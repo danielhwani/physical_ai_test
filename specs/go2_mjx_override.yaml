@@ -1,0 +1,51 @@
+# MJX용 모델 오버라이드 (문서 §12.2: "MJCF 모델은 하나, MJX용 차이는 오버라이드 파일")
+#
+# 원본: specs/go2_control.yaml 의 robot.model_source (Menagerie go2.xml)
+# 참조: Menagerie go2_mjx.xml (같은 커밋). conformance/test_mjx_override.py 가
+#       "adopt" 항목이 go2_mjx.xml과 일치하는지 검사한다. 상류가 바뀌면 그 시험이 깨진다.
+#
+# 원칙: 계산 속도를 위한 물리 설정 단순화만 받아들이고, 로봇의 실제 성능을 바꾸는 것
+#       (토크 한계, 관절 범위, 행동 처리 경로)은 받아들이지 않는다.
+#       받아들인 항목은 모두 sim-to-sim 차이의 후보이므로 영향 메모를 남긴다.
+override_version: "0.1.0"
+reference_model: third_party/mujoco_menagerie/unitree_go2/go2_mjx.xml
+
+adopt:
+  option:
+    cone: pyramidal            # CPU: elliptic. 마찰 원뿔 근사 -> 미끄러짐 특성 차이
+    iterations: 1              # CPU: 100. 솔버 수렴 덜 됨 -> 접촉력 잡음
+    ls_iterations: 5           # CPU: 50
+    disable: [eulerdamp]       # CPU: 활성. 관절 감쇠의 암시적 처리 끔 -> 감쇠 큰 관절에서 안정성 차이
+  joint:
+    frictionloss: 0.0          # CPU: 0.2 (모든 다리 관절). 저속 관절 거동 차이
+  foot:
+    size: 0.0175               # CPU: 0.022. 발 반경 4.5 mm 작음 -> 서 있는 높이 4.5 mm 낮아짐
+    solimp: [0.015, 1.0, 0.031]  # CPU: [0.015, 1, 0.022]
+  # 다리/몸통 충돌 형상을 구로 단순화 (발 이외의 접촉이 거의 사라짐)
+  # body: 그 body의 충돌 geom(group 3)을 순서대로 나열. 발 geom은 위 foot 항목에서 처리
+  collision_geoms:
+    base:
+      - {type: sphere, size: [0.057, 0.04675, 0.057]}            # CPU: box 0.376x0.094x0.114 m
+      - {type: sphere, size: [0.05, 0.045, 0]}                   # CPU: cylinder
+      - {}                                                       # 머리 구: 변경 없음
+    "*_hip":
+      - {type: sphere}                                           # CPU: cylinder
+    "*_thigh":
+      - {type: sphere, size: [0.017, 0.01225, 0.017], pos: [-0.015, 0, -0.1955]}   # CPU: 허벅지 전체 box
+    "*_calf":
+      - {type: sphere}                                           # CPU: cylinder
+      - {type: sphere}                                           # CPU: cylinder
+
+reject:
+  - item: actuators
+    upstream: "position servo, kp=50, kv=0.5 (MJCF 내장)"
+    reason: "행동 처리 경로는 specs/go2_control.yaml(action.pd)로 단일화. 학습 환경도 같은 PD를 물리 스텝마다 계산한다."
+  - item: knee_force_limit
+    upstream: "24 N·m"
+    reason: "실기 Go2 무릎 한계 45.43 N·m를 유지 (spec action.torque_limit). 학습 시 토크 여유를 과소평가하지 않도록."
+  - item: hind_hip_range
+    upstream: "[-1.5708, 3.4907] (앞다리와 동일)"
+    reason: "실기 뒷다리 범위 [-0.5236, 4.5379] 유지."
+  - item: sensors_and_sites
+    upstream: "jointpos/jointvel/imu 센서, 발 site 추가"
+    reason: "관측은 sim/observation.py 기준 구현이 qpos/qvel에서 직접 계산. 모델 센서에 의존하지 않음."

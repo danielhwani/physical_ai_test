@@ -1,0 +1,11 @@
+# 외부 모델 (scripts/fetch_models.sh로 받음)
+third_party/
+# 실행 결과
+runs/
+# 내부 문서, 작업용 캡처
+*.docx
+Screenshot*.png
+# Python
+__pycache__/
+*.pyc
+.venv/

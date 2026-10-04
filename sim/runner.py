@@ -1,0 +1,337 @@
+"""시나리오 실행기.
+
+    python -m sim.runner scenarios/flat_trot.yaml              # lockstep(시뮬레이션 시간), 최대 속도
+    python -m sim.runner scenarios/flat_trot.yaml --realtime   # 실시간 페이싱
+    python -m sim.runner scenarios/flat_trot.yaml --view       # MuJoCo 뷰어 (저사양: 느릴 수 있음)
+    python -m sim.runner scenarios/flat_trot.yaml --ros2       # ROS2 포즈 스트림 발행
+    python -m sim.runner scenarios/flat_trot.yaml --policy policies/go2_trot_bc/card.yaml   # ONNX 정책
+
+운용 모드는 문서 §9.2의 두 가지: lockstep(순수 가상)과 실시간(LVC 대비).
+"""
+import argparse
+import copy
+import datetime as dt
+import os
+import platform
+import threading
+import time
+from collections import deque
+from pathlib import Path
+
+import mujoco
+import mujoco.viewer
+import numpy as np
+import yaml
+
+from .adapters import quat_to_roll_pitch, quat_to_yaw
+from .control_interface import ControlInterface, load_card
+from .controllers.common import GaitClock, StepContext
+from .controllers.onnx_policy import OnnxPolicyController
+from .controllers.trot import TrotController
+from .model_builder import ROOT, build_model
+from .recorder import Recorder
+from .terrain_service import TerrainMapService
+
+SIM_VERSION = "0.3.0"
+TERRAIN_COMMIT_HZ = 5.0       # 지형 갱신은 수 Hz로 충분 (문서 §5.3)
+FALL_HEIGHT = 0.12            # 몸통 높이(지면 기준)가 이보다 낮으면 넘어짐
+FALL_TILT = 1.0               # rad
+
+
+KEY_SPACE, KEY_RIGHT = 32, 262      # GLFW 키 코드
+
+
+class PauseControl:
+    """뷰어 키 입력: Space = 일시정지/재개, → = 일시정지 중 제어 주기 1회 진행.
+    passive 뷰어의 Pause 버튼은 러너가 물리를 직접 돌리므로 동작하지 않아 여기서 처리한다."""
+
+    def __init__(self, paused=False):
+        self.paused = paused
+        self.step_requests = 0
+
+    def key_callback(self, key):          # 뷰어 스레드에서 호출됨
+        if key == KEY_SPACE:
+            self.paused = not self.paused
+        elif key == KEY_RIGHT and self.paused:
+            self.step_requests += 1
+
+
+def load_yaml(path):
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+class Simulation:
+    """scenario: YAML 경로 또는 dict. policy: 정책 카드 경로 (없으면 시나리오의 규칙 기반 보행기)."""
+
+    def __init__(self, scenario, spec_path=ROOT / "specs/go2_control.yaml", variant="cpu", seed=None,
+                 policy=None):
+        self.scn = copy.deepcopy(scenario) if isinstance(scenario, dict) else load_yaml(scenario)
+        if seed is not None:
+            self.scn["seed"] = seed
+        self.spec = load_yaml(spec_path)
+        t = self.scn["terrain"]
+        self.terrain = TerrainMapService(t["size"], t["resolution"], t["z_range"], self.scn.get("seed", 0))
+        for p in t.get("patches", []):
+            self.terrain.add_patch(p)
+        self.variant = variant
+        self.model, self.hfield_id = build_model(self.spec, self.terrain, variant)
+        self.data = mujoco.MjData(self.model)
+
+        # 제어 인터페이스: 정책 카드가 있으면 카드 규약, 없으면 로봇 명세 규약
+        if policy:
+            card = load_card(policy)
+            self.iface = ControlInterface(self.spec, card)
+            self.ctrl = OnnxPolicyController(card, self.iface)
+            self.controller_desc = f"onnx:{card['name']}"
+            period = self.iface.gait_period
+        else:
+            self.iface = ControlInterface(self.spec)
+            self.ctrl = TrotController(self.spec, self.scn["controller"], self.iface)
+            self.controller_desc = f"trot:{self.scn['controller']}"
+            period = self.scn["controller"]["period"]
+        self.clock = GaitClock(period or 1.0)
+        self.decim = int(round(self.iface.control_dt / self.model.opt.timestep))
+        self.delay_steps = self.spec["action"].get("delay_steps", 0)
+        self.on_action = None       # (ctx, action) -> action. 모방학습(DAgger)에서 실행 action 교체용
+
+        m = self.model
+        self.base_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, self.spec["robot"]["base_body"])
+        self.foot_ids = [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, f) for f in self.spec["robot"]["feet"]]
+        self.terrain_geom = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "terrain")
+        self.total_mass = m.body_subtreemass[self.base_id]
+        self.reset()
+
+    def reset(self):
+        mujoco.mj_resetDataKeyframe(self.model, self.data, 0)
+        self.data.qpos[2] += self.terrain.height_at(0.0, 0.0)
+        mujoco.mj_forward(self.model, self.data)
+        self.ctrl.reset()
+        self.clock.reset()
+        self.q_des = self.iface.targets_from_action(np.zeros(12))
+        self.action = np.zeros(12)
+        self.pending = deque([np.zeros(12)] * self.delay_steps)
+        self.obs = np.zeros(self.iface.obs.dim)
+        self.events = sorted(self.scn.get("events", []), key=lambda e: e["t"])
+        self.next_terrain_commit = 0.0
+
+    # ---- 이벤트 (나중에 DIS 시나리오 콘솔이 같은 경로로 주입) ----
+    def _apply_events(self, verbose=True):
+        while self.events and self.events[0]["t"] <= self.data.time + 1e-9:
+            e = self.events.pop(0)
+            if e["action"] == "set_command":
+                self.clock.set_command(e["vx"], e.get("yaw_rate", 0.0))
+            elif e["action"] == "add_patch":
+                self.terrain.add_patch(e["patch"])
+            if verbose:
+                print(f"[t={self.data.time:6.2f}] event: {e['action']}")
+
+    def feet_xy(self):
+        return [self.data.geom_xpos[g][:2].copy() for g in self.foot_ids]
+
+    def foot_contacts(self):
+        c = np.zeros(4, dtype=bool)
+        for k in range(self.data.ncon):
+            con = self.data.contact[k]
+            for i, g in enumerate(self.foot_ids):
+                if g in (con.geom1, con.geom2):
+                    c[i] = True
+        return c
+
+    def obs_inputs(self):
+        """관측 계산 입력. 새 관측 항목이 다른 입력(지형 높이 등)을 쓰면 여기에 추가."""
+        d = self.data
+        return dict(qpos=d.qpos, qvel=d.qvel, command=self.clock.command_body(),
+                    last_action=self.action, gait_phase=self.clock.phase)
+
+    def step_control(self, verbose=True):
+        """제어 주기 1회 = 물리 스텝 decim회."""
+        d = self.data
+        dt = self.decim * self.model.opt.timestep
+        self._apply_events(verbose)
+        terrain_changed = False
+        if d.time >= self.next_terrain_commit:
+            terrain_changed = self.terrain.commit(self.model, self.hfield_id, self.feet_xy())
+            self.next_terrain_commit += 1.0 / TERRAIN_COMMIT_HZ
+
+        # 1) 명령/위상 갱신  2) 관측  3) 컨트롤러 -> action  4) 행동 처리 -> q_des  5) PD + 물리
+        self.clock.update(dt)
+        self.obs = self.iface.obs.compute(**self.obs_inputs())
+        roll, pitch = quat_to_roll_pitch(d.qpos[3:7])
+        R = d.xmat[self.base_id].reshape(3, 3)
+        ctx = StepContext(dt=dt, qpos=d.qpos, qvel=d.qvel, roll=roll, pitch=pitch, yaw=quat_to_yaw(d.qpos[3:7]),
+                          v_body_x=(R.T @ d.qvel[:3])[0], wz_world=(R @ d.qvel[3:6])[2],
+                          clock=self.clock, obs=self.obs)
+        action = self.ctrl.act(ctx)
+        if self.on_action:
+            action = self.on_action(ctx, action)
+        self.action = np.clip(action, -self.iface.clip, self.iface.clip)
+        if self.delay_steps:
+            self.pending.append(self.action)
+            applied = self.pending.popleft()
+        else:
+            applied = self.action
+        self.q_des = self.iface.targets_from_action(applied)
+
+        kp, kd, lim = self.iface.kp, self.iface.kd, self.iface.torque_limit
+        energy = 0.0
+        for _ in range(self.decim):
+            tau = kp * (self.q_des - d.qpos[7:]) - kd * d.qvel[6:]
+            d.ctrl[:] = np.clip(tau, -lim, lim)
+            mujoco.mj_step(self.model, d)
+            energy += np.abs(d.ctrl * d.qvel[6:]).sum() * self.model.opt.timestep
+        return terrain_changed, energy, roll, pitch
+
+    def fallen(self, roll, pitch):
+        bx, by, bz = self.data.qpos[:3]
+        return bz - self.terrain.height_at(bx, by) < FALL_HEIGHT or max(abs(roll), abs(pitch)) > FALL_TILT
+
+
+def run(args):
+    sim = Simulation(args.scenario, variant=args.variant, policy=args.policy)
+    scn, d, m = sim.scn, sim.data, sim.model
+    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = ROOT / "runs" / f"{scn['name']}_{stamp}"
+    meta = {
+        "scenario": scn["name"], "seed": scn.get("seed", 0), "source": "Virtual",
+        "mode": "realtime" if args.realtime else "lockstep",
+        "model_variant": args.variant,
+        # 버전 조합 기록 (문서 §13.3)
+        "versions": {"sim": SIM_VERSION, "spec": sim.spec["spec_version"],
+                     "controller": sim.controller_desc, "mujoco": mujoco.__version__,
+                     "model": sim.spec["robot"]["menagerie_commit"]},
+        "host": platform.node(), "started": stamp,
+    }
+    rec = Recorder(out, meta)
+
+    viewer = bridge = None
+    pause = PauseControl(paused=args.start_paused)
+    if args.view:
+        before = set(threading.enumerate())
+        viewer = mujoco.viewer.launch_passive(m, d, key_callback=pause.key_callback)
+        viewer_threads = set(threading.enumerate()) - before
+        viewer.cam.trackbodyid = sim.base_id
+        viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+        viewer.cam.distance = 2.0
+    if args.ros2:
+        from .ros2_bridge import Ros2PoseBridge
+        bridge = Ros2PoseBridge(m)
+    if args.rt:
+        os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(50))
+
+    ctrl_dt = sim.decim * m.opt.timestep
+    energy_total, fell_at = 0.0, None
+    start_xy = d.qpos[:2].copy()
+    wall0 = run_start = time.perf_counter()
+    paused_total, pause_start = 0.0, None
+    late, max_lag = 0, 0.0
+    next_view = 0.0
+    was_paused = False
+
+    while d.time < scn["duration"]:
+        if viewer:
+            if pause.paused and pause.step_requests == 0:
+                if not was_paused:
+                    viewer.set_texts((None, mujoco.mjtGridPos.mjGRID_TOPLEFT, "PAUSED",
+                                      f"t = {d.time:.2f} s   [Space] resume  [Right] step"))   # 오버레이 폰트는 ASCII만 지원
+                    print(f"[t={d.time:6.2f}] paused")
+                    was_paused, pause_start = True, time.perf_counter()
+                viewer.sync()               # 일시정지 중에도 카메라 조작은 가능
+                time.sleep(1 / 30)
+                if not viewer.is_running():
+                    break
+                continue
+            if was_paused and not pause.paused:
+                viewer.clear_texts()
+                wall0 = time.perf_counter() - d.time    # 실시간 기준점 재설정 (정지 시간은 지연으로 세지 않음)
+                paused_total += time.perf_counter() - pause_start
+                print(f"[t={d.time:6.2f}] resumed")
+                was_paused = False
+            if pause.step_requests:
+                pause.step_requests -= 1
+
+        terrain_changed, energy, roll, pitch = sim.step_control()
+        energy_total += energy
+
+        rec.log(t=d.time, base_pos=d.qpos[:3], base_quat_wxyz=d.qpos[3:7], base_linvel=d.qvel[:3],
+                base_angvel_body=d.qvel[3:6], q=d.qpos[7:], qd=d.qvel[6:], tau=d.ctrl, q_des=sim.q_des,
+                contact=sim.foot_contacts().astype(float), cmd=sim.clock.cmd_f, gait_phase=sim.clock.phase, obs=sim.obs, action=sim.action,
+                terrain_version=sim.terrain.version)
+
+        if bridge:
+            bridge.publish(d)
+        if viewer:
+            if not viewer.is_running():
+                break
+            if terrain_changed:
+                viewer.update_hfield(sim.hfield_id)
+            if was_paused:                   # 1스텝 진행: 바로 그리고 시각 표시 갱신
+                viewer.set_texts((None, mujoco.mjtGridPos.mjGRID_TOPLEFT, "PAUSED",
+                                  f"t = {d.time:.2f} s   [Space] resume  [Right] step"))   # 오버레이 폰트는 ASCII만 지원
+                viewer.sync()
+            elif d.time >= next_view:        # 저사양: 화면 갱신은 30 Hz로 제한
+                viewer.sync()
+                next_view = d.time + 1 / 30
+        if (args.realtime or viewer) and not was_paused:
+            lag = (time.perf_counter() - wall0) - d.time
+            if lag < 0:
+                time.sleep(-lag)
+            elif lag > ctrl_dt:
+                late += 1
+                max_lag = max(max_lag, lag)
+
+        if sim.fallen(roll, pitch):
+            fell_at = d.time
+            print(f"[t={d.time:6.2f}] FALL detected")
+            break
+
+    if was_paused:
+        paused_total += time.perf_counter() - pause_start
+    wall = time.perf_counter() - run_start - paused_total
+    dist = float(np.linalg.norm(d.qpos[:2] - start_xy))
+    mop = {
+        "sim_time_s": round(d.time, 3),
+        "wall_time_s": round(wall, 3),
+        "realtime_factor": round(d.time / wall, 2),
+        "fell": fell_at is not None, "fell_at_s": fell_at,
+        "distance_m": round(dist, 3),
+        "forward_x_m": round(float(d.qpos[0] - start_xy[0]), 3),
+        "lateral_drift_m": round(float(d.qpos[1] - start_xy[1]), 3),
+        "mean_speed_mps": round(dist / max(d.time - 1.0, 1e-6), 3),
+        "cost_of_transport": round(energy_total / (sim.total_mass * 9.81 * max(dist, 1e-6)), 3),
+        "late_control_steps": late if (args.realtime or viewer) else None,
+        "max_lag_s": round(max_lag, 4) if (args.realtime or viewer) else None,
+    }
+    rec.save(mop)
+    print("\n== MOP ==")
+    for k, v in mop.items():
+        print(f"  {k:20s} {v}")
+    print(f"\n기록: {out.relative_to(ROOT)}")
+
+    if viewer:
+        # close()는 종료 신호만 보낸다. 뷰어 스레드(daemon)가 GL 자원을 다 해제하기 전에
+        # 인터프리터가 종료되며 glfw.terminate()가 불리면 segfault가 나므로 끝날 때까지 기다린다.
+        viewer.close()
+        for t in viewer_threads:
+            t.join(timeout=10)
+    if bridge:
+        bridge.close()
+    return mop
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("scenario")
+    ap.add_argument("--realtime", action="store_true", help="벽시계에 맞춰 실행")
+    ap.add_argument("--view", action="store_true", help="MuJoCo 뷰어 표시")
+    ap.add_argument("--start-paused", action="store_true", help="--view와 함께: 일시정지 상태로 시작")
+    ap.add_argument("--ros2", action="store_true", help="ROS2 /tf, /joint_states, /clock 발행")
+    ap.add_argument("--policy", help="정책 카드 경로 (예: policies/go2_trot_bc/card.yaml). 없으면 트롯 보행기")
+    ap.add_argument("--variant", choices=["cpu", "mjx"], default="cpu",
+                    help="mjx: specs/go2_mjx_override.yaml 적용 모델 (CPU MuJoCo로 실행)")
+    ap.add_argument("--rt", action="store_true", help="SCHED_FIFO 우선순위 50 (RT 커널)")
+    run(ap.parse_args())
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,9 @@
+# 실행 환경: conda env "mj_ros" (Python 3.10, mujoco 3.5, 시스템 ROS2 Humble rclpy)
+# 추가로 설치한 패키지: pyarrow, onnx, onnxruntime
+mujoco>=3.3
+numpy
+pyyaml
+pyarrow          # 시험 데이터 Parquet 기록 (문서 §4)
+pillow           # sim.snapshot 이미지 저장
+onnx             # 모방 정책 ONNX 그래프 생성
+onnxruntime      # ONNX 정책 실행 (CPU)

@@ -1,0 +1,56 @@
+# 관측·행동·제어 명세 (문서 §12.2: 기계 판독 가능한 단일 명세)
+# 컨트롤러, 기록기, 향후 MJX 학습 환경과 ONNX 정책이 모두 이 파일을 읽는다.
+spec_version: "0.3.0"
+robot:
+  name: unitree_go2
+  model_source: third_party/mujoco_menagerie/unitree_go2/go2.xml
+  menagerie_commit: 4d038b3
+  base_body: base
+  feet: [FL, FR, RL, RR]           # foot geom 이름
+  # 액추에이터 순서와 동일 (motor, 토크 제어)
+  joints: [FL_hip_joint, FL_thigh_joint, FL_calf_joint,
+           FR_hip_joint, FR_thigh_joint, FR_calf_joint,
+           RL_hip_joint, RL_thigh_joint, RL_calf_joint,
+           RR_hip_joint, RR_thigh_joint, RR_calf_joint]
+  default_pose: [0, 0.9, -1.8,  0, 0.9, -1.8,  0, 0.9, -1.8,  0, 0.9, -1.8]
+  leg:
+    hip_offsets: [[0.1934, 0.0465], [0.1934, -0.0465], [-0.1934, 0.0465], [-0.1934, -0.0465]]
+    thigh_length: 0.213
+    calf_length: 0.213
+
+# 행동 처리 경로 (sim-to-sim 불일치의 주원인이므로 명세로 고정)
+#   q_des = default_pose + scale * clip(action, -clip, clip)
+#   tau   = clip(kp * (q_des - q) - kd * qd, -torque_limit, torque_limit)   # 물리 스텝마다
+action:
+  type: joint_position_target
+  scale: 0.25
+  clip: 4.0                        # 정책 출력 클립 (scale 적용 전)
+  control_dt: 0.02                 # 50 Hz (정책/보행 생성 주기)
+  delay_steps: 0                   # 제어 주기 단위 지연 (실기 측정 후 반영)
+  pd:
+    kp: [100, 150, 150,  100, 150, 150,  100, 150, 150,  100, 150, 150]   # 규칙 기반 보행기용 (학습 정책은 보통 더 낮음)
+    kd: [4, 4, 4,  4, 4, 4,  4, 4, 4,  4, 4, 4]
+    rate: physics                  # PD는 물리 스텝마다 (500 Hz)
+  torque_limit: [23.7, 23.7, 45.43,  23.7, 23.7, 45.43,  23.7, 23.7, 45.43,  23.7, 23.7, 45.43]
+
+# 관측 벡터: 아래 순서대로 이어 붙인다. 각 항목 = scale * (원값), 이후 전체를 clip.
+# 기준 구현: sim/observation.py (numpy). JAX/C++ 구현은 conformance/reference/obs_reference.npz와 비교한다.
+# 입력은 qpos, qvel, command, last_action, gait_phase 뿐이다 (MuJoCo 함수 호출 없음 -> 어느 언어로도 이식 가능).
+# 관절 항목은 인터페이스의 관절 순서(정책 카드가 있으면 카드 순서)로 나열한다.
+#   MuJoCo free joint 규약: qpos[3:7] 쿼터니언 (w,x,y,z), qvel[0:3] 월드 선속도, qvel[3:6] 몸통 좌표 각속도
+observation:
+  clip: 100.0
+  terms:
+    - {name: base_ang_vel,      dim: 3,  scale: 0.25, def: "qvel[3:6] (몸통 좌표, = imu site gyro)"}
+    - {name: projected_gravity, dim: 3,  scale: 1.0,  def: "R(qpos[3:7])^T @ [0, 0, -1]"}
+    - {name: command,           dim: 3,  scale: [2.0, 2.0, 0.25], def: "[vx, vy, yaw_rate] 몸통 좌표"}
+    - {name: joint_pos_rel,     dim: 12, scale: 1.0,  def: "qpos[7:19] - default_pose"}
+    - {name: joint_vel,         dim: 12, scale: 0.05, def: "qvel[6:18]"}
+    - {name: last_action,       dim: 12, scale: 1.0,  def: "직전 제어 주기의 action (clip 후, scale 전)"}
+    - {name: gait_phase,        dim: 2,  scale: 1.0,  def: "[sin(2πφ), cos(2πφ)], φ = runner GaitClock 위상 (명령 0이면 정지)"}
+  dim: 47
+  # 다른 구현과 비교할 때의 허용 오차 (MJX 기본 float32 vs CPU double)
+  tolerance: {rtol: 1.0e-5, atol: 1.0e-5}
+
+physics:
+  timestep: 0.002

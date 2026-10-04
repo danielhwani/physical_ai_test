@@ -1,0 +1,17 @@
+# 평지 직진 트롯: 기본 동작 확인용
+name: flat_trot
+duration: 12.0
+seed: 0
+terrain:
+  size: [10.0, 10.0]          # 반폭 (m) -> 20 m x 20 m
+  resolution: 0.05            # m/cell (컴파일 시 고정, 문서 §5.3)
+  z_range: [-0.2, 0.4]        # 절대 높이 범위 사전 할당
+  patches: []
+controller:
+  type: trot
+  period: 0.36
+  swing_height: 0.07
+  stand_height: 0.27
+events:
+  - {t: 1.0, action: set_command, vx: 0.4, yaw_rate: 0.0}
+  - {t: 8.0, action: set_command, vx: 0.4, yaw_rate: 0.4}
