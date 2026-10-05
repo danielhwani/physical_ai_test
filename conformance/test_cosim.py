@@ -7,6 +7,8 @@
 2. 결정성: 같은 시나리오를 두 번 돌리면 로봇, 차량, 지형이 모두 같은지 (파이프라인 동기 포함)
 3. 단방향: 로봇이 무엇을 하든 차량 궤적은 같은지 (로봇 -> 차량 물리 작용 없음)
 4. 스트림: Chrono 바디가 physics_source=Chrono로 매니페스트와 TF 포즈에 들어가는지
+5. 발자국: 로봇 발 하중으로 판 자국이 디딘 발 아래에 생기고, 깊이가 하중-흙 강도 관계를 따르며(무른 흙이 더 깊음),
+   과하게 파이지 않는지(대리 구가 흙에 떨어져 충격으로 파는 문제 재발 방지), 결정적인지
 """
 import contextlib
 import copy
@@ -23,6 +25,7 @@ from sim.runner import Simulation  # noqa: E402
 from sim.stream import build_manifest  # noqa: E402
 
 SCN = yaml.safe_load((ROOT / "scenarios/vehicle_crossing.yaml").read_text())
+FOOT = yaml.safe_load((ROOT / "scenarios/footprints.yaml").read_text())
 
 
 def _run(scn, seconds, on_step=None):
@@ -90,6 +93,45 @@ def test_stream_includes_chrono_bodies():
         assert len({b["id"] for b in m["bodies"]}) == len(m["bodies"]), "바디 id 중복"
     finally:
         sim.close()
+
+
+def _footprints(scn, seconds):
+    stance = []
+
+    def record(sim):
+        f = sim.foot_normal_forces()
+        stance.extend(sim.data.geom_xpos[g][:2].copy() for i, g in enumerate(sim.foot_ids) if f[i] > 20)
+
+    q, H, _, sim = _run(scn, seconds, record)
+    prints = H < -0.005
+    xs = np.broadcast_to(sim.terrain.xs, H.shape)[prints]
+    ys = np.broadcast_to(sim.terrain.ys[:, None], H.shape)[prints]
+    return q, H, prints, xs, ys, np.array(stance)
+
+
+def test_footprints_under_stance_feet():
+    # 12초: Chrono 시간 간격 2 ms일 때 9초쯤 대리 구가 순간적으로 박히던 문제(-15 cm)까지 지나도록
+    _, H, prints, xs, ys, stance = _footprints(FOOT, 12.0)
+    assert prints.sum() > 50, "발자국이 MuJoCo 지형에 들어오지 않음"
+    d = np.min(np.hypot(xs[:, None] - stance[None, :, 0], ys[:, None] - stance[None, :, 1]), axis=1)
+    assert np.median(d) < 0.03 and np.percentile(d, 95) < 0.06, f"발자국이 발 위치와 어긋남 (중앙 {np.median(d):.3f} m)"
+    depth = H[prints]
+    # 단독 측정(kphi 1e7: 50 N -> 1.8 cm, 80 N -> 2.8 cm)과 같은 범위. 과도한 침하(이전 문제: -15 cm) 재발 금지
+    assert -0.03 < depth.mean() < -0.005 and depth.min() > -0.06, f"발자국 깊이 이상: 평균 {depth.mean():.3f}, 최대 {depth.min():.3f}"
+
+
+def test_footprint_depth_follows_soil():
+    firm = copy.deepcopy(FOOT)
+    firm["chrono"]["scm"]["soil"]["bekker_kphi"] = 4.0e7           # 더 단단한 흙
+    _, H_soft, p_soft, *_ = _footprints(FOOT, 4.0)
+    _, H_firm, p_firm, *_ = _footprints(firm, 4.0)
+    assert H_soft[p_soft].mean() < H_firm[p_firm].mean(), "무른 흙의 발자국이 더 깊어야 한다 (하중으로 누르는지 확인)"
+
+
+def test_footprints_determinism():
+    q1, H1, *_ = _footprints(FOOT, 3.0)
+    q2, H2, *_ = _footprints(FOOT, 3.0)
+    assert np.array_equal(q1, q2) and np.array_equal(H1, H2)
 
 
 if __name__ == "__main__":

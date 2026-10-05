@@ -24,8 +24,8 @@ from visualization_msgs.msg import Marker, MarkerArray
 from .stream_decode import TerrainGrid, check_manifest, quat_to_rpy
 
 TERRAIN_HALF = 6.0      # 표시 범위 (m, 원점 기준 반폭). 저사양 RViz를 위해 제한
-TERRAIN_RES = 0.1       # 표시 해상도 (m)
-TILE = 5                # 타일 한 변의 셀 수 (0.5 m)
+MAX_CELLS = 100_000     # 표시 셀 수 상한: 지형이 작으면 원래 해상도(발자국 등), 크면 성기게
+TILE = 5                # 타일 한 변의 셀 수
 
 
 def build_urdf(manifest):
@@ -109,27 +109,31 @@ class RvizAdapter(Node):
         self.publish_terrain()
 
     def sampled(self):
-        xs = np.arange(-TERRAIN_HALF, TERRAIN_HALF + 1e-9, TERRAIN_RES)
+        """표시용 격자: 원래 격자의 k칸마다 한 점 (k는 셀 수가 MAX_CELLS 이하가 되는 가장 작은 값)."""
         g = self.grid
-        ci = np.clip(np.round((xs + g.half_x) / (2 * g.half_x) * (g.ncol - 1)).astype(int), 0, g.ncol - 1)
-        ri = np.clip(np.round((xs + g.half_y) / (2 * g.half_y) * (g.nrow - 1)).astype(int), 0, g.nrow - 1)
-        return xs, g.heights[np.ix_(ri, ci)].astype(float)
+        cols = np.where(np.abs(g.xs()) <= TERRAIN_HALF)[0]
+        rows = np.where(np.abs(g.ys()) <= TERRAIN_HALF)[0]
+        k = 1
+        while (len(cols) // k) * (len(rows) // k) > MAX_CELLS:
+            k += 1
+        cols, rows = cols[::k], rows[::k]
+        return g.xs()[cols], g.ys()[rows], g.heights[np.ix_(rows, cols)].astype(float)
 
     def publish_terrain(self):
-        xs, H = self.sampled()
-        n = len(xs) - 1
+        xs, ys, H = self.sampled()
+        nr, nc = len(ys) - 1, len(xs) - 1
         arr = MarkerArray()
-        for r0 in range(0, n, TILE):
-            for c0 in range(0, n, TILE):
-                r1, c1 = min(r0 + TILE, n), min(c0 + TILE, n)
+        for r0 in range(0, nr, TILE):
+            for c0 in range(0, nc, TILE):
+                r1, c1 = min(r0 + TILE, nr), min(c0 + TILE, nc)
                 block = H[r0:r1 + 1, c0:c1 + 1]
                 if self.shown is not None and np.array_equal(block, self.shown[r0:r1 + 1, c0:c1 + 1]):
                     continue
-                X, Y = np.meshgrid(xs[c0:c1 + 1], xs[r0:r1 + 1])
+                X, Y = np.meshgrid(xs[c0:c1 + 1], ys[r0:r1 + 1])
                 V = np.stack([X, Y, block], -1)
                 a, b, d, e = V[:-1, :-1], V[:-1, 1:], V[1:, :-1], V[1:, 1:]
                 tri = np.stack([a, b, e, a, e, d], 2).reshape(-1, 3)
-                m = self.marker("terrain", r0 * (n + 1) + c0, Marker.TRIANGLE_LIST, (0.55, 0.50, 0.42, 1.0), (1, 1, 1))
+                m = self.marker("terrain", r0 * (nc + 1) + c0, Marker.TRIANGLE_LIST, (0.55, 0.50, 0.42, 1.0), (1, 1, 1))
                 m.points = [Point(x=x, y=y, z=z) for x, y, z in tri.tolist()]
                 arr.markers.append(m)
         if arr.markers:

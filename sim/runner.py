@@ -62,6 +62,42 @@ class PauseControl:
 STATUS_DT = 0.1      # 상태 스트림 발행 주기 (시뮬레이션 시간 s)
 
 
+def terrain_deformation(before, after, threshold=0.005):
+    """실행 중 지면이 파인 정도 (Chrono 바퀴 자국, 발자국, 시나리오 이벤트). threshold 이상 내려간 셀 기준."""
+    dz = after - before
+    dug = dz < -threshold
+    return {"deformed_cells": int(dug.sum()),
+            "deform_mean_m": round(float(dz[dug].mean()), 4) if dug.any() else 0.0,
+            "deform_max_m": round(float(dz.min()), 4) if dug.any() else 0.0}
+
+
+def parse_value(text):
+    """--set 값: 숫자(5e6처럼 YAML이 문자열로 읽는 표기 포함) > YAML(true, [1, 2] 등) > 문자열."""
+    for cast in (int, float):
+        try:
+            return cast(text)
+        except ValueError:
+            pass
+    return yaml.safe_load(text)
+
+
+def apply_overrides(scn, sets):
+    """시나리오 dict에 'a.b.c=값' 목록을 적용한다. 없는 키는 오류 (오타로 조용히 무시되는 것을 막는다)."""
+    scn = copy.deepcopy(scn)
+    for item in sets or []:
+        key, _, text = item.partition("=")
+        *path, leaf = key.strip().split(".")
+        node = scn
+        for k in path:
+            if k not in node:
+                raise KeyError(f"--set {key}: '{k}' 없음 (있는 키: {list(node)})")
+            node = node[k]
+        if leaf not in node:
+            raise KeyError(f"--set {key}: '{leaf}' 없음 (있는 키: {list(node)})")
+        node[leaf] = parse_value(text.strip())
+    return scn
+
+
 def load_yaml(path):
     with open(path) as f:
         return yaml.safe_load(f)
@@ -78,6 +114,8 @@ class Simulation:
         self.spec = load_yaml(spec_path)
         t = self.scn["terrain"]
         self.terrain = TerrainMapService(t["size"], t["resolution"], t["z_range"], self.scn.get("seed", 0))
+        # 발 근처 셀 갱신 보류 반경 (m). 로봇이 자기 발자국을 밟게 하려면 보폭보다 작게 (문서 §5.3)
+        self.guard_radius = t.get("guard_radius", 0.15)
         for p in t.get("patches", []):
             self.terrain.add_patch(p)
         self.variant = variant
@@ -110,7 +148,12 @@ class Simulation:
         self.cosim = None
         if "chrono" in self.scn:                 # 두 번째 물리엔진: 차량 + 변형 지면 (문서 §5)
             from .chrono_link import ChronoLink
-            self.cosim = ChronoLink(self.scn["chrono"], self.terrain)
+            ccfg = self.scn["chrono"]
+            if ccfg.get("robot_feet"):           # 발 대리 구 반지름 = 실제 발 geom 반지름 (모델 변형에 따라 자동)
+                ccfg["robot_feet"] = dict(ccfg["robot_feet"]) if isinstance(ccfg["robot_feet"], dict) else {}
+                ccfg["robot_feet"].setdefault("radius", float(self.model.geom_size[self.foot_ids[0]][0]))
+                ccfg["robot_feet"].setdefault("names", list(self.spec["robot"]["feet"]))
+            self.cosim = ChronoLink(ccfg, self.terrain)
 
     def close(self):
         """외부 물리엔진 프로세스 정리. Chrono 통계(서버 계산 시간)를 돌려준다."""
@@ -153,6 +196,17 @@ class Simulation:
     def feet_xy(self):
         return [self.data.geom_xpos[g][:2].copy() for g in self.foot_ids]
 
+    def foot_normal_forces(self):
+        """발마다 지형과의 접촉 수직력 합 (N). Chrono 발자국 계산의 입력."""
+        f, out = np.zeros(4), np.zeros(6)
+        for k in range(self.data.ncon):
+            con = self.data.contact[k]
+            for i, g in enumerate(self.foot_ids):
+                if g in (con.geom1, con.geom2) and self.terrain_geom in (con.geom1, con.geom2):
+                    mujoco.mj_contactForce(self.model, self.data, k, out)
+                    f[i] += out[0]               # 접촉 좌표계 첫 성분 = 법선 방향
+        return f
+
     def foot_contacts(self):
         c = np.zeros(4, dtype=bool)
         for k in range(self.data.ncon):
@@ -183,7 +237,7 @@ class Simulation:
                     print(f"[t={d.time:6.2f}] event: vehicle_near ({dist:.2f} m)")
         terrain_changed = False
         if d.time >= self.next_terrain_commit:
-            terrain_changed = self.terrain.commit(self.model, self.hfield_id, self.feet_xy())
+            terrain_changed = self.terrain.commit(self.model, self.hfield_id, self.feet_xy(), self.guard_radius)
             self.next_terrain_commit += 1.0 / TERRAIN_COMMIT_HZ
 
         # 1) 명령/위상 갱신  2) 관측  3) 컨트롤러 -> action  4) 행동 처리 -> q_des  5) PD + 물리
@@ -207,11 +261,18 @@ class Simulation:
 
         kp, kd, lim = self.iface.kp, self.iface.kd, self.iface.torque_limit
         energy = 0.0
+        feet_coupled = self.cosim is not None and self.cosim.feet_enabled
+        fn_sum = np.zeros(4)
         for _ in range(self.decim):
             tau = kp * (self.q_des - d.qpos[7:]) - kd * d.qvel[6:]
             d.ctrl[:] = np.clip(tau, -lim, lim)
             mujoco.mj_step(self.model, d)
             energy += np.abs(d.ctrl * d.qvel[6:]).sum() * self.model.opt.timestep
+            if feet_coupled:
+                fn_sum += self.foot_normal_forces()
+        if feet_coupled:
+            # 물리 스텝마다 평균한 수직력 (착지 순간의 짧은 접촉력 스파이크는 실제 충격량만큼만 반영된다)
+            self.cosim.observe_feet(d.geom_xpos[self.foot_ids], fn_sum / self.decim)
         return terrain_changed, energy, roll, pitch
 
     def fallen(self, roll, pitch):
@@ -220,12 +281,18 @@ class Simulation:
 
 
 def run(args):
-    sim = Simulation(args.scenario, variant=args.variant, policy=args.policy)
+    scenario = args.scenario if isinstance(args.scenario, dict) else load_yaml(args.scenario)
+    scenario = apply_overrides(scenario, getattr(args, "set", None))
+    sim = Simulation(scenario, variant=args.variant, policy=args.policy)
     scn, d, m = sim.scn, sim.data, sim.model
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     out = ROOT / "runs" / f"{scn['name']}_{stamp}"
+    k = 2
+    while out.exists():                       # 같은 초에 여러 번 실행해도 (스윕 등) 덮어쓰지 않게
+        out, k = ROOT / "runs" / f"{scn['name']}_{stamp}_{k}", k + 1
     meta = {
         "scenario": scn["name"], "seed": scn.get("seed", 0), "source": "Virtual",
+        "overrides": list(getattr(args, "set", None) or []),       # --set으로 바꾼 값 (결과 출처 추적)
         "mode": "realtime" if args.realtime else "lockstep",
         "model_variant": args.variant,
         # 버전 조합 기록 (문서 §13.3)
@@ -268,6 +335,7 @@ def run(args):
     ctrl_dt = sim.decim * m.opt.timestep
     energy_total, fell_at = 0.0, None
     start_xy = d.qpos[:2].copy()
+    terrain0 = sim.terrain.applied.copy()     # 지면 변형량 MOP 기준
     wall0 = run_start = time.perf_counter()
     paused_total, pause_start = 0.0, None
     late, max_lag = 0, 0.0
@@ -306,7 +374,7 @@ def run(args):
                     base_angvel_body=d.qvel[3:6], q=d.qpos[7:], qd=d.qvel[6:], tau=d.ctrl, q_des=sim.q_des,
                     contact=sim.foot_contacts().astype(float), cmd=sim.clock.cmd_f, gait_phase=sim.clock.phase, obs=sim.obs, action=sim.action,
                     terrain_version=sim.terrain.version)
-            if sim.cosim is not None:
+            if sim.cosim is not None and sim.cosim.has_vehicle:
                 rec.log(vehicle_pos=sim.cosim.vehicle["pos"], vehicle_speed=sim.cosim.vehicle["speed"])
 
             if bridge:
@@ -361,7 +429,8 @@ def run(args):
         "lateral_drift_m": round(float(d.qpos[1] - start_xy[1]), 3),
         "mean_speed_mps": round(dist / max(d.time - 1.0, 1e-6), 3),
         "cost_of_transport": round(energy_total / (sim.total_mass * 9.81 * max(dist, 1e-6)), 3),
-        "min_vehicle_distance_m": round(sim.cosim.min_dist, 3) if sim.cosim is not None else None,
+        "min_vehicle_distance_m": round(sim.cosim.min_dist, 3) if sim.cosim is not None and sim.cosim.has_vehicle else None,
+        **terrain_deformation(terrain0, sim.terrain.applied),
         "late_control_steps": late if (args.realtime or viewer) else None,
         "max_lag_s": round(max_lag, 4) if (args.realtime or viewer) else None,
     }
@@ -413,6 +482,8 @@ def main():
     ap.add_argument("--variant", choices=["cpu", "mjx"], default="cpu",
                     help="mjx: specs/go2_mjx_override.yaml 적용 모델 (CPU MuJoCo로 실행)")
     ap.add_argument("--rt", action="store_true", help="SCHED_FIFO 우선순위 50 (RT 커널)")
+    ap.add_argument("--set", action="append", metavar="KEY=VALUE",
+                    help="시나리오 값 바꾸기 (여러 번 가능). 예: --set chrono.scm.soil.bekker_kphi=2e7")
     args = ap.parse_args()
     if args.rviz or args.mjviz:
         args.ros2 = args.realtime = True

@@ -1,0 +1,43 @@
+# 로봇 발자국 (MuJoCo 4족 + Chrono SCM, HMMWV 없음)
+# MuJoCo가 네 발의 위치와 지면 수직 하중을 Chrono에 보내고, Chrono의 발 대리 구가 그 힘으로 SCM 흙을 누른다.
+# 패인 깊이는 하중과 흙 강도로 정해지며(단독 측정: kphi 1e7에서 50 N -> 약 1.8 cm, 80 N -> 약 2.8 cm),
+# 패인 모양은 Terrain Map Service를 거쳐 MuJoCo 지형으로 돌아와 이후 걸음(뒷발 등)이 밟는다.
+# 한계: 디딘 발이 그 자리에서 가라앉지는 않는다 (흙 반력을 MuJoCo로 되돌리지 않음).
+name: footprints
+duration: 15.0
+seed: 4
+terrain:
+  size: [7.0, 1.5]       # 반폭: x -7~7 m, y -1.5~1.5 m
+  resolution: 0.02       # 발 반지름 2.2 cm보다 촘촘해야 한다 (5 cm면 발이 격자점 사이로 빠진다)
+  z_range: [-0.15, 0.15]
+  guard_radius: 0.06     # 트롯 보폭(약 6 cm)보다 작게: 앞발 자국이 반영되어 뒷발이 밟는다
+  patches: []            # SCM 영역은 평평해야 한다
+controller:
+  type: trot
+  period: 0.36
+  swing_height: 0.08
+  stand_height: 0.27
+events:
+  - {t: 1.0, action: set_command, vx: 0.35, yaw_rate: 0.0}
+chrono:
+  sync_dt: 0.04          # 발 하중/위치 교환 주기 (s)
+  terrain_dt: 0.2        # 지형 변경분 교환 주기 (s)
+  step: 1.0e-3           # Chrono 시간 간격 (s). 2 ms면 작은 발 접촉에서 흙 탄성(elastic_k)이 너무 뻣뻣해
+                         # 대리 구가 떨다가 순간적으로 박힌다 (-15 cm). 1 ms와 0.5 ms 결과가 같음(수렴) 확인
+  robot_feet:            # 반지름, 이름은 로봇 모델에서 자동으로 채운다
+    mass: 2.0            # 대리 구 질량 (kg). 자중은 상쇄한다
+    damping: 300.0       # 수직 감쇠 (N s/m): 충격 없이 천천히 정적 평형으로 (damping*dt/mass < 2 안정 조건)
+    fn_min: 5.0          # 이보다 작은 하중이면 발이 들린 것으로 본다 (N)
+  scm:
+    center: [0.0, 0.0]
+    size: [14.0, 3.0]    # 지형 전체
+    resolution: 0.02     # = terrain.resolution
+    soil:                # 발자국 약 2 cm (kphi 2e7이면 약 1.1~1.7 cm)
+      bekker_kphi: 1.0e7
+      bekker_kc: 0
+      bekker_n: 1.1
+      cohesion: 0
+      friction_deg: 30
+      janosi_shear: 0.01
+      elastic_k: 4.0e7
+      damping_r: 3.0e4

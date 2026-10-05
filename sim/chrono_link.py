@@ -1,8 +1,10 @@
-"""Chrono 연동 (문서 §5): Chrono는 차량 동역학과 변형 지면(SCM), MuJoCo는 4족 로봇. 단방향 연결.
+"""Chrono 연동 (문서 §5): Chrono는 변형 지면(SCM)과 선택적으로 HMMWV, MuJoCo는 4족 로봇.
 
   Chrono SCM 높이 변화 ──▶ Terrain Map Service ──▶ MuJoCo heightfield   (지형, 5 Hz)
-  Chrono 차량 바디 포즈 ──▶ 중립 렌더 스트림(physics_source: Chrono)       (25 Hz)
-  로봇 -> 차량 방향의 물리 작용은 없다. 근접은 논리 이벤트로만 판정한다 (문서 §5.4).
+  Chrono HMMWV 바디 포즈 ──▶ 중립 렌더 스트림(physics_source: Chrono)      (25 Hz)
+  MuJoCo 로봇 발 위치 + 수직 하중 ──▶ Chrono 발 대리 구가 흙을 누름 (발자국, robot_feet 설정 시)
+  로봇과 HMMWV 사이 물리 작용은 없다. 근접은 논리 이벤트로만 판정한다 (문서 §5.4).
+  발자국은 로봇이 흙에 빠지는 힘을 MuJoCo로 되돌리지 않는다: 패인 모양만 지형으로 돌아와 이후 걸음이 밟는다.
 
 Chrono는 별도 프로세스(chrono conda 환경, Python 3.12)로 돌고 socketpair로 연결한다 (cosim/wire.py).
 동기는 파이프라인 방식: 시각 T_k에 T_k 결과를 반영하고 곧바로 T_k+1을 요청하므로, 두 엔진이 같은 구간을
@@ -40,6 +42,9 @@ class ChronoLink:
         self.sync_dt = cfg.get("sync_dt", 0.04)
         self.terrain_every = max(1, round(cfg.get("terrain_dt", 0.2) / self.sync_dt))
         self.near_dist = cfg.get("near_distance", 3.0)
+        self.has_vehicle = "vehicle" in cfg
+        self.feet_enabled = bool(cfg.get("robot_feet"))
+        self._fn_sum, self._n_obs, self._feet_pos = np.zeros(4), 0, np.zeros((4, 3))
 
         # 칸 단위 정합 확인 (문서 §5.3 해상도 정합): SCM 격자 = MuJoCo 지형 격자
         scm = cfg["scm"]
@@ -79,8 +84,20 @@ class ChronoLink:
 
     # ---- 동기 ----
     def _request(self, k):
-        wire.send(self.sock, {"cmd": "advance", "t": round(k * self.sync_dt, 9), "terrain": k % self.terrain_every == 0})
+        msg = {"cmd": "advance", "t": round(k * self.sync_dt, 9), "terrain": k % self.terrain_every == 0}
+        if self.feet_enabled and self._n_obs:
+            # 지난 교환 이후 제어 주기들의 평균 수직 하중과 마지막 발 위치 (다음 구간 동안 Chrono가 사용)
+            fn = self._fn_sum / self._n_obs
+            msg["feet"] = [{"pos": p.tolist(), "fn": float(f)} for p, f in zip(self._feet_pos, fn)]
+            self._fn_sum[:], self._n_obs = 0.0, 0
+        wire.send(self.sock, msg)
         self.pending_t = k * self.sync_dt
+
+    def observe_feet(self, positions, normal_forces):
+        """제어 주기마다 호출: 발 중심 월드 위치(4x3)와 지면 수직 하중(N, 4)."""
+        self._feet_pos[:] = positions
+        self._fn_sum += normal_forces
+        self._n_obs += 1
 
     def sync(self, t):
         """제어 주기 시작마다 호출. 교환 시각에 도달했으면 결과를 반영하고 다음 구간을 요청."""
@@ -93,6 +110,7 @@ class ChronoLink:
         self.t = r["t"]
         self.poses = [(np.array(p["pos"]), np.array(p["quat"])) for p in r["poses"]]
         self.vehicle = r["vehicle"]
+        self.foot_state = r.get("feet", [])
         tr = r["terrain"]
         if tr:
             i = np.frombuffer(wire.unb64(tr["i"]), "<i4")
@@ -103,6 +121,8 @@ class ChronoLink:
 
     # ---- 로봇과의 관계 (물리 작용 없음, 논리 판정만) ----
     def distance_to(self, xy):
+        if not self.has_vehicle:
+            return np.inf
         d = float(np.linalg.norm(np.array(self.vehicle["pos"][:2]) - xy))
         self.min_dist = min(self.min_dist, d)
         return d
