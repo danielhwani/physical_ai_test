@@ -18,7 +18,10 @@ conda activate mj_ros                      # 또는 ~/miniconda3/envs/mj_ros/bin
 python -m sim.runner scenarios/flat_trot.yaml            # lockstep, 최대 속도, 화면 없음
 python -m sim.runner scenarios/rough_rut.yaml --view     # MuJoCo 뷰어 (소프트웨어 렌더링이라 느릴 수 있음)
 python -m sim.runner scenarios/flat_trot.yaml --realtime --rt   # 실시간 + SCHED_FIFO
-source /opt/ros/humble/setup.bash && python -m sim.runner scenarios/flat_trot.yaml --realtime --ros2
+python -m sim.runner scenarios/rough_rut.yaml --rviz     # RViz로 가시화 (MuJoCo는 물리엔진으로만 사용)
+#   RViz를 자동으로 띄우고 준비되면 시작한다. 끝난 뒤 RViz 창을 닫으면 종료, Ctrl+C로 중단해도 기록은 저장된다.
+#   수동으로 띄우려면: --realtime --ros2 로 실행하고, conda를 끈 터미널에서
+#   rviz2 -d config/go2.rviz --ros-args -p use_sim_time:=true
 python -m sim.runner scenarios/rough_rut.yaml --policy policies/go2_trot_bc/card.yaml --view   # ONNX 정책
 python train/imitate_trot.py                             # 모방학습 정책 재생성 (CPU, 약 3분)
 MUJOCO_GL=egl python -m sim.snapshot scenarios/rough_rut.yaml --t 5   # 오프스크린 스냅샷
@@ -51,7 +54,8 @@ python conformance/make_policy_reference.py <card.yaml>  # (ONNX를 바꾼 경�
 | `train/imitate_trot.py` | DAgger 모방학습 (numpy MLP, ONNX 그래프 직접 구성, PyTorch 불필요) | §12 |
 | `sim/runner.py` | 시나리오 실행, lockstep/실시간 두 모드, 넘어짐 판정, MOP 계산 | §9.2, §13 |
 | `sim/adapters.py` | 좌표계 변환 단일 지점 (MuJoCo / ROS2 REP-103 / UE5) | §6.3, §8 |
-| `sim/ros2_bridge.py` | `/tf`(모든 바디 월드 포즈), `/sim/base_twist`, `/joint_states`, `/clock` | §6.3 |
+| `sim/ros2_bridge.py` | `/tf`(모든 바디 월드 포즈), `/sim/base_twist`, `/joint_states`, `/clock`, `/robot_description`(MuJoCo 메쉬로 만든 URDF), `/sim/terrain`(지형 타일 마커) | §6.3 |
+| `config/go2.rviz` | RViz 설정 (로봇, 지형, 카메라가 몸통 추적). 시뮬레이션 시각을 쓰므로 `use_sim_time:=true` 필요 | – |
 | `sim/recorder.py` | Parquet 기록, Virtual 출처와 버전 조합 기록 | §4, §9.2, §13.3 |
 | `conformance/` | 결정성, IK-모델 일치, 관측 기준 벡터(`reference/obs_reference.npz`), 오버라이드-상류 일치, 변형 간 MOP 비교 | §12.3, §13.2 |
 
@@ -86,7 +90,7 @@ python conformance/make_policy_reference.py <card.yaml>  # (ONNX를 바꾼 경�
 
 ## 저사양을 고려해 의도적으로 뺀 것
 
-- **UE5 / 센서 시뮬레이션**: GPU 드라이버가 없어 불가. 렌더러는 ROS2 포즈 스트림을 받는 얇은 클라이언트로 나중에 붙인다.
+- **UE5 / 센서 시뮬레이션**: GPU 드라이버가 없어 불가. 렌더러는 포즈 스트림을 받는 얇은 클라이언트로 나중에 붙인다. 연동 계획과 추천 PC 제원은 [`docs/ue5_integration.md`](docs/ue5_integration.md).
 - **MJX / 강화학습**: GPU 없이는 학습 처리량이 나오지 않음. 학습은 다른 장비에서 하고 ONNX 정책만 가져오는 구조로 간다.
 - **Chrono 연동**: `chrono` conda env가 있으므로 다음 단계에서 SCM 결과를 `TerrainMapService.apply_heights()`로 넣으면 된다.
 - 그림자 끔, 뷰어 갱신 30 Hz 제한, 지형 20 m × 20 m @ 5 cm.

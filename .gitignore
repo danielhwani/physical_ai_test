@@ -2,6 +2,7 @@
 third_party/
 # 실행 결과
 runs/
+build/
 # 내부 문서, 작업용 캡처
 *.docx
 Screenshot*.png

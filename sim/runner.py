@@ -4,6 +4,7 @@
     python -m sim.runner scenarios/flat_trot.yaml --realtime   # 실시간 페이싱
     python -m sim.runner scenarios/flat_trot.yaml --view       # MuJoCo 뷰어 (저사양: 느릴 수 있음)
     python -m sim.runner scenarios/flat_trot.yaml --ros2       # ROS2 포즈 스트림 발행
+    python -m sim.runner scenarios/flat_trot.yaml --rviz       # RViz로 가시화 (ROS2 + 실시간 자동)
     python -m sim.runner scenarios/flat_trot.yaml --policy policies/go2_trot_bc/card.yaml   # ONNX 정책
 
 운용 모드는 문서 §9.2의 두 가지: lockstep(순수 가상)과 실시간(LVC 대비).
@@ -204,7 +205,7 @@ def run(args):
     }
     rec = Recorder(out, meta)
 
-    viewer = bridge = None
+    viewer = bridge = rviz = None
     pause = PauseControl(paused=args.start_paused)
     if args.view:
         before = set(threading.enumerate())
@@ -214,8 +215,14 @@ def run(args):
         viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
         viewer.cam.distance = 2.0
     if args.ros2:
-        from .ros2_bridge import Ros2PoseBridge
-        bridge = Ros2PoseBridge(m)
+        from .ros2_bridge import Ros2PoseBridge, launch_rviz
+        bridge = Ros2PoseBridge(m, sim.terrain)
+        if args.rviz:
+            rviz = launch_rviz(out / "rviz.log")
+            print("RViz 시작 대기 중...")
+            if not bridge.wait_for_subscriber(alive=lambda: rviz.poll() is None):
+                print(f"RViz가 뜨지 않았다. 로그: {(out / 'rviz.log').relative_to(ROOT)}")
+                rviz = None
     if args.rt:
         os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(50))
 
@@ -228,62 +235,71 @@ def run(args):
     next_view = 0.0
     was_paused = False
 
-    while d.time < scn["duration"]:
-        if viewer:
-            if pause.paused and pause.step_requests == 0:
-                if not was_paused:
-                    viewer.set_texts((None, mujoco.mjtGridPos.mjGRID_TOPLEFT, "PAUSED",
-                                      f"t = {d.time:.2f} s   [Space] resume  [Right] step"))   # 오버레이 폰트는 ASCII만 지원
-                    print(f"[t={d.time:6.2f}] paused")
-                    was_paused, pause_start = True, time.perf_counter()
-                viewer.sync()               # 일시정지 중에도 카메라 조작은 가능
-                time.sleep(1 / 30)
+    interrupted = False
+    try:
+        while d.time < scn["duration"]:
+            if viewer:
+                if pause.paused and pause.step_requests == 0:
+                    if not was_paused:
+                        viewer.set_texts((None, mujoco.mjtGridPos.mjGRID_TOPLEFT, "PAUSED",
+                                          f"t = {d.time:.2f} s   [Space] resume  [Right] step"))   # 오버레이 폰트는 ASCII만 지원
+                        print(f"[t={d.time:6.2f}] paused")
+                        was_paused, pause_start = True, time.perf_counter()
+                    viewer.sync()               # 일시정지 중에도 카메라 조작은 가능
+                    time.sleep(1 / 30)
+                    if not viewer.is_running():
+                        break
+                    continue
+                if was_paused and not pause.paused:
+                    viewer.clear_texts()
+                    wall0 = time.perf_counter() - d.time    # 실시간 기준점 재설정 (정지 시간은 지연으로 세지 않음)
+                    paused_total += time.perf_counter() - pause_start
+                    print(f"[t={d.time:6.2f}] resumed")
+                    was_paused = False
+                if pause.step_requests:
+                    pause.step_requests -= 1
+
+            terrain_changed, energy, roll, pitch = sim.step_control()
+            energy_total += energy
+
+            rec.log(t=d.time, base_pos=d.qpos[:3], base_quat_wxyz=d.qpos[3:7], base_linvel=d.qvel[:3],
+                    base_angvel_body=d.qvel[3:6], q=d.qpos[7:], qd=d.qvel[6:], tau=d.ctrl, q_des=sim.q_des,
+                    contact=sim.foot_contacts().astype(float), cmd=sim.clock.cmd_f, gait_phase=sim.clock.phase, obs=sim.obs, action=sim.action,
+                    terrain_version=sim.terrain.version)
+
+            if bridge:
+                bridge.publish(d)
+            if rviz is not None and rviz.poll() is not None:     # RViz 창을 닫으면 시험 종료
+                print(f"[t={d.time:6.2f}] RViz closed")
+                break
+            if viewer:
                 if not viewer.is_running():
                     break
-                continue
-            if was_paused and not pause.paused:
-                viewer.clear_texts()
-                wall0 = time.perf_counter() - d.time    # 실시간 기준점 재설정 (정지 시간은 지연으로 세지 않음)
-                paused_total += time.perf_counter() - pause_start
-                print(f"[t={d.time:6.2f}] resumed")
-                was_paused = False
-            if pause.step_requests:
-                pause.step_requests -= 1
+                if terrain_changed:
+                    viewer.update_hfield(sim.hfield_id)
+                if was_paused:                   # 1스텝 진행: 바로 그리고 시각 표시 갱신
+                    viewer.set_texts((None, mujoco.mjtGridPos.mjGRID_TOPLEFT, "PAUSED",
+                                      f"t = {d.time:.2f} s   [Space] resume  [Right] step"))   # 오버레이 폰트는 ASCII만 지원
+                    viewer.sync()
+                elif d.time >= next_view:        # 저사양: 화면 갱신은 30 Hz로 제한
+                    viewer.sync()
+                    next_view = d.time + 1 / 30
+            if (args.realtime or viewer) and not was_paused:
+                lag = (time.perf_counter() - wall0) - d.time
+                if lag < 0:
+                    time.sleep(-lag)
+                elif lag > ctrl_dt:
+                    late += 1
+                    max_lag = max(max_lag, lag)
 
-        terrain_changed, energy, roll, pitch = sim.step_control()
-        energy_total += energy
-
-        rec.log(t=d.time, base_pos=d.qpos[:3], base_quat_wxyz=d.qpos[3:7], base_linvel=d.qvel[:3],
-                base_angvel_body=d.qvel[3:6], q=d.qpos[7:], qd=d.qvel[6:], tau=d.ctrl, q_des=sim.q_des,
-                contact=sim.foot_contacts().astype(float), cmd=sim.clock.cmd_f, gait_phase=sim.clock.phase, obs=sim.obs, action=sim.action,
-                terrain_version=sim.terrain.version)
-
-        if bridge:
-            bridge.publish(d)
-        if viewer:
-            if not viewer.is_running():
+            if sim.fallen(roll, pitch):
+                fell_at = d.time
+                print(f"[t={d.time:6.2f}] FALL detected")
                 break
-            if terrain_changed:
-                viewer.update_hfield(sim.hfield_id)
-            if was_paused:                   # 1스텝 진행: 바로 그리고 시각 표시 갱신
-                viewer.set_texts((None, mujoco.mjtGridPos.mjGRID_TOPLEFT, "PAUSED",
-                                  f"t = {d.time:.2f} s   [Space] resume  [Right] step"))   # 오버레이 폰트는 ASCII만 지원
-                viewer.sync()
-            elif d.time >= next_view:        # 저사양: 화면 갱신은 30 Hz로 제한
-                viewer.sync()
-                next_view = d.time + 1 / 30
-        if (args.realtime or viewer) and not was_paused:
-            lag = (time.perf_counter() - wall0) - d.time
-            if lag < 0:
-                time.sleep(-lag)
-            elif lag > ctrl_dt:
-                late += 1
-                max_lag = max(max_lag, lag)
 
-        if sim.fallen(roll, pitch):
-            fell_at = d.time
-            print(f"[t={d.time:6.2f}] FALL detected")
-            break
+    except KeyboardInterrupt:          # Ctrl+C: 지금까지의 기록과 MOP는 저장하고 정리
+        interrupted = True
+        print(f"\n[t={d.time:6.2f}] interrupted")
 
     if was_paused:
         paused_total += time.perf_counter() - pause_start
@@ -293,7 +309,7 @@ def run(args):
         "sim_time_s": round(d.time, 3),
         "wall_time_s": round(wall, 3),
         "realtime_factor": round(d.time / wall, 2),
-        "fell": fell_at is not None, "fell_at_s": fell_at,
+        "fell": fell_at is not None, "fell_at_s": fell_at, "interrupted": interrupted,
         "distance_m": round(dist, 3),
         "forward_x_m": round(float(d.qpos[0] - start_xy[0]), 3),
         "lateral_drift_m": round(float(d.qpos[1] - start_xy[1]), 3),
@@ -314,6 +330,14 @@ def run(args):
         viewer.close()
         for t in viewer_threads:
             t.join(timeout=10)
+    if rviz is not None and rviz.poll() is None and not interrupted:
+        print("RViz 창을 닫으면 종료합니다 (Ctrl+C도 가능).")
+        try:
+            rviz.wait()                  # 그동안 마지막 상태(로봇, 지형)는 RViz에 남아 있다
+        except KeyboardInterrupt:
+            pass
+    if rviz is not None and rviz.poll() is None:
+        rviz.terminate()
     if bridge:
         bridge.close()
     return mop
@@ -326,11 +350,16 @@ def main():
     ap.add_argument("--view", action="store_true", help="MuJoCo 뷰어 표시")
     ap.add_argument("--start-paused", action="store_true", help="--view와 함께: 일시정지 상태로 시작")
     ap.add_argument("--ros2", action="store_true", help="ROS2 /tf, /joint_states, /clock 발행")
+    ap.add_argument("--rviz", action="store_true",
+                    help="RViz로 가시화 (--ros2, --realtime 자동 적용. conda 환경에서 바로 실행 가능)")
     ap.add_argument("--policy", help="정책 카드 경로 (예: policies/go2_trot_bc/card.yaml). 없으면 트롯 보행기")
     ap.add_argument("--variant", choices=["cpu", "mjx"], default="cpu",
                     help="mjx: specs/go2_mjx_override.yaml 적용 모델 (CPU MuJoCo로 실행)")
     ap.add_argument("--rt", action="store_true", help="SCHED_FIFO 우선순위 50 (RT 커널)")
-    run(ap.parse_args())
+    args = ap.parse_args()
+    if args.rviz:
+        args.ros2 = args.realtime = True
+    run(args)
 
 
 if __name__ == "__main__":

@@ -22,7 +22,8 @@ class TerrainMapService:
         self.X, self.Y = np.meshgrid(self.xs, self.ys)
         self.target = np.zeros((self.nrow, self.ncol))    # 최신 지형 (원천)
         self.applied = self.target.copy()                  # 물리엔진에 반영된 지형
-        self.version = 0
+        self.version = 0            # 원천(target)이 바뀔 때 증가
+        self.applied_version = 0    # 물리엔진 반영(applied)이 바뀔 때 증가 (렌더러 갱신 기준)
 
     # ---- MuJoCo 모델 빌드용 파라미터 ----
     @property
@@ -83,6 +84,7 @@ class TerrainMapService:
         if not pending.any():
             return False
         self.applied[pending] = self.target[pending]
+        self.applied_version += 1
         self.write_all(model, hfield_id)
         return True
 
