@@ -106,6 +106,17 @@ class Simulation:
         self.terrain_geom = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "terrain")
         self.total_mass = m.body_subtreemass[self.base_id]
         self.reset()
+        self.cosim = None
+        if "chrono" in self.scn:                 # 두 번째 물리엔진: 차량 + 변형 지면 (문서 §5)
+            from .chrono_link import ChronoLink
+            self.cosim = ChronoLink(self.scn["chrono"], self.terrain)
+
+    def close(self):
+        """외부 물리엔진 프로세스 정리. Chrono 통계(서버 계산 시간)를 돌려준다."""
+        if self.cosim is not None:
+            stats, self.cosim = self.cosim.close(), None
+            return stats
+        return None
 
     def reset(self):
         mujoco.mj_resetDataKeyframe(self.model, self.data, 0)
@@ -161,6 +172,14 @@ class Simulation:
         d = self.data
         dt = self.decim * self.model.opt.timestep
         self._apply_events(verbose)
+        if self.cosim is not None:
+            self.cosim.sync(d.time)              # Chrono 결과 반영 (지형 원천 갱신 + 차량 포즈)
+            dist = self.cosim.distance_to(d.qpos[:2])
+            if dist < self.cosim.near_dist and not self.cosim.near_event_sent:
+                self.cosim.near_event_sent = True
+                self.last_event = (d.time, f"vehicle_near {dist:.1f}m")
+                if verbose:
+                    print(f"[t={d.time:6.2f}] event: vehicle_near ({dist:.2f} m)")
         terrain_changed = False
         if d.time >= self.next_terrain_commit:
             terrain_changed = self.terrain.commit(self.model, self.hfield_id, self.feet_xy())
@@ -227,7 +246,7 @@ def run(args):
         viewer.cam.distance = 2.0
     if args.ros2:
         from .ros2_bridge import Ros2StreamPublisher, launch_rviz_stack
-        bridge = Ros2StreamPublisher(m, sim.terrain)
+        bridge = Ros2StreamPublisher(m, sim.terrain, sim.cosim)
         if args.rviz:
             rviz, adapter = launch_rviz_stack(out)
             print("RViz 시작 대기 중...")
@@ -278,6 +297,8 @@ def run(args):
                     base_angvel_body=d.qvel[3:6], q=d.qpos[7:], qd=d.qvel[6:], tau=d.ctrl, q_des=sim.q_des,
                     contact=sim.foot_contacts().astype(float), cmd=sim.clock.cmd_f, gait_phase=sim.clock.phase, obs=sim.obs, action=sim.action,
                     terrain_version=sim.terrain.version)
+            if sim.cosim is not None:
+                rec.log(vehicle_pos=sim.cosim.vehicle["pos"], vehicle_speed=sim.cosim.vehicle["speed"])
 
             if bridge:
                 bridge.publish(d)
@@ -330,6 +351,7 @@ def run(args):
         "lateral_drift_m": round(float(d.qpos[1] - start_xy[1]), 3),
         "mean_speed_mps": round(dist / max(d.time - 1.0, 1e-6), 3),
         "cost_of_transport": round(energy_total / (sim.total_mass * 9.81 * max(dist, 1e-6)), 3),
+        "min_vehicle_distance_m": round(sim.cosim.min_dist, 3) if sim.cosim is not None else None,
         "late_control_steps": late if (args.realtime or viewer) else None,
         "max_lag_s": round(max_lag, 4) if (args.realtime or viewer) else None,
     }
@@ -359,6 +381,9 @@ def run(args):
         adapter.terminate()
     if bridge:
         bridge.close()
+    stats = sim.close()
+    if stats:
+        print(f"Chrono 서버 계산 시간: {stats['busy_s']:.1f} s")
     return mop
 
 

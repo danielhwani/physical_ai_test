@@ -1,0 +1,43 @@
+# 차량 횡단 + 바퀴 자국 넘기, 무른 흙 버전 (vehicle_crossing.yaml과 흙 강도만 다름)
+# HMMWV가 로봇 진행 방향(x)을 가로질러(y 방향) x=3 m를 지나가며 SCM 지형에 바퀴 자국을 남긴다.
+# 로봇은 그 뒤 두 줄의 자국(x≈2.2, 3.8 m)을 넘어간다. 차량과 로봇 사이에 물리 작용은 없다 (단방향).
+name: vehicle_crossing_soft
+duration: 16.0
+seed: 2
+terrain:
+  size: [10.0, 10.0]
+  resolution: 0.05
+  z_range: [-0.3, 0.4]
+  patches:
+    # SCM 영역(x 1.5~4.5 m)은 평평해야 하므로 요철은 그 뒤에만 둔다
+    - {kind: rough, amplitude: 0.012, region: [5.0, -3.0, 9.0, 3.0]}
+controller:
+  type: trot
+  period: 0.36
+  swing_height: 0.08
+  stand_height: 0.27
+events:
+  - {t: 1.0, action: set_command, vx: 0.35, yaw_rate: 0.0}
+chrono:
+  sync_dt: 0.04          # 차량 포즈 교환 주기 (s)
+  terrain_dt: 0.2        # 지형 변경분 교환 주기 (s), 5 Hz
+  near_distance: 3.0     # 차량-로봇 근접 이벤트 거리 (m, 차체 중심 기준)
+  vehicle:
+    model: hmmwv
+    start: [3.0, -8.0]
+    end: [3.0, 8.0]
+    speed: 3.0           # m/s
+    t_start: 1.0
+  scm:
+    center: [3.0, 0.0]   # 지형 격자점에 있어야 함
+    size: [3.0, 19.0]    # 이 영역의 기본 지형은 평평(0)해야 함
+    resolution: 0.05     # = terrain.resolution (칸 단위 정합)
+    soil:                # Bekker-Wong + Janosi. 자국 깊이(이 PC 측정): kphi 1e6 -> 약 15 cm, 5e6 -> 약 5.5 cm, 2e7 -> 약 1.8 cm
+      bekker_kphi: 1.0e6 # 무른 흙: 자국 약 15 cm. 규칙 기반 트롯은 첫 자국에서 넘어진다 (넘어짐 판정 확인용)
+      bekker_kc: 0
+      bekker_n: 1.1
+      cohesion: 0
+      friction_deg: 30
+      janosi_shear: 0.01
+      elastic_k: 4.0e7
+      damping_r: 3.0e4

@@ -55,7 +55,8 @@ def status_lines(s):
         return [f"=={state}==|t={m['sim_time_s']:.2f}s",
                 f"forward={m['forward_x_m']:.2f}m|lateral={m['lateral_drift_m']:+.2f}m",
                 f"mean_speed={m['mean_speed_mps']:.2f}m/s|CoT={m['cost_of_transport']:.2f}",
-                f"late_steps={m['late_control_steps']}",
+                f"late_steps={m['late_control_steps']}"
+                + (f"|min_vehicle_dist={m['min_vehicle_distance_m']:.2f}m" if m.get("min_vehicle_distance_m") else ""),
                 "(close_RViz_to_exit)"], (m["fell"] or bool(m.get("interrupted")))
     cot = "--" if s["cot"] is None else f"{s['cot']:.2f}"
     lines = [f"[{s['controller']}|{s['variant']}]|t={s['t']:.2f}s",
@@ -63,6 +64,8 @@ def status_lines(s):
              f"speed={s['speed_avg']:.2f}m/s|dist={s['distance']:.2f}m|CoT={cot}",
              "contact:" + ",".join(n if f["contact"] else "--" for n, f in s["feet"].items()),
              f"late_steps={s['late_steps']}"]
+    for v in s.get("vehicles", []):
+        lines.append(f"{v['name']}:dist={v['distance']:.1f}m,speed={v['speed']:.1f}m/s")
     ev = s.get("event")
     if ev and s["t"] - ev["t"] < 3.0:
         lines.append(f"event@{ev['t']:.1f}s:{ev['desc']}")

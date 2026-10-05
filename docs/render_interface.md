@@ -50,7 +50,9 @@
 - 외형 메쉬(`mesh`)는 `asset_root` 기준 상대 경로의 OBJ이며, 정점은 **외형 좌표계**다.
   월드 정점 = 바디 포즈(TF) ∘ (`pos`, `quat`) ∘ 정점.
   (MuJoCo가 컴파일한 메쉬를 내보낸 것이라 원본 Menagerie OBJ와 좌표계가 다르다.)
-- `physics_source`: 그 바디의 움직임을 누가 결정하는가 (`MuJoCo`, 이후 `Chrono`, `Live`). 문서 §6.2, §9.
+- `physics_source`: 그 바디의 움직임을 누가 결정하는가 (`MuJoCo`, `Chrono`, 이후 `Live`). 문서 §6.2, §9.
+  다른 물리엔진의 바디는 id 1000부터 쓰고(MuJoCo 바디 id와 겹치지 않게), 포즈는 같은 `/tf`로 보낸다.
+  예: Chrono HMMWV는 차체와 바퀴 축 4개(`hmmwv_*`)가 들어가며, 메쉬는 `build/scene_meshes/chrono/`.
 - 다른 PC의 렌더러는 `build/scene_meshes/`를 복사해 가거나, 이후 자산 전송 방식을 정한다 (미결).
 
 ### 3. 지형 패치: `/sim/terrain_patch` (std_msgs/String, JSON, transient local, depth 500)
@@ -68,7 +70,7 @@
 ### 4. 상태: `/sim/status` (std_msgs/String, JSON, 10 Hz)
 
 ```json
-{"t": 6.2, "controller": "trot", "variant": "cpu",
+{"t": 6.2, "controller": "trot", "variant": "cpu", "vehicles": [{"name": "hmmwv", "pos": [x, y, z], "speed": 2.8, "distance": 2.5}],
  "command": {"vx": 0.35, "yaw_rate": 0.0}, "speed_avg": 0.33, "distance": 2.1, "cot": 3.8,
  "base_pos": [x, y, z], "yaw": 0.01,
  "feet": {"FL": {"pos": [x, y, z], "contact": true}, ...},

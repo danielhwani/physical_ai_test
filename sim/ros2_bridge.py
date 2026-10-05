@@ -43,7 +43,7 @@ def launch_rviz_stack(log_dir):
 
 
 class Ros2StreamPublisher:
-    def __init__(self, model, terrain, frame="world"):
+    def __init__(self, model, terrain, cosim=None, frame="world"):
         import rclpy
         from geometry_msgs.msg import TransformStamped, TwistStamped
         from rclpy.qos import DurabilityPolicy, QoSProfile
@@ -70,7 +70,8 @@ class Ros2StreamPublisher:
         self.bodies = [(i, mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, i)) for i in range(1, model.nbody)]
         self.joints = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, j) for j in range(1, model.njnt)]
 
-        self.pub_manifest.publish(String(data=json.dumps(build_manifest(model, terrain))))
+        self.cosim = cosim
+        self.pub_manifest.publish(String(data=json.dumps(build_manifest(model, terrain, cosim))))
         self.terrain_stream = TerrainPatchStream(terrain)
         self.pub_terrain.publish(String(data=json.dumps(self.terrain_stream.full())))
 
@@ -97,6 +98,13 @@ class Ros2StreamPublisher:
             t = self._T()
             t.header.stamp, t.header.frame_id, t.child_frame_id = stamp, self.frame, name
             p, q = data.xpos[bid], mj_quat_to_ros(data.xquat[bid])
+            t.transform.translation.x, t.transform.translation.y, t.transform.translation.z = map(float, p)
+            (t.transform.rotation.x, t.transform.rotation.y,
+             t.transform.rotation.z, t.transform.rotation.w) = map(float, q)
+            msg.transforms.append(t)
+        for name, p, q in (self.cosim.stream_poses() if self.cosim is not None else []):   # 다른 물리엔진 바디
+            t = self._T()
+            t.header.stamp, t.header.frame_id, t.child_frame_id = stamp, self.frame, name
             t.transform.translation.x, t.transform.translation.y, t.transform.translation.z = map(float, p)
             (t.transform.rotation.x, t.transform.rotation.y,
              t.transform.rotation.z, t.transform.rotation.w) = map(float, q)

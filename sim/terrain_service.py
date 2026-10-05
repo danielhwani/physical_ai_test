@@ -70,6 +70,22 @@ class TerrainMapService:
         self.target = np.clip(heights, self.z_min, self.z_max)
         self.version += 1
 
+    def set_cells(self, rows, cols, heights):
+        """외부 물리엔진(Chrono SCM)이 계산한 일부 셀의 절대 높이를 원천에 반영. 격자 밖 셀은 버린다."""
+        rows, cols, heights = np.asarray(rows), np.asarray(cols), np.asarray(heights, dtype=float)
+        ok = (rows >= 0) & (rows < self.nrow) & (cols >= 0) & (cols < self.ncol)
+        if ok.any():
+            self.target[rows[ok], cols[ok]] = np.clip(heights[ok], self.z_min, self.z_max)
+            self.version += 1
+        return int(ok.sum())
+
+    def cell_of(self, x, y):
+        """월드 좌표가 격자점에 정확히 놓이면 (row, col), 아니면 None."""
+        c, r = (x + self.half_x) / (2 * self.half_x) * (self.ncol - 1), (y + self.half_y) / (2 * self.half_y) * (self.nrow - 1)
+        if abs(c - round(c)) > 1e-6 or abs(r - round(r)) > 1e-6:
+            return None
+        return int(round(r)), int(round(c))
+
     def _in(self, x0, y0, x1, y1):
         return (self.X >= x0) & (self.X <= x1) & (self.Y >= y0) & (self.Y <= y1)
 

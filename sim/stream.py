@@ -39,7 +39,11 @@ def export_meshes(model, mesh_dir=MESH_DIR):
     return paths
 
 
-def build_manifest(model, terrain, physics_source="MuJoCo"):
+COSIM_ID_BASE = 1000     # 다른 물리엔진 바디의 id 시작값 (MuJoCo 바디 id와 겹치지 않게)
+
+
+def build_manifest(model, terrain, cosim=None, physics_source="MuJoCo"):
+    """cosim: 다른 물리엔진 연결(ChronoLink 등). 그 바디들도 같은 장면에 넣되 physics_source로 구분한다."""
     name = lambda t, i: mujoco.mj_id2name(model, t, i)  # noqa: E731
     meshes = export_meshes(model)
     bodies, visuals = [], []
@@ -56,6 +60,10 @@ def build_manifest(model, terrain, physics_source="MuJoCo"):
                         "mesh": meshes[model.geom_dataid[g]],
                         "pos": model.geom_pos[g].tolist(), "quat": mj_quat_to_ros(model.geom_quat[g]).tolist(),
                         "rgba": [float(c) for c in rgba]})
+    for k, b in enumerate(cosim.manifest_bodies() if cosim is not None else []):
+        bodies.append({"id": COSIM_ID_BASE + k, "name": b["name"], "parent": "world",
+                       "physics_source": b["physics_source"]})
+        visuals += [dict(v, body=b["name"]) for v in b["visuals"]]
     return {
         "stream_version": STREAM_VERSION,
         "frame": "world",
@@ -126,6 +134,9 @@ def build_status(sim, start_xy, energy, late, final_mop=None):
         "feet": {n: {"pos": d.geom_xpos[g].tolist(), "contact": bool(c)}
                  for n, g, c in zip(FOOT_NAMES, sim.foot_ids, sim.foot_contacts())},
         "late_steps": late,
+        "vehicles": [] if sim.cosim is None else [{
+            "name": "hmmwv", "pos": sim.cosim.vehicle["pos"], "speed": sim.cosim.vehicle["speed"],
+            "distance": float(np.linalg.norm(np.array(sim.cosim.vehicle["pos"][:2]) - d.qpos[:2]))}],
         "event": {"t": sim.last_event[0], "desc": sim.last_event[1]} if sim.last_event else None,
         "final_mop": final_mop,
     }
