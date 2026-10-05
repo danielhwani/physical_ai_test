@@ -15,8 +15,8 @@ Visualization Manager:
       Name: Terrain
       Enabled: true
       Topic:
-        Value: /sim/terrain
-        Depth: 200
+        Value: /viz/terrain
+        Depth: 500
         Durability Policy: Transient Local
         History Policy: Keep Last
         Reliability Policy: Reliable
@@ -33,6 +33,15 @@ Visualization Manager:
       Visual Enabled: true
       Collision Enabled: false
       Alpha: 1
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Status
+      Enabled: true
+      Topic:
+        Value: /viz/status_markers
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
     - Class: rviz_default_plugins/TF
       Name: TF
       Enabled: false

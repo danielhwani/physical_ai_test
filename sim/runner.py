@@ -31,6 +31,7 @@ from .controllers.onnx_policy import OnnxPolicyController
 from .controllers.trot import TrotController
 from .model_builder import ROOT, build_model
 from .recorder import Recorder
+from .stream import build_status
 from .terrain_service import TerrainMapService
 
 SIM_VERSION = "0.3.0"
@@ -55,6 +56,9 @@ class PauseControl:
             self.paused = not self.paused
         elif key == KEY_RIGHT and self.paused:
             self.step_requests += 1
+
+
+STATUS_DT = 0.1      # 상태 스트림 발행 주기 (시뮬레이션 시간 s)
 
 
 def load_yaml(path):
@@ -114,6 +118,7 @@ class Simulation:
         self.pending = deque([np.zeros(12)] * self.delay_steps)
         self.obs = np.zeros(self.iface.obs.dim)
         self.events = sorted(self.scn.get("events", []), key=lambda e: e["t"])
+        self.last_event = None      # (시각, 설명) 가시화용
         self.next_terrain_commit = 0.0
 
     # ---- 이벤트 (나중에 DIS 시나리오 콘솔이 같은 경로로 주입) ----
@@ -124,6 +129,12 @@ class Simulation:
                 self.clock.set_command(e["vx"], e.get("yaw_rate", 0.0))
             elif e["action"] == "add_patch":
                 self.terrain.add_patch(e["patch"])
+            desc = e["action"]
+            if e["action"] == "set_command":
+                desc += f" vx={e['vx']:.2f} yaw={e.get('yaw_rate', 0.0):.2f}"
+            elif e["action"] == "add_patch":
+                desc += f" {e['patch']['kind']}"
+            self.last_event = (self.data.time, desc)
             if verbose:
                 print(f"[t={self.data.time:6.2f}] event: {e['action']}")
 
@@ -205,7 +216,7 @@ def run(args):
     }
     rec = Recorder(out, meta)
 
-    viewer = bridge = rviz = None
+    viewer = bridge = rviz = adapter = None
     pause = PauseControl(paused=args.start_paused)
     if args.view:
         before = set(threading.enumerate())
@@ -215,10 +226,10 @@ def run(args):
         viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
         viewer.cam.distance = 2.0
     if args.ros2:
-        from .ros2_bridge import Ros2PoseBridge, launch_rviz
-        bridge = Ros2PoseBridge(m, sim.terrain)
+        from .ros2_bridge import Ros2StreamPublisher, launch_rviz_stack
+        bridge = Ros2StreamPublisher(m, sim.terrain)
         if args.rviz:
-            rviz = launch_rviz(out / "rviz.log")
+            rviz, adapter = launch_rviz_stack(out)
             print("RViz 시작 대기 중...")
             if not bridge.wait_for_subscriber(alive=lambda: rviz.poll() is None):
                 print(f"RViz가 뜨지 않았다. 로그: {(out / 'rviz.log').relative_to(ROOT)}")
@@ -233,6 +244,7 @@ def run(args):
     paused_total, pause_start = 0.0, None
     late, max_lag = 0, 0.0
     next_view = 0.0
+    next_status = 0.0
     was_paused = False
 
     interrupted = False
@@ -269,6 +281,9 @@ def run(args):
 
             if bridge:
                 bridge.publish(d)
+                if d.time >= next_status:
+                    bridge.publish_status(build_status(sim, start_xy, energy_total, late))
+                    next_status = d.time + STATUS_DT
             if rviz is not None and rviz.poll() is not None:     # RViz 창을 닫으면 시험 종료
                 print(f"[t={d.time:6.2f}] RViz closed")
                 break
@@ -319,6 +334,8 @@ def run(args):
         "max_lag_s": round(max_lag, 4) if (args.realtime or viewer) else None,
     }
     rec.save(mop)
+    if bridge and not interrupted:      # Ctrl+C 때는 rclpy가 이미 종료됨
+        bridge.publish_status(build_status(sim, start_xy, energy_total, late, final_mop=mop))
     print("\n== MOP ==")
     for k, v in mop.items():
         print(f"  {k:20s} {v}")
@@ -338,6 +355,8 @@ def run(args):
             pass
     if rviz is not None and rviz.poll() is None:
         rviz.terminate()
+    if adapter is not None and adapter.poll() is None:
+        adapter.terminate()
     if bridge:
         bridge.close()
     return mop

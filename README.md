@@ -20,8 +20,10 @@ python -m sim.runner scenarios/rough_rut.yaml --view     # MuJoCo 뷰어 (소프
 python -m sim.runner scenarios/flat_trot.yaml --realtime --rt   # 실시간 + SCHED_FIFO
 python -m sim.runner scenarios/rough_rut.yaml --rviz     # RViz로 가시화 (MuJoCo는 물리엔진으로만 사용)
 #   RViz를 자동으로 띄우고 준비되면 시작한다. 끝난 뒤 RViz 창을 닫으면 종료, Ctrl+C로 중단해도 기록은 저장된다.
-#   수동으로 띄우려면: --realtime --ros2 로 실행하고, conda를 끈 터미널에서
-#   rviz2 -d config/go2.rviz --ros-args -p use_sim_time:=true
+#   로봇 위 정보판(시각, 명령, 속도, 거리, CoT, 발 접촉, 이벤트, 지연 -> 종료 시 최종 MOP),
+#   발 접촉(초록=접지), 명령 화살표(파랑), 경로(노랑). 같은 정보가 /sim/status(JSON)로도 나온다.
+#   수동으로 띄우려면: --realtime --ros2 로 실행하고, python -m viz.rviz_adapter 를 따로 실행한 뒤,
+#   conda를 끈 터미널에서 rviz2 -d config/go2.rviz --ros-args -p use_sim_time:=true
 python -m sim.runner scenarios/rough_rut.yaml --policy policies/go2_trot_bc/card.yaml --view   # ONNX 정책
 python train/imitate_trot.py                             # 모방학습 정책 재생성 (CPU, 약 3분)
 MUJOCO_GL=egl python -m sim.snapshot scenarios/rough_rut.yaml --t 5   # 오프스크린 스냅샷
@@ -29,6 +31,7 @@ python -m sim.runner scenarios/rough_rut.yaml --variant mjx   # MJX용 물리 �
 python conformance/test_conformance.py                   # 결정성, IK-모델 일치
 python conformance/test_specs.py                         # 관측 기준 벡터, 카드 관절 재배열, MJX 오버라이드 검증
 python conformance/test_policy.py                        # 정책 카드/ONNX 입출력/결정성/추론 지연
+python conformance/test_render_stream.py                 # 렌더 스트림 계약 (스트림만으로 장면 재구성 = 시뮬레이터)
 python conformance/compare_variants.py [--policy card.yaml]   # cpu vs mjx 설정의 MOP 분포 비교
 python conformance/make_obs_reference.py                 # (관측 명세를 바꾼 경우) 기준 벡터 재생성
 python conformance/make_policy_reference.py <card.yaml>  # (ONNX를 바꾼 경우) 정책 입출력 기준 재생성
@@ -54,8 +57,11 @@ python conformance/make_policy_reference.py <card.yaml>  # (ONNX를 바꾼 경�
 | `train/imitate_trot.py` | DAgger 모방학습 (numpy MLP, ONNX 그래프 직접 구성, PyTorch 불필요) | §12 |
 | `sim/runner.py` | 시나리오 실행, lockstep/실시간 두 모드, 넘어짐 판정, MOP 계산 | §9.2, §13 |
 | `sim/adapters.py` | 좌표계 변환 단일 지점 (MuJoCo / ROS2 REP-103 / UE5) | §6.3, §8 |
-| `sim/ros2_bridge.py` | `/tf`(모든 바디 월드 포즈), `/sim/base_twist`, `/joint_states`, `/clock`, `/robot_description`(MuJoCo 메쉬로 만든 URDF), `/sim/terrain`(지형 타일 마커) | §6.3 |
-| `config/go2.rviz` | RViz 설정 (로봇, 지형, 카메라가 몸통 추적). 시뮬레이션 시각을 쓰므로 `use_sim_time:=true` 필요 | – |
+| `sim/stream.py` | 중립 렌더 스트림 인코더: 장면 매니페스트, 지형 패치, 상태. 그리는 방법은 모름 | §8 |
+| `sim/ros2_bridge.py` | 중립 스트림의 ROS2 전송: `/tf`, `/clock`, `/joint_states`, `/sim/base_twist`, `/sim/scene_manifest`, `/sim/terrain_patch`, `/sim/status` | §6.3 |
+| `viz/` | 렌더러 쪽 (물리엔진 import 금지). `stream_decode.py` 공용 디코더, `rviz_adapter.py` 중립 스트림 -> RViz 표현 | §6, §8 |
+| `config/go2.rviz` | RViz 설정 (로봇, 지형, 정보, 카메라가 몸통 추적). 시뮬레이션 시각을 쓰므로 `use_sim_time:=true` 필요 | – |
+| `docs/render_interface.md` | 렌더 인터페이스 계약 (메시지, 규약, 어댑터 추가 방법, 계약 시험) | §8 |
 | `sim/recorder.py` | Parquet 기록, Virtual 출처와 버전 조합 기록 | §4, §9.2, §13.3 |
 | `conformance/` | 결정성, IK-모델 일치, 관측 기준 벡터(`reference/obs_reference.npz`), 오버라이드-상류 일치, 변형 간 MOP 비교 | §12.3, §13.2 |
 

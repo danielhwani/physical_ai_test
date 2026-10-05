@@ -20,14 +20,22 @@
 
 ## 2. 이미 있는 것
 
+**중립 렌더 스트림과 계약이 준비되어 있다: [`docs/render_interface.md`](render_interface.md).**
+RViz 어댑터(`viz/rviz_adapter.py`)가 이 스트림만으로 로봇, 지형 변형, 시험 정보를 그리고 있으므로,
+UE5 어댑터는 같은 입력을 받아 UE5 표현으로 바꾸는 "두 번째 어댑터"가 된다.
+
 | 항목 | 위치 | 비고 |
 |---|---|---|
-| 바디 월드 포즈 스트림 | `sim/ros2_bridge.py` (`--ros2`) | `/tf`에 모든 바디, `/sim/base_twist`, `/joint_states`, `/clock` |
-| 좌표 변환식 | `sim/adapters.py` `mj_pose_to_ue()` | 위치 Y 반전 ×100(cm), 쿼터니언 (−x, y, −z, w) |
-| 지형 원천 | `sim/terrain_service.py` | 절대 높이 격자, 버전 번호, 변경 셀 추적 |
-| 로봇 메쉬 | `third_party/mujoco_menagerie/unitree_go2/assets/*.obj` | `scripts/fetch_models.sh`로 받음 |
+| 바디 포즈 | `/tf` | 모든 바디 월드 포즈, 50 Hz |
+| 장면 매니페스트 | `/sim/scene_manifest` | 바디, 외형 메쉬(외형 좌표계 OBJ), 지형 규격. 아래 3.2의 매니페스트에 해당 |
+| 지형 패치 | `/sim/terrain_patch` | 높이 격자 변경분 (base64 float32). 아래 3.1의 지형 패치에 해당 |
+| 상태 | `/sim/status` | 명령, 속도, 접촉, 이벤트, 최종 MOP |
+| 공용 디코더 | `viz/stream_decode.py` | UE5 쪽 C++로 옮길 때 참고 |
+| 좌표 변환식 | `sim/adapters.py` `mj_pose_to_ue()` | 위치 Y 반전 ×100(cm), 쿼터니언 (−x, y, −z, w). UE5 어댑터 안에서만 사용 |
 
 ## 3. 시뮬레이션 쪽에서 추가할 것
+
+내용(매니페스트, 지형 패치, 상태)은 이미 계약으로 정해져 있다. 남은 것은 ROS2 없이 받을 수 있는 **UDP 전송**뿐이다.
 
 ### 3.1 렌더 스트림 송신 (`--render-udp host:port`)
 ROS2 플러그인 없이 UE5 내장 소켓으로 받을 수 있게 UDP를 기본으로 한다. ROS2(`/tf`)는 대안으로 유지.
