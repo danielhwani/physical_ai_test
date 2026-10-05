@@ -42,6 +42,12 @@ def launch_rviz_stack(log_dir):
     return rviz, adapter
 
 
+def launch_mujoco_viewer(log_dir):
+    """MuJoCo 렌더러 어댑터 (중립 스트림 -> 그리기 전용 MuJoCo 모델 -> 뷰어)."""
+    return subprocess.Popen([sys.executable, "-m", "viz.mujoco_adapter"], cwd=ROOT,
+                            stdout=open(log_dir / "mujoco_adapter.log", "w"), stderr=subprocess.STDOUT)
+
+
 class Ros2StreamPublisher:
     def __init__(self, model, terrain, cosim=None, frame="world"):
         import rclpy
@@ -75,11 +81,11 @@ class Ros2StreamPublisher:
         self.terrain_stream = TerrainPatchStream(terrain)
         self.pub_terrain.publish(String(data=json.dumps(self.terrain_stream.full())))
 
-    def wait_for_subscriber(self, topic="/tf", timeout=30.0, alive=lambda: True):
-        """RViz 같은 구독자가 붙을 때까지 대기 (늦게 켜져 시작 장면을 놓치지 않도록)."""
+    def wait_for_subscriber(self, topic="/tf", count=1, timeout=30.0, alive=lambda: True):
+        """렌더러 같은 구독자가 count개 붙을 때까지 대기 (늦게 켜져 시작 장면을 놓치지 않도록)."""
         t0 = time.time()
         while time.time() - t0 < timeout and alive():
-            if self.node.count_subscribers(topic) > 0:
+            if self.node.count_subscribers(topic) >= count:
                 time.sleep(1.0)          # 구독 후 표시 준비 여유
                 return True
             time.sleep(0.2)

@@ -5,6 +5,7 @@
     python -m sim.runner scenarios/flat_trot.yaml --view       # MuJoCo 뷰어 (저사양: 느릴 수 있음)
     python -m sim.runner scenarios/flat_trot.yaml --ros2       # ROS2 포즈 스트림 발행
     python -m sim.runner scenarios/flat_trot.yaml --rviz       # RViz로 가시화 (ROS2 + 실시간 자동)
+    python -m sim.runner scenarios/flat_trot.yaml --mjviz      # MuJoCo 렌더러 어댑터로 가시화 (중립 스트림 사용)
     python -m sim.runner scenarios/flat_trot.yaml --policy policies/go2_trot_bc/card.yaml   # ONNX 정책
 
 운용 모드는 문서 §9.2의 두 가지: lockstep(순수 가상)과 실시간(LVC 대비).
@@ -235,7 +236,8 @@ def run(args):
     }
     rec = Recorder(out, meta)
 
-    viewer = bridge = rviz = adapter = None
+    viewer = bridge = None
+    displays, helpers = [], []   # 창(닫으면 시험 종료) / 보조 프로세스(끝나면 정리)
     pause = PauseControl(paused=args.start_paused)
     if args.view:
         before = set(threading.enumerate())
@@ -245,14 +247,21 @@ def run(args):
         viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
         viewer.cam.distance = 2.0
     if args.ros2:
-        from .ros2_bridge import Ros2StreamPublisher, launch_rviz_stack
+        from .ros2_bridge import Ros2StreamPublisher, launch_mujoco_viewer, launch_rviz_stack
         bridge = Ros2StreamPublisher(m, sim.terrain, sim.cosim)
         if args.rviz:
-            rviz, adapter = launch_rviz_stack(out)
-            print("RViz 시작 대기 중...")
-            if not bridge.wait_for_subscriber(alive=lambda: rviz.poll() is None):
-                print(f"RViz가 뜨지 않았다. 로그: {(out / 'rviz.log').relative_to(ROOT)}")
-                rviz = None
+            rviz, rviz_adapter = launch_rviz_stack(out)
+            displays.append(("RViz", rviz))
+            helpers.append(rviz_adapter)
+        if args.mjviz:
+            displays.append(("MuJoCo viewer", launch_mujoco_viewer(out)))
+        if displays:
+            names = ", ".join(n for n, _ in displays)
+            print(f"{names} 시작 대기 중...")
+            # 창마다 /tf 구독자 하나 (RViz, MuJoCo 렌더러 어댑터)
+            if not bridge.wait_for_subscriber(count=len(displays),
+                                              alive=lambda: all(p.poll() is None for _, p in displays)):
+                print(f"창이 뜨지 않았다. 로그: {out.relative_to(ROOT)}/*.log")
     if args.rt:
         os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(50))
 
@@ -305,8 +314,9 @@ def run(args):
                 if d.time >= next_status:
                     bridge.publish_status(build_status(sim, start_xy, energy_total, late))
                     next_status = d.time + STATUS_DT
-            if rviz is not None and rviz.poll() is not None:     # RViz 창을 닫으면 시험 종료
-                print(f"[t={d.time:6.2f}] RViz closed")
+            closed = [n for n, p in displays if p.poll() is not None]
+            if closed:                                  # 창을 닫으면 시험 종료
+                print(f"[t={d.time:6.2f}] {closed[0]} closed")
                 break
             if viewer:
                 if not viewer.is_running():
@@ -369,16 +379,17 @@ def run(args):
         viewer.close()
         for t in viewer_threads:
             t.join(timeout=10)
-    if rviz is not None and rviz.poll() is None and not interrupted:
-        print("RViz 창을 닫으면 종료합니다 (Ctrl+C도 가능).")
+    open_displays = [(n, p) for n, p in displays if p.poll() is None]
+    if open_displays and not interrupted:
+        print("창을 닫으면 종료합니다 (Ctrl+C도 가능).")
         try:
-            rviz.wait()                  # 그동안 마지막 상태(로봇, 지형)는 RViz에 남아 있다
+            while all(p.poll() is None for _, p in open_displays):   # 그동안 마지막 상태가 창에 남아 있다
+                time.sleep(0.2)
         except KeyboardInterrupt:
             pass
-    if rviz is not None and rviz.poll() is None:
-        rviz.terminate()
-    if adapter is not None and adapter.poll() is None:
-        adapter.terminate()
+    for p in [p for _, p in displays] + helpers:
+        if p.poll() is None:
+            p.terminate()
     if bridge:
         bridge.close()
     stats = sim.close()
@@ -396,12 +407,14 @@ def main():
     ap.add_argument("--ros2", action="store_true", help="ROS2 /tf, /joint_states, /clock 발행")
     ap.add_argument("--rviz", action="store_true",
                     help="RViz로 가시화 (--ros2, --realtime 자동 적용. conda 환경에서 바로 실행 가능)")
+    ap.add_argument("--mjviz", action="store_true",
+                    help="MuJoCo 렌더러 어댑터로 가시화 (중립 스트림만 사용. HMMWV 등 다른 물리엔진 바디도 표시)")
     ap.add_argument("--policy", help="정책 카드 경로 (예: policies/go2_trot_bc/card.yaml). 없으면 트롯 보행기")
     ap.add_argument("--variant", choices=["cpu", "mjx"], default="cpu",
                     help="mjx: specs/go2_mjx_override.yaml 적용 모델 (CPU MuJoCo로 실행)")
     ap.add_argument("--rt", action="store_true", help="SCHED_FIFO 우선순위 50 (RT 커널)")
     args = ap.parse_args()
-    if args.rviz:
+    if args.rviz or args.mjviz:
         args.ros2 = args.realtime = True
     run(args)
 

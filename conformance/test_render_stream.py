@@ -3,10 +3,12 @@
     python conformance/test_render_stream.py
 
 렌더러는 스트림만 보고 장면을 그린다. 그래서 "스트림만으로 재구성한 장면 = 시뮬레이터가 계산한 장면"이어야 한다.
-1. 렌더러 패키지(viz/)가 물리엔진(MuJoCo)에 의존하지 않는다
+1. 렌더러 패키지(viz/)가 물리 시뮬레이션(sim/)에 의존하지 않는다. RViz 쪽은 MuJoCo도 쓰지 않고,
+   MuJoCo 렌더러 어댑터는 MuJoCo를 그리기 라이브러리로만 쓴다
 2. 외형: 매니페스트 + 바디 포즈(TF와 같은 x,y,z,w)로 놓은 메쉬 정점 = MuJoCo의 월드 geom 정점
 3. 지형: 높이 패치를 차례로 적용한 격자 = 물리엔진에 반영된 지형 (실행 중 변형 포함)
 4. 상태/매니페스트가 JSON으로 왕복되고, RViz 어댑터가 매니페스트로 URDF를 만든다
+5. MuJoCo 렌더러 어댑터: 매니페스트로 만든 그리기 전용 모델 + 포즈 = 시뮬레이터 외형, 지형도 같다
 """
 import contextlib
 import io
@@ -32,11 +34,16 @@ def _roundtrip(obj):
     return json.loads(json.dumps(obj))         # 실제 전송과 같이 JSON 직렬화를 거친다
 
 
-def test_viz_does_not_depend_on_physics():
-    code = ("import sys; import viz.stream_decode, viz.rviz_adapter; "
-            "bad = [m for m in sys.modules if m.split('.')[0] in ('mujoco', 'sim')]; print(bad)")
+def _imported_roots(modules):
+    code = (f"import sys; import {modules}; "
+            "print(sorted({m.split('.')[0] for m in sys.modules} & {'mujoco', 'sim', 'cosim'}))")
     out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, check=True)
-    assert out.stdout.strip() == "[]", f"viz/가 물리엔진 쪽 모듈을 불러옴: {out.stdout}"
+    return out.stdout.strip()
+
+
+def test_viz_does_not_depend_on_physics():
+    assert _imported_roots("viz.stream_decode, viz.rviz_adapter") == "[]", "RViz 경로가 MuJoCo/sim을 불러옴"
+    assert _imported_roots("viz.mujoco_adapter") == "['mujoco']", "MuJoCo 렌더러가 물리 시뮬레이션(sim/)을 불러옴"
 
 
 def test_visuals_reconstruct_simulator_geometry():
@@ -98,6 +105,56 @@ def test_status_and_urdf():
     assert links == {"world"} | {b["name"] for b in manifest["bodies"]}
     for mesh in urdf.iter("mesh"):
         assert Path(mesh.get("filename").removeprefix("file://")).exists()
+
+
+def test_mujoco_render_model_matches_simulator():
+    import mujoco
+    from viz.mujoco_adapter import apply_poses, build_render_model, write_terrain
+    sim = Simulation(SCENARIO)
+    with contextlib.redirect_stdout(io.StringIO()):
+        for _ in range(150):
+            sim.step_control()
+    m0, d0 = sim.model, sim.data
+    manifest = _roundtrip(build_manifest(m0, sim.terrain))
+    model, mocap, hid = build_render_model(manifest)
+    data = mujoco.MjData(model)
+    poses = {b["name"]: (d0.xpos[b["id"]].tolist(), mj_quat_to_ros(d0.xquat[b["id"]]).tolist()) for b in manifest["bodies"]}
+    apply_poses(model, data, mocap, poses)
+
+    def world_verts(m, d, g):
+        mid = m.geom_dataid[g]
+        v = m.mesh_vert[m.mesh_vertadr[mid]:m.mesh_vertadr[mid] + m.mesh_vertnum[mid]]
+        return (d.geom_xmat[g].reshape(3, 3) @ v.T).T + d.geom_xpos[g]
+
+    src = [g for g in range(m0.ngeom) if m0.geom_type[g] == 7 and m0.geom_bodyid[g] != 0]
+    dst = [g for g in range(model.ngeom) if model.geom_type[g] == 7]
+    assert len(src) == len(dst)
+    worst = 0.0
+    for gs, gd in zip(src, dst):
+        a, b = world_verts(m0, d0, gs), world_verts(model, data, gd)
+        # 다시 컴파일하면 정점 순서가 바뀔 수 있으므로 중심과 축별 분포로 비교
+        worst = max(worst, np.abs(a.mean(0) - b.mean(0)).max(), np.abs(np.sort(a, 0) - np.sort(b, 0)).max())
+    assert worst < 1e-5, f"그리기 모델 외형 오차 {worst:.2e} m"
+
+    grid = TerrainGrid(manifest["terrain"])
+    grid.apply(_roundtrip(TerrainPatchStream(sim.terrain).full()))
+    write_terrain(model, hid, grid, manifest["terrain"]["z_range"])
+    zmin, zmax = manifest["terrain"]["z_range"]
+    adr = model.hfield_adr[hid]
+    h = model.hfield_data[adr:adr + grid.heights.size].reshape(grid.heights.shape) * (zmax - zmin) + zmin
+    assert np.allclose(h, sim.terrain.applied, atol=1e-6)
+
+
+def test_mujoco_overlay_path_segments():
+    import mujoco
+    from viz.mujoco_adapter import MAX_PATH, draw_overlays
+    scn = mujoco.MjvScene(mujoco.MjModel.from_xml_string("<mujoco><worldbody/></mujoco>"), maxgeom=10000)
+    status = {"feet": {"FL": {"pos": [0, 0, 0], "contact": True}}, "base_pos": [1, 0, 0.3], "yaw": 0.0,
+              "command": {"vx": 0.3}}
+    for n in (2, 50, 1000):
+        draw_overlays(scn, status, [np.array([x, 0, 0.3]) for x in np.linspace(0, 2, n)])
+        caps = [scn.geoms[i] for i in range(scn.ngeom) if scn.geoms[i].type == mujoco.mjtGeom.mjGEOM_CAPSULE]
+        assert len(caps) == min(n - 1, MAX_PATH) and min(g.size[2] for g in caps) > 0, n   # 길이 0 선분 금지
 
 
 if __name__ == "__main__":

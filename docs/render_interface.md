@@ -89,13 +89,22 @@
 4. 상태는 렌더러에 맞게 표시한다 (문구, 색, 위젯).
 
 공용 디코더: `viz/stream_decode.py` (`TerrainGrid`, `decode_heights`, `quat_to_matrix` 등).
-참고 구현: `viz/rviz_adapter.py`.
+
+| 어댑터 | 실행 | 표현 |
+|---|---|---|
+| `viz/rviz_adapter.py` | `--rviz` | URDF(RobotModel), 지형 타일 마커, 정보판 마커. MuJoCo도 import하지 않음 |
+| `viz/mujoco_adapter.py` | `--mjviz` | 매니페스트로 만든 **그리기 전용** MuJoCo 모델 (모든 바디 mocap, 물리 계산 없음) + 뷰어. MuJoCo를 그리기 라이브러리로만 사용 |
+| UE5 어댑터 | (계획) | `docs/ue5_integration.md` |
+
+`--rviz`와 `--mjviz`는 함께 켤 수 있다. 렌더러는 `sim/`(물리 시뮬레이션)을 import하지 않는다.
 
 ## 계약 시험 (`conformance/test_render_stream.py`)
 
 | 시험 | 확인 내용 |
 |---|---|
-| `test_viz_does_not_depend_on_physics` | `viz/`가 `mujoco`, `sim` 모듈을 불러오지 않음 |
+| `test_viz_does_not_depend_on_physics` | `viz/`가 `sim`을 불러오지 않음. RViz 경로는 `mujoco`도 불러오지 않음 |
 | `test_visuals_reconstruct_simulator_geometry` | 스트림으로 놓은 메쉬 정점 = MuJoCo 월드 geom 정점 (< 1e-5 m) |
 | `test_terrain_patches_reconstruct_physics_terrain` | 패치 누적 = 물리엔진 지형, 실행 중 변형 포함 (< 1e-6 m) |
 | `test_status_and_urdf` | 상태/매니페스트 JSON 왕복, 매니페스트로 만든 URDF의 링크와 메쉬 파일 |
+| `test_mujoco_render_model_matches_simulator` | 그리기 전용 MuJoCo 모델 + 포즈 = 시뮬레이터 외형 (< 1e-5 m), 지형 일치 |
+| `test_mujoco_overlay_path_segments` | 경로 선분이 연속한 점을 잇는지 (길이 0 선분 없음) |
