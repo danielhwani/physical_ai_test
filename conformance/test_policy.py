@@ -19,8 +19,8 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from conformance.make_policy_reference import onnx_sha256  # noqa: E402
-from sim.control_interface import ControlInterface, load_card  # noqa: E402
-from sim.controllers.onnx_policy import OnnxPolicyController  # noqa: E402
+from control.interface import ControlInterface, load_card  # noqa: E402
+from control.onnx_policy import OnnxPolicyController  # noqa: E402
 from sim.runner import Simulation  # noqa: E402
 
 CARD_PATH = Path(sys.argv[1]) if len(sys.argv) > 1 and __name__ == "__main__" else ROOT / "policies/go2_trot_bc/card.yaml"

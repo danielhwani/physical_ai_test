@@ -1,4 +1,4 @@
-"""컨트롤러 공통 요소.
+"""컨트롤러 공통 요소 (알고리즘 쪽).
 
 명령 필터와 보행 위상 시계는 runner가 소유하고 모든 컨트롤러가 같이 쓴다.
 정책 관측(command, gait_phase)과 규칙 기반 보행기가 같은 값을 보게 하기 위함이다.
@@ -41,14 +41,13 @@ class GaitClock:
 
 @dataclass
 class StepContext:
-    """제어 주기마다 컨트롤러에 넘기는 상태 (컨트롤러는 필요한 것만 쓴다)."""
+    """제어 주기마다 컨트롤러에 넘기는 값. 모두 로봇이 아는 값(측정 + 추정)이다. 참값은 없다."""
     dt: float
-    qpos: np.ndarray
-    qvel: np.ndarray
+    est: object          # control.estimator.Estimate (자세, 각속도, 다리 주행거리계 속도, 접촉, 관절)
     roll: float
     pitch: float
     yaw: float
-    v_body_x: float      # 몸통 좌표 전진 속도 (규칙 기반 보행기 전용: 실기 정책은 보통 못 씀)
+    v_body_x: float      # 몸통 좌표 전진 속도 (추정)
     wz_world: float
     clock: GaitClock
-    obs: np.ndarray      # 이 컨트롤러의 인터페이스로 계산한 관측
+    obs: np.ndarray      # 이 컨트롤러의 인터페이스로 계산한 관측 (추정값 기반)

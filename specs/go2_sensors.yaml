@@ -1,0 +1,30 @@
+# 센서 명세 (문서 §8). 시나리오의 sensors: [이름, ...] 또는 실행 옵션 --sensor 이름 으로 켠다.
+# 센서 모델은 sensors/ (엔진 무관). LiDAR 레이캐스트는 viz/sensor_renderer.py (중립 스트림 장면 + MuJoCo 기하 계산).
+lidars:
+  front_lidar:
+    # Go2 기본 LiDAR(Unitree L1, 초당 약 2만 점)를 참고한 앞쪽 180도 스캐너. 장착 위치/자세는 근사값
+    parent: base
+    pos: [0.29, 0.0, -0.04]      # 머리 앞쪽 아래 (base 좌표, m)
+    rpy: [0.0, 0.0, 0.0]         # 센서 x축 = 몸통 정면. 수직 범위로 발밑을 본다
+    rate_hz: 10.0
+    azimuth_deg: [-90.0, 90.0]
+    azimuth_step_deg: 1.5
+    elevation_deg: [-60.0, 10.0]
+    channels: 24                 # 121 x 24 = 2904 광선/프레임
+    range_min: 0.05
+    range_max: 30.0
+    noise_std: 0.01              # 거리 잡음 표준편차 (m). L1 정확도 약 2 cm
+    dropout: 0.0
+    seed: 0
+
+# 고유수용 센서 (sensors/proprio.py): 보행 알고리즘이 받는 로봇 상태의 잡음/편향/표류. 잡음 난수 시드 = 시나리오 seed
+proprio:
+  gyro_noise: 0.005          # rad/s
+  gyro_bias: 0.002           # rad/s (실행마다 축별로 정해짐)
+  accel_noise: 0.05          # m/s^2
+  accel_bias: 0.02           # m/s^2
+  attitude_noise_deg: 0.2    # IMU 자세 출력(AHRS) 롤/피치 잡음
+  yaw_drift_deg_s: 0.05      # IMU 방향 표류율 (도/초, 실행마다 정해짐)
+  joint_pos_noise: 2.0e-4    # rad
+  joint_vel_noise: 0.02      # rad/s
+  foot_force_noise: 2.0      # N

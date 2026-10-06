@@ -24,7 +24,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from sim.runner import Simulation, load_yaml  # noqa: E402
 
-OUT_DIR = ROOT / "policies/go2_trot_bc"
+OUT_DIR = ROOT / "policies/go2_trot_bc_est"
+LATENCY_RANGE = (0, 2)       # 에피소드마다 연결 지연 0~2 제어 주기 (배치 측정값 1주기 = 20 ms 주변으로 여유)
 EPISODE_S = 12.0
 HIDDEN = (128, 128)
 
@@ -90,7 +91,7 @@ class MLP:
 
 # ---------------- 데이터 수집 ----------------
 
-def random_scenario(rng):
+def random_scenario(rng, latency_range=LATENCY_RANGE):
     rough = rng.random() < 0.6
     patches = []
     if rough:
@@ -109,6 +110,8 @@ def random_scenario(rng):
     return {"name": "bc_episode", "duration": EPISODE_S, "seed": int(rng.integers(1 << 30)),
             "terrain": {"size": [8.0, 8.0], "resolution": 0.05, "z_range": [-0.2, 0.4], "patches": patches},
             "controller": {"type": "trot", "period": 0.36, "swing_height": 0.08, "stand_height": 0.27},
+            # 배치(ROS 노드)와 같은 연결 지연. 관측은 로봇 경계(센서 잡음 + 상태 추정)를 그대로 거친다
+            "control_link": {"latency_steps": int(rng.integers(latency_range[0], latency_range[1] + 1))},
             "events": events}
 
 
@@ -188,7 +191,7 @@ def export_onnx(params, path):
 
 def write_card(spec, info, path):
     card = {
-        "name": "go2_trot_bc",
+        "name": path.parent.name,
         "onnx": "policy.onnx",
         "io": {"input": "obs", "output": "actions"},
         # 아래 규약은 학습 당시 명세를 그대로 복사한다 (카드만 보고 탑재할 수 있도록 자기완결적으로)
@@ -206,10 +209,11 @@ def write_card(spec, info, path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--workers", type=int, default=5)
+    ap.add_argument("--workers", type=int, default=3)   # 작업자당 약 0.55 GB. 5개는 이 PC에서 메모리 부족
     ap.add_argument("--iters", type=int, default=6)
     ap.add_argument("--episodes", type=int, default=30)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--out", default=str(OUT_DIR), help="정책 저장 폴더")
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.seed)
@@ -240,16 +244,19 @@ def main():
             log.append(entry)
             print(json.dumps(entry, ensure_ascii=False))
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    export_onnx(net.params(), OUT_DIR / "policy.onnx")
-    info = {"method": "DAgger imitation of rule-based trot (sim/controllers/trot.py)",
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    export_onnx(net.params(), out_dir / "policy.onnx")
+    info = {"method": "DAgger imitation of rule-based trot (control/trot.py)",
+            "observation_source": "robot boundary: sensor noise + state estimator (no ground truth)",
+            "link_latency_steps_range": list(LATENCY_RANGE),
             "spec_version": spec["spec_version"], "date": dt.date.today().isoformat(),
             "network": f"MLP {dim_in}-{'-'.join(map(str, HIDDEN))}-{dim_out} ELU, obs normalization in graph",
             "samples": int(len(X)), "dagger_iters": len(betas), "train_seconds": round(time.time() - t_start),
             "trained_on": "CPU MuJoCo, model variant cpu", "final_eval": log[-1]["eval"]}
-    write_card(spec, info, OUT_DIR / "card.yaml")
-    (OUT_DIR / "train_log.json").write_text(json.dumps(log, indent=2, ensure_ascii=False))
-    print(f"\n저장: {OUT_DIR.relative_to(ROOT)}/policy.onnx, card.yaml, train_log.json")
+    write_card(spec, info, out_dir / "card.yaml")
+    (out_dir / "train_log.json").write_text(json.dumps(log, indent=2, ensure_ascii=False))
+    print(f"\n저장: {out_dir}/policy.onnx, card.yaml, train_log.json (평가는 연결 지연 1주기 = ROS 배치와 같음)")
 
 
 if __name__ == "__main__":

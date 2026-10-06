@@ -48,4 +48,4 @@ reject:
     reason: "실기 뒷다리 범위 [-0.5236, 4.5379] 유지."
   - item: sensors_and_sites
     upstream: "jointpos/jointvel/imu 센서, 발 site 추가"
-    reason: "관측은 sim/observation.py 기준 구현이 qpos/qvel에서 직접 계산. 모델 센서에 의존하지 않음."
+    reason: "관측은 control/observation.py 기준 구현이 계산. 모델 센서에 의존하지 않음."

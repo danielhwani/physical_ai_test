@@ -26,12 +26,10 @@ import numpy as np
 import yaml
 
 from .adapters import quat_to_roll_pitch, quat_to_yaw
-from .control_interface import ControlInterface, load_card
-from .controllers.common import GaitClock, StepContext
-from .controllers.onnx_policy import OnnxPolicyController
-from .controllers.trot import TrotController
+from control.node import ControllerNode
 from .model_builder import ROOT, TERRAIN_BODY, build_model
 from .recorder import Recorder
+from .robot_io import RobotIO
 from .stream import build_status
 from .terrain_service import TerrainMapService
 
@@ -107,7 +105,7 @@ class Simulation:
     """scenario: YAML 경로 또는 dict. policy: 정책 카드 경로 (없으면 시나리오의 규칙 기반 보행기)."""
 
     def __init__(self, scenario, spec_path=ROOT / "specs/go2_control.yaml", variant="cpu", seed=None,
-                 policy=None):
+                 policy=None, sensors=None):
         self.scn = copy.deepcopy(scenario) if isinstance(scenario, dict) else load_yaml(scenario)
         if seed is not None:
             self.scn["seed"] = seed
@@ -125,22 +123,11 @@ class Simulation:
         self.model, self.hfield_id = build_model(self.spec, self.terrain, variant)
         self.data = mujoco.MjData(self.model)
 
-        # 제어 인터페이스: 정책 카드가 있으면 카드 규약, 없으면 로봇 명세 규약
-        if policy:
-            card = load_card(policy)
-            self.iface = ControlInterface(self.spec, card)
-            self.ctrl = OnnxPolicyController(card, self.iface)
-            self.controller_desc = f"onnx:{card['name']}"
-            period = self.iface.gait_period
-        else:
-            self.iface = ControlInterface(self.spec)
-            self.ctrl = TrotController(self.spec, self.scn["controller"], self.iface)
-            self.controller_desc = f"trot:{self.scn['controller']}"
-            period = self.scn["controller"]["period"]
-        self.clock = GaitClock(period or 1.0)
-        self.decim = int(round(self.iface.control_dt / self.model.opt.timestep))
-        self.delay_steps = self.spec["action"].get("delay_steps", 0)
-        self.on_action = None       # (ctx, action) -> action. 모방학습(DAgger)에서 실행 action 교체용
+        # 보행 알고리즘 (control/): 로봇 상태 메시지만 받아 관절 명령을 낸다 (참값을 모른다). 같은 프로세스에서 부른다
+        self.controller = ControllerNode(self.spec, self.scn.get("controller"), policy)
+        self.controller_desc = self.controller.desc
+        self.decim = int(round(self.controller.iface.control_dt / self.model.opt.timestep))
+        self.sensor_defs = load_yaml(ROOT / "specs/go2_sensors.yaml")
 
         m = self.model
         self.base_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, self.spec["robot"]["base_body"])
@@ -160,6 +147,36 @@ class Simulation:
                 ccfg["robot_feet"].setdefault("names", list(self.spec["robot"]["feet"]))
             self.cosim = ChronoLink(ccfg, self.terrain)
 
+        # 센서 (문서 §8): 시나리오 sensors 목록 + 실행 옵션. 센서는 렌더러 쪽(viz/sensor_renderer.py)에서
+        # 중립 스트림 메시지만 받아 계산한다. 같은 프로세스에서는 StreamTap이 메시지를 만들어 건넨다 (결정적).
+        names = list(dict.fromkeys(list(self.scn.get("sensors", [])) + list(sensors or [])))
+        self.scans, self.sensor_renderer, self.lidars = {}, None, []
+        if names:
+            from viz.sensor_renderer import SensorRenderer
+            from .stream import StreamTap
+            defs = self.sensor_defs["lidars"]
+            unknown = [n for n in names if n not in defs]
+            assert not unknown, f"알 수 없는 센서: {unknown} (specs/go2_sensors.yaml: {list(defs)})"
+            self.tap = StreamTap(self)
+            self.sensor_renderer = SensorRenderer(self.tap.manifest, {n: defs[n] for n in names},
+                                                  terrain_half=min(8.0, max(defs[n]["range_max"] for n in names)))
+            self.lidars = self.sensor_renderer.lidars
+
+    def sense(self):
+        """센서 주기가 됐으면 스트림 메시지(지형 패치, 바디 포즈)를 센서 렌더러에 건네고 스캔을 받는다.
+        반환: 이번 제어 주기에 새로 나온 스캔 이름 목록."""
+        r, t = self.sensor_renderer, self.data.time
+        if not r.due(t):
+            return []
+        for patch in self.tap.patches():
+            r.apply_patch(patch)
+        r.set_poses(self.tap.poses())
+        new = []
+        for name, scan in r.render(t):
+            self.scans[name] = scan
+            new.append(name)
+        return new
+
     def close(self):
         """외부 물리엔진 프로세스 정리. Chrono 통계(서버 계산 시간)를 돌려준다."""
         if self.cosim is not None:
@@ -171,12 +188,16 @@ class Simulation:
         mujoco.mj_resetDataKeyframe(self.model, self.data, 0)
         self.data.qpos[2] += self.terrain.height_at(0.0, 0.0)
         mujoco.mj_forward(self.model, self.data)
-        self.ctrl.reset()
-        self.clock.reset()
-        self.q_des = self.iface.targets_from_action(np.zeros(12))
-        self.action = np.zeros(12)
-        self.pending = deque([np.zeros(12)] * self.delay_steps)
-        self.obs = np.zeros(self.iface.obs.dim)
+        self.controller.reset()
+        # 로봇 쪽 경계: 참값 -> 센서 모델(잡음, 편향, 표류) -> 로봇 상태 메시지. 잡음 난수는 시나리오 시드
+        self.robot = RobotIO(self, self.sensor_defs.get("proprio"), seed=self.scn.get("seed", 0))
+        self.low_state, self.low_cmd = None, None
+        self.remote = None            # 보행 알고리즘을 별도 노드로 돌릴 때: 로봇 경계 토픽 전송 (Ros2StreamPublisher)
+        # 같은 프로세스 실행의 연결 지연 (ROS 배치와 같게): 명령을 latency_steps 주기 뒤에 실행
+        link = {**self.spec.get("link", {}), **self.scn.get("control_link", {})}
+        self.link_latency = int(link.get("latency_steps", 0))
+        self.link_queue = deque()
+        self.command = (0.0, 0.0)     # 운용자 이동 명령 (마지막 값)
         self.events = sorted(self.scn.get("events", []), key=lambda e: e["t"])
         self.last_event = None      # (시각, 설명) 가시화용
         self.next_terrain_commit = 0.0
@@ -185,8 +206,12 @@ class Simulation:
     def _apply_events(self, verbose=True):
         while self.events and self.events[0]["t"] <= self.data.time + 1e-9:
             e = self.events.pop(0)
-            if e["action"] == "set_command":
-                self.clock.set_command(e["vx"], e.get("yaw_rate", 0.0))
+            if e["action"] == "set_command":       # 운용자 명령 -> 보행 알고리즘
+                self.command = (e["vx"], e.get("yaw_rate", 0.0))
+                if self.remote is not None:
+                    self.remote.publish_cmd_vel(*self.command)
+                else:
+                    self.controller.set_command(*self.command)
             elif e["action"] == "add_patch":
                 self.terrain.add_patch(e["patch"])
             desc = e["action"]
@@ -221,11 +246,36 @@ class Simulation:
                     c[i] = True
         return c
 
-    def obs_inputs(self):
-        """관측 계산 입력. 새 관측 항목이 다른 입력(지형 높이 등)을 쓰면 여기에 추가."""
-        d = self.data
-        return dict(qpos=d.qpos, qvel=d.qvel, command=self.clock.command_body(),
-                    last_action=self.action, gait_phase=self.clock.phase)
+    def hold_cmd(self):
+        """명령이 아직 없을 때: 기본 자세 유지 (로봇 쪽 안전 기본값)."""
+        iface = self.controller.iface
+        zeros = [0.0] * 12
+        return {"q_des": iface.targets_from_action(np.zeros(12)).tolist(), "dq_des": zeros, "kp": iface.kp.tolist(),
+                "kd": iface.kd.tolist(), "tau_ff": zeros}
+
+    def estimate(self):
+        """알고리즘의 최신 상태 추정 {t, v_body, yaw, contacts} (t = 그 추정이 쓴 로봇 상태 시각). 별도 노드면 받은 값."""
+        if self.remote is not None:
+            return self.remote.latest_est
+        if getattr(self, "low_state", None) is None:
+            return None
+        e = self.controller.est
+        return {"t": self.low_state["t"], "v_body": e.v_body, "yaw": e.yaw, "contacts": e.contacts}
+
+    @property
+    def command_display(self):
+        """정보판용 명령: 같은 프로세스면 알고리즘이 쓰는 값(가속 제한 후), 별도 노드면 운용자 명령."""
+        return np.array(self.command) if self.remote is not None else self.controller.clock.cmd_f
+
+    # ---- 같은 프로세스 실행 때 알고리즘 상태 보기 (기록, 학습 스크립트, 기준 벡터 생성용) ----
+    iface = property(lambda self: self.controller.iface)
+    clock = property(lambda self: self.controller.clock)
+    ctrl = property(lambda self: self.controller.ctrl)
+    obs = property(lambda self: self.controller.obs)
+    action = property(lambda self: self.controller.action)
+    q_des = property(lambda self: self.controller.q_des)
+    on_action = property(lambda self: self.controller.on_action,
+                         lambda self, f: setattr(self.controller, "on_action", f))
 
     def step_control(self, verbose=True):
         """제어 주기 1회 = 물리 스텝 decim회."""
@@ -250,39 +300,22 @@ class Simulation:
             terrain_changed |= self.terrain.commit(self.model, self.hfield_id, self.feet_xy(), self.guard_radius)
             self.next_terrain_commit += 1.0 / TERRAIN_COMMIT_HZ
 
-        # 1) 명령/위상 갱신  2) 관측  3) 컨트롤러 -> action  4) 행동 처리 -> q_des  5) PD + 물리
-        self.clock.update(dt)
-        self.obs = self.iface.obs.compute(**self.obs_inputs())
-        roll, pitch = quat_to_roll_pitch(d.qpos[3:7])
-        R = d.xmat[self.base_id].reshape(3, 3)
-        ctx = StepContext(dt=dt, qpos=d.qpos, qvel=d.qvel, roll=roll, pitch=pitch, yaw=quat_to_yaw(d.qpos[3:7]),
-                          v_body_x=(R.T @ d.qvel[:3])[0], wz_world=(R @ d.qvel[3:6])[2],
-                          clock=self.clock, obs=self.obs)
-        action = self.ctrl.act(ctx)
-        if self.on_action:
-            action = self.on_action(ctx, action)
-        self.action = np.clip(action, -self.iface.clip, self.iface.clip)
-        if self.delay_steps:
-            self.pending.append(self.action)
-            applied = self.pending.popleft()
-        else:
-            applied = self.action
-        self.q_des = self.iface.targets_from_action(applied)
-
-        kp, kd, lim = self.iface.kp, self.iface.kd, self.iface.torque_limit
-        energy = 0.0
-        feet_coupled = self.cosim is not None and self.cosim.feet_enabled
-        fn_sum = np.zeros(4)
-        for _ in range(self.decim):
-            tau = kp * (self.q_des - d.qpos[7:]) - kd * d.qvel[6:]
-            d.ctrl[:] = np.clip(tau, -lim, lim)
-            mujoco.mj_step(self.model, d)
-            energy += np.abs(d.ctrl * d.qvel[6:]).sum() * self.model.opt.timestep
-            if feet_coupled:
-                fn_sum += self.foot_normal_forces()
-        if feet_coupled:
-            # 물리 스텝마다 평균한 수직력 (착지 순간의 짧은 접촉력 스파이크는 실제 충격량만큼만 반영된다)
-            self.cosim.observe_feet(d.geom_xpos[self.foot_ids], fn_sum / self.decim)
+        # 로봇 경계: 센서 측정 -> 보행 알고리즘 -> 관절 명령 -> 모터. 알고리즘은 참값을 모른다
+        self.low_state = self.robot.read()
+        if self.remote is None:
+            self.link_queue.append(self.controller.step(self.low_state))
+            # ROS 배치와 같은 지연: 지연 주기만큼 쌓인 뒤부터 실행. 그 전에는 기본 자세 유지 (첫 명령 전 ROS와 같음)
+            self.low_cmd = self.link_queue.popleft() if len(self.link_queue) > self.link_latency else self.hold_cmd()
+        else:                                  # 별도 노드: 상태를 보내고, 마지막으로 받은 명령을 실행 (실제 로봇처럼)
+            self.remote.publish_low_state(self.low_state)
+            self.remote.spin_some()
+            self.low_cmd = self.remote.latest_cmd or self.hold_cmd()
+        energy = self.robot.apply(self.low_cmd)
+        if self.cosim is not None and self.cosim.feet_enabled:
+            # 발자국: 물리 스텝마다 평균한 발 수직력 참값 (흙에 걸리는 실제 하중)
+            self.cosim.observe_feet(d.geom_xpos[self.foot_ids], self.robot.foot_force)
+        roll, pitch = quat_to_roll_pitch(d.qpos[3:7])          # 넘어짐 판정용 참값 (시험 판정자 쪽)
+        self.new_scans = self.sense() if self.sensor_renderer is not None else []
         return terrain_changed, energy, roll, pitch
 
     def fallen(self, roll, pitch):
@@ -293,7 +326,10 @@ class Simulation:
 def run(args):
     scenario = args.scenario if isinstance(args.scenario, dict) else load_yaml(args.scenario)
     scenario = apply_overrides(scenario, getattr(args, "set", None))
-    sim = Simulation(scenario, variant=args.variant, policy=args.policy)
+    sensor_node = getattr(args, "sensor_node", False)
+    # --sensor-node: 센서를 별도 프로세스(ROS2 스트림 구독)에서 계산하므로 러너 안에서는 센서를 켜지 않는다
+    sim = Simulation(scenario, variant=args.variant, policy=args.policy,
+                     sensors=None if sensor_node else getattr(args, "sensor", None))
     scn, d, m = sim.scn, sim.data, sim.model
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     out = ROOT / "runs" / f"{scn['name']}_{stamp}"
@@ -306,6 +342,8 @@ def run(args):
         "mode": "realtime" if args.realtime else "lockstep",
         "model_variant": args.variant,
         # 버전 조합 기록 (문서 §13.3)
+        "control_link": {"mode": "ros_node" if getattr(args, "controller_node", False) else "in_process",
+                         "latency_steps": None if getattr(args, "controller_node", False) else sim.link_latency},
         "versions": {"sim": SIM_VERSION, "spec": sim.spec["spec_version"],
                      "controller": sim.controller_desc, "mujoco": mujoco.__version__,
                      "model": sim.spec["robot"]["menagerie_commit"]},
@@ -324,7 +362,8 @@ def run(args):
         viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
         viewer.cam.distance = 2.0
     if args.ros2:
-        from .ros2_bridge import Ros2StreamPublisher, launch_mujoco_viewer, launch_rviz_stack
+        from .ros2_bridge import (Ros2StreamPublisher, launch_controller_node, launch_mujoco_viewer, launch_rviz_stack,
+                                  launch_sensor_node)
         bridge = Ros2StreamPublisher(m, sim.terrain, sim.cosim)
         if args.rviz:
             rviz, rviz_adapter = launch_rviz_stack(out)
@@ -332,6 +371,18 @@ def run(args):
             helpers.append(rviz_adapter)
         if args.mjviz:
             displays.append(("MuJoCo viewer", launch_mujoco_viewer(out)))
+        if sensor_node:
+            names = list(dict.fromkeys(list(scenario.get("sensors", [])) + list(getattr(args, "sensor", None) or [])))
+            helpers.append(launch_sensor_node(out, names or ["front_lidar"]))
+        if getattr(args, "controller_node", False):
+            # 보행 알고리즘을 별도 노드로: 로봇 상태 토픽만 보고 관절 명령 토픽을 낸다 (실제 탑재 소프트웨어 형태)
+            bridge.enable_robot_io()
+            sim.remote = bridge
+            scn_path = args.scenario if not isinstance(args.scenario, dict) else None
+            helpers.append(launch_controller_node(out, scn_path, args.policy))
+            print("보행 알고리즘 노드 대기 중...")
+            if not bridge.wait_for_subscriber(topic="/robot/low_state"):
+                print(f"보행 알고리즘 노드가 뜨지 않았다. 로그: {(out / 'controller_node.log').relative_to(ROOT)}")
         if displays:
             names = ", ".join(n for n, _ in displays)
             print(f"{names} 시작 대기 중...")
@@ -346,6 +397,10 @@ def run(args):
     energy_total, fell_at = 0.0, None
     start_xy = d.qpos[:2].copy()
     terrain0 = sim.terrain.applied.copy()     # 지면 변형량 MOP 기준
+    est_err_v, est_err_yaw = [], []           # 추정 오차 (판정자 쪽에서만 참값과 비교)
+    cmd_latency = []                          # 별도 노드: 실행한 명령이 몇 초 전 상태로 계산됐는가
+    truth_hist = {round(d.time, 6): (d.xmat[sim.base_id].reshape(3, 3).T @ d.qvel[:3], quat_to_yaw(d.qpos[3:7]))}
+    scan_log = {}
     wall0 = run_start = time.perf_counter()
     paused_total, pause_start = 0.0, None
     late, max_lag = 0, 0.0
@@ -380,13 +435,36 @@ def run(args):
             terrain_changed, energy, roll, pitch = sim.step_control()
             energy_total += energy
 
+            if "t" in sim.low_cmd:                   # 실행한 명령이 몇 초 전 상태로 계산됐는가 (두 실행 방식 공통)
+                cmd_latency.append(sim.low_state["t"] - sim.low_cmd["t"])
+            # 추정 오차: 알고리즘의 추정값을 그 추정이 쓴 로봇 상태 시각(t)의 참값과 비교한다.
+            # 별도 노드면 추정값은 /control/estimate로 받는다 (한 주기 늦게 도착하므로 시각으로 맞춘다)
+            v_true = d.xmat[sim.base_id].reshape(3, 3).T @ d.qvel[:3]
+            truth_hist[round(d.time, 6)] = (v_true, quat_to_yaw(d.qpos[3:7]))   # 다음 로봇 상태 시각의 참값
+            est = sim.estimate()
+            ref = truth_hist.get(round(est["t"], 6)) if est else None
+            if ref is not None:
+                yaw_err = (est["yaw"] - ref[1] + np.pi) % (2 * np.pi) - np.pi
+                est_err_v.append(est["v_body"][0] - ref[0][0]); est_err_yaw.append(yaw_err)
+                rec.log(est_v_body=est["v_body"], est_yaw=est["yaw"], est_contacts=np.asarray(est["contacts"], float),
+                        true_v_body=ref[0])
+            else:
+                rec.log(est_v_body=np.full(3, np.nan), est_yaw=np.nan, est_contacts=np.full(4, np.nan),
+                        true_v_body=np.full(3, np.nan))
+            while len(truth_hist) > 10:
+                truth_hist.pop(next(iter(truth_hist)))
             rec.log(t=d.time, base_pos=d.qpos[:3], base_quat_wxyz=d.qpos[3:7], base_linvel=d.qvel[:3],
-                    base_angvel_body=d.qvel[3:6], q=d.qpos[7:], qd=d.qvel[6:], tau=d.ctrl, q_des=sim.q_des,
-                    contact=sim.foot_contacts().astype(float), cmd=sim.clock.cmd_f, gait_phase=sim.clock.phase, obs=sim.obs, action=sim.action,
+                    base_angvel_body=d.qvel[3:6], q=d.qpos[7:], qd=d.qvel[6:], tau=d.ctrl,
+                    contact=sim.foot_contacts().astype(float), cmd=sim.command_display,
+                    q_des=np.asarray(sim.low_cmd["q_des"]),
                     terrain_version=sim.terrain.version)
             if sim.cosim is not None and sim.cosim.has_vehicle:
                 rec.log(vehicle_pos=sim.cosim.vehicle["pos"], vehicle_speed=sim.cosim.vehicle["speed"])
 
+            for name in sim.new_scans:              # 센서 출력: 기록 + 발행
+                scan_log.setdefault(name, []).append(sim.scans[name])
+                if bridge:
+                    bridge.publish_scan(name, sim.scans[name])
             if bridge:
                 bridge.publish(d)
                 if d.time >= next_status:
@@ -441,10 +519,21 @@ def run(args):
         "cost_of_transport": round(energy_total / (sim.total_mass * 9.81 * max(dist, 1e-6)), 3),
         "min_vehicle_distance_m": round(sim.cosim.min_dist, 3) if sim.cosim is not None and sim.cosim.has_vehicle else None,
         **terrain_deformation(terrain0, sim.terrain.applied),
+        # 보행 알고리즘의 상태 추정 오차 (알고리즘은 참값을 모른다. 여기서 판정만 한다)
+        "est_speed_rmse_mps": round(float(np.sqrt(np.mean(np.square(est_err_v[25:])))), 4) if len(est_err_v) > 25 else None,
+        "est_yaw_err_end_deg": round(float(np.degrees(est_err_yaw[-1])), 2) if est_err_yaw else None,
+        "cmd_latency_ms_mean": round(1000 * float(np.mean(cmd_latency)), 1) if cmd_latency else None,
+        "cmd_latency_ms_max": round(1000 * float(np.max(cmd_latency)), 1) if cmd_latency else None,
         "late_control_steps": late if (args.realtime or viewer) else None,
         "max_lag_s": round(max_lag, 4) if (args.realtime or viewer) else None,
     }
     rec.save(mop)
+    for name, scans in scan_log.items():      # LiDAR 원시 출력: 프레임별 센서 좌표 점군 + 센서 월드 자세
+        np.savez_compressed(out / f"{name}.npz", t=np.array([s["t"] for s in scans]),
+                            frame=np.concatenate([np.full(len(s["points"]), i, np.int32) for i, s in enumerate(scans)]),
+                            points=np.concatenate([s["points"] for s in scans]), ring=np.concatenate([s["ring"] for s in scans]),
+                            label=np.concatenate([s["label"] for s in scans]),
+                            R=np.array([s["R"] for s in scans]), p=np.array([s["p"] for s in scans]))
     if bridge and not interrupted:      # Ctrl+C 때는 rclpy가 이미 종료됨
         bridge.publish_status(build_status(sim, start_xy, energy_total, late, final_mop=mop))
     print("\n== MOP ==")
@@ -492,10 +581,16 @@ def main():
     ap.add_argument("--variant", choices=["cpu", "mjx"], default="cpu",
                     help="mjx: specs/go2_mjx_override.yaml 적용 모델 (CPU MuJoCo로 실행)")
     ap.add_argument("--rt", action="store_true", help="SCHED_FIFO 우선순위 50 (RT 커널)")
+    ap.add_argument("--sensor", action="append", metavar="NAME",
+                    help="센서 켜기 (specs/go2_sensors.yaml의 이름, 여러 번 가능). 예: --sensor front_lidar")
+    ap.add_argument("--sensor-node", action="store_true",
+                    help="센서를 별도 프로세스(ROS2 중립 스트림만 구독)에서 계산 (--ros2, --realtime 자동. 결정성 없음)")
+    ap.add_argument("--controller-node", action="store_true",
+                    help="보행 알고리즘을 별도 ROS2 노드로 (로봇 상태/관절 명령 토픽으로만 주고받음. --ros2, --realtime 자동)")
     ap.add_argument("--set", action="append", metavar="KEY=VALUE",
                     help="시나리오 값 바꾸기 (여러 번 가능). 예: --set chrono.scm.soil.bekker_kphi=2e7")
     args = ap.parse_args()
-    if args.rviz or args.mjviz:
+    if args.rviz or args.mjviz or args.sensor_node or args.controller_node:
         args.ros2 = args.realtime = True
     run(args)
 

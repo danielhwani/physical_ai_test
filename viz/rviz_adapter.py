@@ -84,7 +84,7 @@ class RvizAdapter(Node):
         self.create_subscription(String, "/sim/scene_manifest", self.on_manifest, latched)
         self.create_subscription(String, "/sim/terrain_patch", self.on_patch, history)
         self.create_subscription(String, "/sim/status", self.on_status, 10)
-        self.manifest, self.grid, self.pending, self.shown, self.path = None, None, [], None, []
+        self.manifest, self.grid, self.pending, self.tiles, self.path = None, None, [], {}, []
         self.frame = "world"
 
     # ---- 장면/로봇 ----
@@ -114,34 +114,47 @@ class RvizAdapter(Node):
         self.grid.apply(patch)
         self.publish_terrain()
 
-    def sampled(self):
-        """표시용 격자: 로봇 주변 창에서 k칸마다 한 점 (k는 셀 수가 MAX_CELLS 이하가 되는 가장 작은 값)."""
-        w = self.window
-        k = 1
+    def stride(self):
+        """표시 간격 k칸: 창의 셀 수가 MAX_CELLS 이하가 되는 가장 작은 값."""
+        w, k = self.window, 1
         while (w.wncol // k) * (w.wnrow // k) > MAX_CELLS:
             k += 1
-        return w.xs()[::k], w.ys()[::k], w.heights(self.grid)[::k, ::k].astype(float)
+        return k
 
     def publish_terrain(self):
-        xs, ys, H = self.sampled()
-        nr, nc = len(ys) - 1, len(xs) - 1
-        arr = MarkerArray()
-        for r0 in range(0, nr, TILE):
-            for c0 in range(0, nc, TILE):
-                r1, c1 = min(r0 + TILE, nr), min(c0 + TILE, nc)
-                block = H[r0:r1 + 1, c0:c1 + 1]
-                if self.shown is not None and np.array_equal(block, self.shown[r0:r1 + 1, c0:c1 + 1]):
+        """지형 타일 마커 발행. 타일 번호를 세계 격자 기준으로 매겨, 창이 옮겨져도 겹치는 타일은 그대로 두고
+        새로 들어온 타일만 추가, 빠진 타일만 지운다 (전체를 지우고 다시 그리면 그동안 화면이 빈다)."""
+        w, g, k = self.window, self.grid, self.stride()
+        span = TILE * k                                          # 타일 한 변의 세계 격자 칸 수
+        H = g.heights
+        r_end, c_end = w.r0 + w.wnrow - 1, w.c0 + w.wncol - 1
+        tiles = {}
+        for tr in range(w.r0 // span * span, r_end, span):
+            for tc in range(w.c0 // span * span, c_end, span):
+                rows = np.arange(max(tr, w.r0), min(tr + span, r_end) + 1, k)
+                cols = np.arange(max(tc, w.c0), min(tc + span, c_end) + 1, k)
+                if len(rows) < 2 or len(cols) < 2:
                     continue
-                X, Y = np.meshgrid(xs[c0:c1 + 1], ys[r0:r1 + 1])
-                V = np.stack([X, Y, block], -1)
-                a, b, d, e = V[:-1, :-1], V[:-1, 1:], V[1:, :-1], V[1:, 1:]
-                tri = np.stack([a, b, e, a, e, d], 2).reshape(-1, 3)
-                m = self.marker("terrain", r0 * (nc + 1) + c0, Marker.TRIANGLE_LIST, (0.55, 0.50, 0.42, 1.0), (1, 1, 1))
-                m.points = [Point(x=x, y=y, z=z) for x, y, z in tri.tolist()]
-                arr.markers.append(m)
+                tiles[tr * 100_000 + tc] = (rows, cols, H[np.ix_(rows, cols)].astype(float))
+        arr = MarkerArray()
+        for tid in set(self.tiles) - set(tiles):                 # 창 밖으로 나간 타일 지우기
+            m = self.marker("terrain", tid, Marker.TRIANGLE_LIST, (0, 0, 0, 0), (1, 1, 1))
+            m.action = Marker.DELETE
+            arr.markers.append(m)
+        for tid, (rows, cols, block) in tiles.items():
+            old = self.tiles.get(tid)
+            if old is not None and np.array_equal(old, block):
+                continue
+            X, Y = np.meshgrid(-g.half_x + cols * w.res, -g.half_y + rows * w.res)
+            V = np.stack([X, Y, block], -1)
+            a, b, d, e = V[:-1, :-1], V[:-1, 1:], V[1:, :-1], V[1:, 1:]
+            tri = np.stack([a, b, e, a, e, d], 2).reshape(-1, 3)
+            m = self.marker("terrain", tid, Marker.TRIANGLE_LIST, (0.55, 0.50, 0.42, 1.0), (1, 1, 1))
+            m.points = [Point(x=x, y=y, z=z) for x, y, z in tri.tolist()]
+            arr.markers.append(m)
         if arr.markers:
             self.pub_terrain.publish(arr)
-        self.shown = H
+        self.tiles = {tid: block for tid, (_, _, block) in tiles.items()}
 
     # ---- 상태 ----
     def marker(self, ns, mid, mtype, rgba, scale):
@@ -157,10 +170,7 @@ class RvizAdapter(Node):
         s = json.loads(msg.data)
         bx, by, bz = s["base_pos"]
         if self.grid is not None and self.window.recenter(bx, by, WINDOW_TRIGGER):
-            clear = Marker(); clear.header.frame_id = self.frame; clear.ns = "terrain"; clear.action = Marker.DELETEALL
-            self.pub_terrain.publish(MarkerArray(markers=[clear]))   # 이전 창 지형 지우고 새 창 전체를 다시 보낸다
-            self.shown = None
-            self.publish_terrain()
+            self.publish_terrain()                               # 새로 들어온 타일만 추가, 빠진 타일만 지움
         arr = MarkerArray()
         lines, alert = status_lines(s)
         txt = self.marker("info", 0, Marker.TEXT_VIEW_FACING,

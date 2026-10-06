@@ -1,6 +1,6 @@
 # 관측·행동·제어 명세 (문서 §12.2: 기계 판독 가능한 단일 명세)
 # 컨트롤러, 기록기, 향후 MJX 학습 환경과 ONNX 정책이 모두 이 파일을 읽는다.
-spec_version: "0.3.0"
+spec_version: "0.4.0"
 robot:
   name: unitree_go2
   model_source: third_party/mujoco_menagerie/unitree_go2/go2.xml
@@ -17,6 +17,9 @@ robot:
     hip_offsets: [[0.1934, 0.0465], [0.1934, -0.0465], [-0.1934, 0.0465], [-0.1934, -0.0465]]
     thigh_length: 0.213
     calf_length: 0.213
+    abduction_offset: 0.0955       # 고관절(옆) 축에서 허벅지 관절까지 옆 방향 거리 (왼쪽 +, 오른쪽 -)
+    foot_offset_x: -0.002          # 종아리 끝에서 발 구 중심까지 앞뒤 거리
+    foot_radius: 0.022             # 발 구 반지름 (상태 추정: 딛는 동안 고정되는 것은 발 중심이 아니라 접촉점)
 
 # 행동 처리 경로 (sim-to-sim 불일치의 주원인이므로 명세로 고정)
 #   q_des = default_pose + scale * clip(action, -clip, clip)
@@ -34,7 +37,7 @@ action:
   torque_limit: [23.7, 23.7, 45.43,  23.7, 23.7, 45.43,  23.7, 23.7, 45.43,  23.7, 23.7, 45.43]
 
 # 관측 벡터: 아래 순서대로 이어 붙인다. 각 항목 = scale * (원값), 이후 전체를 clip.
-# 기준 구현: sim/observation.py (numpy). JAX/C++ 구현은 conformance/reference/obs_reference.npz와 비교한다.
+# 기준 구현: control/observation.py (numpy). JAX/C++ 구현은 conformance/reference/obs_reference.npz와 비교한다.
 # 입력은 qpos, qvel, command, last_action, gait_phase 뿐이다 (MuJoCo 함수 호출 없음 -> 어느 언어로도 이식 가능).
 # 관절 항목은 인터페이스의 관절 순서(정책 카드가 있으면 카드 순서)로 나열한다.
 #   MuJoCo free joint 규약: qpos[3:7] 쿼터니언 (w,x,y,z), qvel[0:3] 월드 선속도, qvel[3:6] 몸통 좌표 각속도
@@ -54,3 +57,9 @@ observation:
 
 physics:
   timestep: 0.002
+
+# 로봇 <-> 보행 알고리즘 연결 (문서 §14). ROS2 노드 배치에서 측정한 지연: 상태를 보낸 뒤 그 상태로 계산한 명령이
+# 다음 제어 주기에 실행된다 (1주기 = 20 ms). 같은 프로세스 실행도 이 지연을 흉내 내 ROS 배치와 같은 결과를 낸다.
+# 시나리오의 control_link: {latency_steps: N} 으로 바꿀 수 있다 (0이면 지연 없는 이상적 연결).
+link:
+  latency_steps: 1

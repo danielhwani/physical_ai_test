@@ -9,6 +9,7 @@
   /sim/scene_manifest  장면 매니페스트 JSON (transient local)
   /sim/terrain_patch   지형 높이 패치 JSON (처음 전체 + 변경분, transient local)
   /sim/status          시험 상태 JSON
+  /sensors/<이름>/points  LiDAR 점군 (sensor_msgs/PointCloud2, 센서 좌표계 <이름>; /tf에 world -> <이름>)
 """
 import json
 import os
@@ -41,6 +42,22 @@ def launch_rviz_stack(log_dir):
     rviz = subprocess.Popen(["bash", "-c", cmd], env=env,
                             stdout=open(log_dir / "rviz.log", "w"), stderr=subprocess.STDOUT)
     return rviz, adapter
+
+
+def launch_sensor_node(log_dir, sensors):
+    """별도 프로세스 센서 노드: ROS2 중립 스트림만 구독해 센서 출력을 만든다 (실제 배치 형태)."""
+    return subprocess.Popen([sys.executable, "-m", "viz.sensor_node", *sensors], cwd=ROOT,
+                            stdout=open(log_dir / "sensor_node.log", "w"), stderr=subprocess.STDOUT)
+
+
+def launch_controller_node(log_dir, scenario_path=None, policy=None):
+    """보행 알고리즘 ROS2 노드 (control/ros_node.py): 로봇 상태 토픽만 보고 관절 명령 토픽을 낸다."""
+    cmd = [sys.executable, "-m", "control.ros_node"]
+    if policy:
+        cmd += ["--policy", str(policy)]
+    if scenario_path:
+        cmd += ["--scenario", str(scenario_path)]
+    return subprocess.Popen(cmd, cwd=ROOT, stdout=open(log_dir / "controller_node.log", "w"), stderr=subprocess.STDOUT)
 
 
 def launch_mujoco_viewer(log_dir):
@@ -79,6 +96,7 @@ class Ros2StreamPublisher:
         self.joints = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, j) for j in range(1, model.njnt)]
 
         self.cosim = cosim
+        self.pub_scans = {}
         self.pub_manifest.publish(String(data=json.dumps(build_manifest(model, terrain, cosim))))
         self.terrain_stream = TerrainPatchStream(terrain)
         self.pub_terrain.publish(String(data=json.dumps(self.terrain_stream.full())))
@@ -133,6 +151,65 @@ class Ros2StreamPublisher:
         js.position = [float(x) for x in data.qpos[7:]]
         js.velocity = [float(x) for x in data.qvel[6:]]
         self.pub_js.publish(js)
+
+    def publish_scan(self, name, scan):
+        """같은 프로세스 센서 출력 발행: PointCloud2 + world -> 센서 좌표계 TF."""
+        from sensor_msgs.msg import PointCloud2
+        from viz.ros_msgs import scan_to_msgs
+        if name not in self.pub_scans:
+            self.pub_scans[name] = self.node.create_publisher(PointCloud2, f"/sensors/{name}/points", 5)
+        msg, tf = scan_to_msgs(name, scan, self.frame)
+        self.pub_tf.publish(self._TF(transforms=[tf]))
+        self.pub_scans[name].publish(msg)
+
+    # ---- 로봇 경계 (보행 알고리즘을 별도 노드로 돌릴 때) ----
+    def enable_robot_io(self):
+        from geometry_msgs.msg import Twist
+        from sensor_msgs.msg import Imu, JointState
+        self._Twist2, self._Imu, self._JS2 = Twist, Imu, JointState
+        self.pub_low_state = self.node.create_publisher(self._String, "/robot/low_state", 10)
+        self.pub_imu = self.node.create_publisher(Imu, "/robot/imu", 10)
+        self.pub_meas_js = self.node.create_publisher(JointState, "/robot/joint_states", 10)
+        self.pub_cmd_vel = self.node.create_publisher(Twist, "/cmd_vel", 10)
+        self.latest_cmd = self.latest_est = None
+        self._rx = 0                                  # 받은 메시지 수 (spin_some이 큐가 비었는지 판단)
+        self.node.create_subscription(self._String, "/robot/low_cmd", self._on_low_cmd, 10)
+        # 알고리즘의 상태 추정 (진단용). 판정자(러너)가 참값과 비교해 추정 오차 MOP를 남긴다
+        self.node.create_subscription(self._String, "/control/estimate", self._on_estimate, 10)
+
+    def _on_low_cmd(self, msg):
+        self.latest_cmd = json.loads(msg.data); self._rx += 1
+
+    def _on_estimate(self, msg):
+        self.latest_est = json.loads(msg.data); self._rx += 1
+
+    def publish_low_state(self, ls):
+        """로봇 상태: 알고리즘용 JSON 전체 + 표준 도구용 Imu, JointState (측정값)."""
+        self.pub_low_state.publish(self._String(data=json.dumps(ls)))
+        stamp = self._stamp(ls["t"])
+        imu = self._Imu()
+        imu.header.stamp, imu.header.frame_id = stamp, "imu"
+        (imu.orientation.x, imu.orientation.y, imu.orientation.z, imu.orientation.w) = ls["imu"]["quat"]
+        imu.angular_velocity.x, imu.angular_velocity.y, imu.angular_velocity.z = ls["imu"]["gyro"]
+        imu.linear_acceleration.x, imu.linear_acceleration.y, imu.linear_acceleration.z = ls["imu"]["accel"]
+        self.pub_imu.publish(imu)
+        js = self._JS2()
+        js.header.stamp, js.name, js.position, js.velocity = stamp, self.joints, ls["q"], ls["dq"]
+        self.pub_meas_js.publish(js)
+
+    def publish_cmd_vel(self, vx, yaw_rate):
+        msg = self._Twist2()
+        msg.linear.x, msg.angular.z = float(vx), float(yaw_rate)
+        self.pub_cmd_vel.publish(msg)
+
+    def spin_some(self, max_msgs=50):
+        """쌓인 메시지를 모두 처리한다 (spin_once는 한 번에 하나만 처리하므로 명령이 밀리지 않게 비운다)."""
+        import rclpy
+        for _ in range(max_msgs):
+            before = self._rx
+            rclpy.spin_once(self.node, timeout_sec=0.0)
+            if self._rx == before:
+                break
 
     def publish_status(self, status):
         self.pub_status.publish(self._String(data=json.dumps(status)))

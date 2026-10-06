@@ -27,7 +27,7 @@ class TrotController:
         leg = spec["robot"]["leg"]
         self.l1, self.l2 = leg["thigh_length"], leg["calf_length"]
         self.hip_xy = np.array(leg["hip_offsets"])
-        self.track = 2 * (abs(self.hip_xy[0, 1]) + 0.0955)     # 좌우 발 간격
+        self.track = 2 * (abs(self.hip_xy[0, 1]) + leg["abduction_offset"])     # 좌우 발 간격
         self.swing_h = cfg["swing_height"]
         self.stand_h = cfg["stand_height"]
         self.default = np.array(spec["robot"]["default_pose"], dtype=float)

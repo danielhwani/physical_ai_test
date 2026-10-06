@@ -1,4 +1,4 @@
-# 렌더 인터페이스 계약 (중립 스트림 v1.0)
+# 렌더 인터페이스 계약 (중립 스트림 v1.1)
 
 설계 문서 §8 "인터페이스 계약을 먼저 고정"에 해당한다. 시뮬레이터(물리엔진)와 렌더러는 이 계약으로만 연결된다.
 
@@ -21,7 +21,7 @@
 | 쿼터니언 | x, y, z, w |
 | 기준 프레임 | `world` (매니페스트 `frame`) |
 | 시각 | 시뮬레이션 시각. ROS2 구독자는 `use_sim_time:=true` |
-| 버전 | 매니페스트 `stream_version` = `"1.0"`. 주 버전(1)이 다르면 어댑터가 거부 |
+| 버전 | 매니페스트 `stream_version` = `"1.1"` (1.1: 바디 `entity` 추가). 주 버전(1)이 다르면 어댑터가 거부 |
 
 엔진별 좌표 변환(예: UE5 왼손 좌표계, cm)은 그 렌더러의 어댑터 한 곳에서만 한다.
 
@@ -39,7 +39,7 @@
   "stream_version": "1.0", "frame": "world",
   "conventions": {"coordinates": "REP-103 ...", "units": "m", "quaternion": "x,y,z,w"},
   "asset_root": "/절대/경로/physics_ai_test",
-  "bodies":  [{"id": 1, "name": "base", "parent": "world", "physics_source": "MuJoCo"}, ...],
+  "bodies":  [{"id": 1, "name": "base", "parent": "world", "physics_source": "MuJoCo", "entity": "go2"}, ...],
   "visuals": [{"body": "base", "mesh": "build/scene_meshes/base_0.obj",
                "pos": [x, y, z], "quat": [x, y, z, w], "rgba": [r, g, b, a]}, ...],
   "terrain": {"half_size": [hx, hy], "nrow": 401, "ncol": 401, "z_range": [-0.2, 0.4],
@@ -50,6 +50,7 @@
 - 외형 메쉬(`mesh`)는 `asset_root` 기준 상대 경로의 OBJ이며, 정점은 **외형 좌표계**다.
   월드 정점 = 바디 포즈(TF) ∘ (`pos`, `quat`) ∘ 정점.
   (MuJoCo가 컴파일한 메쉬를 내보낸 것이라 원본 Menagerie OBJ와 좌표계가 다르다.)
+- `entity`: 그 바디가 속한 개체 (예: `go2`, `hmmwv`). 센서 렌더러는 센서를 단 개체의 바디를 레이캐스트에서 뺀다 (자기 몸).
 - `physics_source`: 그 바디의 움직임을 누가 결정하는가 (`MuJoCo`, `Chrono`, 이후 `Live`). 문서 §6.2, §9.
   다른 물리엔진의 바디는 id 1000부터 쓰고(MuJoCo 바디 id와 겹치지 않게), 포즈는 같은 `/tf`로 보낸다.
   예: Chrono HMMWV는 차체와 바퀴 축 4개(`hmmwv_*`)가 들어가며, 메쉬는 `build/scene_meshes/chrono/`.
@@ -92,6 +93,7 @@
 
 | 어댑터 | 실행 | 표현 |
 |---|---|---|
+| `viz/sensor_renderer.py` (+ `sensor_node.py`) | `--sensor`, `--sensor-node` | 센서 출력 (LiDAR 점군 `/sensors/<이름>/points`). 같은 스트림으로 장면을 재구성해 레이캐스트 |
 | `viz/rviz_adapter.py` | `--rviz` | URDF(RobotModel), 지형 타일 마커, 정보판 마커. MuJoCo도 import하지 않음 |
 | `viz/mujoco_adapter.py` | `--mjviz` | 매니페스트로 만든 **그리기 전용** MuJoCo 모델 (모든 바디 mocap, 물리 계산 없음) + 뷰어. MuJoCo를 그리기 라이브러리로만 사용 |
 | UE5 어댑터 | (계획) | `docs/ue5_integration.md` |

@@ -1,0 +1,124 @@
+# 자동 생성: train/imitate_trot.py
+name: go2_trot_bc_est
+onnx: policy.onnx
+io:
+  input: obs
+  output: actions
+joints:
+- FL_hip_joint
+- FL_thigh_joint
+- FL_calf_joint
+- FR_hip_joint
+- FR_thigh_joint
+- FR_calf_joint
+- RL_hip_joint
+- RL_thigh_joint
+- RL_calf_joint
+- RR_hip_joint
+- RR_thigh_joint
+- RR_calf_joint
+default_pose:
+- 0
+- 0.9
+- -1.8
+- 0
+- 0.9
+- -1.8
+- 0
+- 0.9
+- -1.8
+- 0
+- 0.9
+- -1.8
+action:
+  scale: 0.25
+  clip: 4.0
+  control_dt: 0.02
+  pd:
+    kp:
+    - 100
+    - 150
+    - 150
+    - 100
+    - 150
+    - 150
+    - 100
+    - 150
+    - 150
+    - 100
+    - 150
+    - 150
+    kd:
+    - 4
+    - 4
+    - 4
+    - 4
+    - 4
+    - 4
+    - 4
+    - 4
+    - 4
+    - 4
+    - 4
+    - 4
+    rate: physics
+observation:
+  clip: 100.0
+  terms:
+  - name: base_ang_vel
+    dim: 3
+    scale: 0.25
+    def: qvel[3:6] (몸통 좌표, = imu site gyro)
+  - name: projected_gravity
+    dim: 3
+    scale: 1.0
+    def: R(qpos[3:7])^T @ [0, 0, -1]
+  - name: command
+    dim: 3
+    scale:
+    - 2.0
+    - 2.0
+    - 0.25
+    def: '[vx, vy, yaw_rate] 몸통 좌표'
+  - name: joint_pos_rel
+    dim: 12
+    scale: 1.0
+    def: qpos[7:19] - default_pose
+  - name: joint_vel
+    dim: 12
+    scale: 0.05
+    def: qvel[6:18]
+  - name: last_action
+    dim: 12
+    scale: 1.0
+    def: 직전 제어 주기의 action (clip 후, scale 전)
+  - name: gait_phase
+    dim: 2
+    scale: 1.0
+    def: '[sin(2πφ), cos(2πφ)], φ = runner GaitClock 위상 (명령 0이면 정지)'
+  dim: 47
+  tolerance:
+    rtol: 1.0e-05
+    atol: 1.0e-05
+gait_clock:
+  period: 0.36
+provenance:
+  method: DAgger imitation of rule-based trot (control/trot.py)
+  observation_source: 'robot boundary: sensor noise + state estimator (no ground truth)'
+  link_latency_steps_range:
+  - 0
+  - 2
+  spec_version: 0.4.0
+  date: '2026-10-06'
+  network: MLP 47-128-128-12 ELU, obs normalization in graph
+  samples: 113895
+  dagger_iters: 6
+  train_seconds: 323
+  trained_on: CPU MuJoCo, model variant cpu
+  final_eval:
+  - scenario: flat_trot
+    forward_m: 4.235
+    fell_at: null
+  - scenario: rough_rut
+    forward_m: 4.035
+    fell_at: null

@@ -16,7 +16,7 @@ import numpy as np
 from .adapters import mj_quat_to_ros, quat_to_yaw
 from .model_builder import TERRAIN_BODY
 
-STREAM_VERSION = "1.0"
+STREAM_VERSION = "1.1"     # 1.1: 바디에 entity (어느 개체의 바디인가: 센서가 자기 몸을 구분)
 ROOT = Path(__file__).resolve().parent.parent
 MESH_DIR = ROOT / "build/scene_meshes"
 FOOT_NAMES = ("FL", "FR", "RL", "RR")
@@ -43,7 +43,7 @@ def export_meshes(model, mesh_dir=MESH_DIR):
 COSIM_ID_BASE = 1000     # 다른 물리엔진 바디의 id 시작값 (MuJoCo 바디 id와 겹치지 않게)
 
 
-def build_manifest(model, terrain, cosim=None, physics_source="MuJoCo"):
+def build_manifest(model, terrain, cosim=None, physics_source="MuJoCo", entity="go2"):
     """cosim: 다른 물리엔진 연결(ChronoLink 등). 그 바디들도 같은 장면에 넣되 physics_source로 구분한다."""
     name = lambda t, i: mujoco.mj_id2name(model, t, i)  # noqa: E731
     meshes = export_meshes(model)
@@ -54,7 +54,7 @@ def build_manifest(model, terrain, cosim=None, physics_source="MuJoCo"):
         parent = model.body_parentid[b]
         bodies.append({"id": b, "name": name(mujoco.mjtObj.mjOBJ_BODY, b),
                        "parent": "world" if parent == 0 else name(mujoco.mjtObj.mjOBJ_BODY, parent),
-                       "physics_source": physics_source})
+                       "physics_source": physics_source, "entity": entity})
     for g in range(model.ngeom):
         if model.geom_type[g] != mujoco.mjtGeom.mjGEOM_MESH or model.geom_bodyid[g] == 0:
             continue
@@ -65,7 +65,7 @@ def build_manifest(model, terrain, cosim=None, physics_source="MuJoCo"):
                         "rgba": [float(c) for c in rgba]})
     for k, b in enumerate(cosim.manifest_bodies() if cosim is not None else []):
         bodies.append({"id": COSIM_ID_BASE + k, "name": b["name"], "parent": "world",
-                       "physics_source": b["physics_source"]})
+                       "physics_source": b["physics_source"], "entity": b.get("entity", "hmmwv")})
         visuals += [dict(v, body=b["name"]) for v in b["visuals"]]
     return {
         "stream_version": STREAM_VERSION,
@@ -131,7 +131,7 @@ def build_status(sim, start_xy, energy, late, final_mop=None):
     return {
         "t": float(d.time),
         "controller": ctrl, "variant": sim.variant,
-        "command": {"vx": float(sim.clock.cmd_f[0]), "yaw_rate": float(sim.clock.cmd_f[1])},
+        "command": {"vx": float(sim.command_display[0]), "yaw_rate": float(sim.command_display[1])},
         "speed_avg": sim.display_speed, "distance": dist, "cot": cot,
         "base_pos": d.qpos[:3].tolist(), "yaw": float(quat_to_yaw(d.qpos[3:7])),
         "feet": {n: {"pos": d.geom_xpos[g].tolist(), "contact": bool(c)}
@@ -143,3 +143,30 @@ def build_status(sim, start_xy, energy, late, final_mop=None):
         "event": {"t": sim.last_event[0], "desc": sim.last_event[1]} if sim.last_event else None,
         "final_mop": final_mop,
     }
+
+
+class StreamTap:
+    """같은 프로세스 안에서 중립 스트림 메시지를 만든다 (ROS 없이). 센서 렌더러 등 소비자는 이 메시지만 받는다.
+    내용은 ROS2 토픽과 같다: 매니페스트, 지형 패치(변경분), 바디 포즈(TF와 같은 x,y,z,w), 시각."""
+
+    def __init__(self, sim):
+        self.sim = sim
+        self.manifest = build_manifest(sim.model, sim.terrain, sim.cosim)
+        self.bodies = [(b["id"], b["name"]) for b in self.manifest["bodies"] if b["physics_source"] == "MuJoCo"]
+        self.terrain = TerrainPatchStream(sim.terrain)
+        self.started = False
+
+    def patches(self):
+        """처음엔 전체 지형, 이후엔 바뀐 영역. 반환: 패치 목록."""
+        if not self.started:
+            self.started = True
+            return [self.terrain.full()]
+        p = self.terrain.update()
+        return [p] if p else []
+
+    def poses(self):
+        d = self.sim.data
+        out = {n: (d.xpos[i].tolist(), mj_quat_to_ros(d.xquat[i]).tolist()) for i, n in self.bodies}
+        if self.sim.cosim is not None:
+            out.update({n: (p.tolist(), q.tolist()) for n, p, q in self.sim.cosim.stream_poses()})
+        return out

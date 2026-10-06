@@ -84,6 +84,9 @@ def build_model(spec_cfg, terrain, variant="cpu"):
         s.worldbody.add_geom(name="terrain", type=mujoco.mjtGeom.mjGEOM_HFIELD, hfieldname="terrain",
                              pos=terrain.geom_pos, material="terrain")
 
+    # IMU 가속도계 참값 (로봇 쪽 센서 모델의 입력). 센서는 동역학에 영향이 없다
+    s.add_sensor(name="imu_accel", type=mujoco.mjtSensor.mjSENS_ACCELEROMETER, objtype=mujoco.mjtObj.mjOBJ_SITE,
+                 objname="imu")
     model = s.compile()
     hid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_HFIELD, "terrain")
     terrain.applied[:] = terrain.target          # 초기 지형은 보류 없이 전부 반영

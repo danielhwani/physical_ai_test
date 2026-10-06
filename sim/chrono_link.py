@@ -129,7 +129,7 @@ class ChronoLink:
 
     # ---- 스트림용 ----
     def manifest_bodies(self):
-        return [dict(b, physics_source="Chrono") for b in self.bodies]
+        return [dict(b, physics_source="Chrono", entity="hmmwv") for b in self.bodies]
 
     def stream_poses(self):
         return [(n, p, q) for n, (p, q) in zip(self.names, self.poses)]

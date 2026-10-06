@@ -13,7 +13,7 @@ import mujoco
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from sim.controllers.trot import leg_ik  # noqa: E402
+from control.trot import leg_ik  # noqa: E402
 from sim.runner import Simulation  # noqa: E402
 
 SCENARIO = Path(__file__).resolve().parent.parent / "scenarios/rough_rut.yaml"

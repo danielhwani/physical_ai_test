@@ -32,15 +32,16 @@ def _wxyz(q_xyzw):
     return [w, x, y, z]
 
 
-def build_render_model(manifest):
+def build_render_model(manifest, window_half=RENDER_WINDOW, max_cells=200_000, self_bodies=()):
     """매니페스트 -> (MjModel, 바디이름->mocap 인덱스, hfield id, TerrainWindow). 물리용이 아닌 그리기 전용 모델.
-    세계 지형이 크면 로봇 주변 창만 담고, 창은 mocap 바디로 옮긴다 (TerrainWindow 규칙)."""
+    세계 지형이 크면 로봇 주변 창만 담고, 창은 mocap 바디로 옮긴다 (TerrainWindow 규칙).
+    geom 그룹: 지형 0, 다른 바디 1, self_bodies(센서를 단 로봇 자신) 2 -> 레이캐스트에서 자기 몸을 뺄 수 있다."""
     root = Path(manifest["asset_root"])
     s = mujoco.MjSpec()
     s.compiler.inertiafromgeom = mujoco.mjtInertiaFromGeom.mjINERTIAFROMGEOM_FALSE   # 질량 계산 불필요
     s.visual.global_.offwidth, s.visual.global_.offheight = 1280, 720
     t = manifest["terrain"]
-    win = TerrainWindow(t, half=RENDER_WINDOW)
+    win = TerrainWindow(t, half=window_half, max_cells=max_cells)
     add_terrain_look(s, win.win_half)                            # 흙 질감, 1 m 옅은 격자, 비스듬한 조명
     zmin, zmax = t["z_range"]
     hf = s.add_hfield(name="terrain", nrow=win.wnrow, ncol=win.wncol, size=[*win.win_half, zmax - zmin, 0.1])
@@ -62,7 +63,7 @@ def build_render_model(manifest):
     for v in manifest["visuals"]:
         bodies[v["body"]].add_geom(type=mujoco.mjtGeom.mjGEOM_MESH, meshname=meshes[v["mesh"]],
                                    pos=v["pos"], quat=_wxyz(v["quat"]), rgba=v["rgba"],
-                                   contype=0, conaffinity=0, group=1)
+                                   contype=0, conaffinity=0, group=2 if v["body"] in self_bodies else 1)
     model = s.compile()
     mocap = {b["name"]: model.body_mocapid[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, b["name"])]
              for b in manifest["bodies"]}

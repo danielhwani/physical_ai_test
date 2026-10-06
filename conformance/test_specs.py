@@ -12,9 +12,9 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from conformance.make_obs_reference import OUT as REF_PATH, spec_hash  # noqa: E402
-from sim.control_interface import ControlInterface  # noqa: E402
+from control.interface import ControlInterface  # noqa: E402
 from sim.model_builder import COLLISION_GROUP, MJX_OVERRIDE, robot_spec  # noqa: E402
-from sim.observation import INPUT_KEYS  # noqa: E402
+from control.observation import INPUT_KEYS  # noqa: E402
 
 SPEC = yaml.safe_load((ROOT / "specs/go2_control.yaml").read_text())
 OBS = ControlInterface(SPEC).obs

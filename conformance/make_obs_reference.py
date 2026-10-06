@@ -3,7 +3,7 @@
     python conformance/make_obs_reference.py
 
 conformance/reference/obs_reference.npz 에 (qpos, qvel, command, last_action, gait_phase) 입력과
-sim/observation.py 기준 구현의 출력(obs)을 저장한다. JAX/C++ 구현은 같은 입력으로 계산해
+control/observation.py 기준 구현의 출력(obs)을 저장한다. JAX/C++ 구현은 같은 입력으로 계산해
 명세의 tolerance 안에서 obs와 일치해야 한다.
 
 입력 상태 구성:
@@ -21,8 +21,8 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from sim.control_interface import ControlInterface  # noqa: E402
-from sim.observation import INPUT_KEYS  # noqa: E402
+from control.interface import ControlInterface  # noqa: E402
+from control.observation import INPUT_KEYS  # noqa: E402
 from sim.runner import Simulation, load_yaml  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent

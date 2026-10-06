@@ -16,7 +16,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from sim.control_interface import load_card  # noqa: E402
+from control.interface import load_card  # noqa: E402
 from sim.runner import Simulation  # noqa: E402
 
 
@@ -39,7 +39,7 @@ def main(card_path):
     out = card["_dir"] / "io_reference.npz"
     np.savez_compressed(out, obs=np.array(obs, dtype=np.float32), actions=np.array(act, dtype=np.float32),
                         onnx_sha256=np.array(onnx_sha256(card)))
-    print(f"{out.relative_to(ROOT)}: {len(obs)} samples")
+    print(f"{Path(out).resolve().relative_to(ROOT)}: {len(obs)} samples")
 
 
 if __name__ == "__main__":

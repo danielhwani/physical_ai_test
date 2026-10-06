@@ -45,7 +45,7 @@ class ObservationSpec:
         self.joint_idx = np.asarray(joint_idx)
         self.default_pose = np.asarray(default_pose, dtype=float)
         unknown = [t["name"] for t in self.terms if t["name"] not in TERMS]
-        assert not unknown, f"구현되지 않은 관측 항목: {unknown} (sim/observation.py TERMS에 추가 필요)"
+        assert not unknown, f"구현되지 않은 관측 항목: {unknown} (control/observation.py TERMS에 추가 필요)"
         assert sum(t["dim"] for t in self.terms) == self.dim, "observation dim 불일치"
 
     def compute(self, qpos, qvel, command, last_action, gait_phase=0.0):
