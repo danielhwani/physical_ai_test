@@ -8,6 +8,8 @@
       0 = v_body + ω × p_foot + J(q) dq + (ω + Ω_rel) × (-r n)
       ->  v_body = -(J dq + ω × p_foot + (ω + Ω_rel) × (-r n))
   디딘 발들의 평균을 저역통과한다. 발이 미끄러지면 오차가 생긴다 (실제 로봇과 같은 한계).
+- 위치(주행거리 좌표계 odom): 추정 속도를 월드 방향으로 돌려 적분한다. 시작 자세가 원점, 시간이 지나며 표류한다.
+  지형 지도(control/terrain_map.py)는 이 좌표계에 쌓는다.
 참값을 받지 않는다. MuJoCo를 import하지 않는다.
 """
 from dataclasses import dataclass
@@ -37,6 +39,7 @@ class Estimate:
     v_body: np.ndarray       # 몸통 좌표 선속도 (다리 주행거리계)
     wz_world: float          # 월드 z축 기준 방향 회전 속도
     contacts: np.ndarray     # 디딘 발 (bool, 4)
+    pos: np.ndarray          # 몸통 위치 (odom 좌표계, 적분)
     q: np.ndarray            # 관절각 (측정)
     dq: np.ndarray           # 관절 속도 (측정)
 
@@ -50,6 +53,8 @@ class LegOdometryEstimator:
 
     def reset(self):
         self.v = np.zeros(3)
+        self.pos = np.zeros(3)
+        self.last_t = None
 
     def update(self, ls):
         imu = ls["imu"]
@@ -71,5 +76,8 @@ class LegOdometryEstimator:
                 omega_foot = gyro + self.kin.foot_angular_velocity(qi, dqi)
                 est.append(-(self.kin.jacobian(i, qi) @ dqi + np.cross(gyro, p) + np.cross(omega_foot, down)))
             self.v += self.alpha * (np.mean(est, axis=0) - self.v)
+        if self.last_t is not None:
+            self.pos += (R @ self.v) * (ls["t"] - self.last_t)
+        self.last_t = ls["t"]
         return Estimate(quat_wxyz=qw, R=R, roll=roll, pitch=pitch, yaw=yaw, gyro=gyro, v_body=self.v.copy(),
-                        wz_world=float((R @ gyro)[2]), contacts=contacts, q=q, dq=dq)
+                        wz_world=float((R @ gyro)[2]), contacts=contacts, pos=self.pos.copy(), q=q, dq=dq)

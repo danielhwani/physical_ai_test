@@ -57,6 +57,29 @@ Visualization Manager:
       Axis: Z
       Use Fixed Frame: true
       Decay Time: 0
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Algorithm terrain map
+      Enabled: true
+      Topic:
+        Value: /control/terrain_map
+        Depth: 2
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+      Style: Boxes
+      Size (m): 0.038
+      Color Transformer: RGB8
+      Use Fixed Frame: true
+      Decay Time: 0
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Footholds
+      Enabled: true
+      Topic:
+        Value: /control/footholds
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
     - Class: rviz_default_plugins/TF
       Name: TF
       Enabled: false

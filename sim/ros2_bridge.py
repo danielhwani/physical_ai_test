@@ -50,9 +50,9 @@ def launch_sensor_node(log_dir, sensors):
                             stdout=open(log_dir / "sensor_node.log", "w"), stderr=subprocess.STDOUT)
 
 
-def launch_controller_node(log_dir, scenario_path=None, policy=None):
+def launch_controller_node(log_dir, scenario_path=None, policy=None, viz=False):
     """보행 알고리즘 ROS2 노드 (control/ros_node.py): 로봇 상태 토픽만 보고 관절 명령 토픽을 낸다."""
-    cmd = [sys.executable, "-m", "control.ros_node"]
+    cmd = [sys.executable, "-m", "control.ros_node"] + (["--viz"] if viz else [])
     if policy:
         cmd += ["--policy", str(policy)]
     if scenario_path:
@@ -170,15 +170,28 @@ class Ros2StreamPublisher:
         self.pub_low_state = self.node.create_publisher(self._String, "/robot/low_state", 10)
         self.pub_imu = self.node.create_publisher(Imu, "/robot/imu", 10)
         self.pub_meas_js = self.node.create_publisher(JointState, "/robot/joint_states", 10)
-        self.pub_cmd_vel = self.node.create_publisher(Twist, "/cmd_vel", 10)
+        from geometry_msgs.msg import TwistStamped
+        self._TwistS = TwistStamped
+        # 시나리오 이벤트의 운용자 명령은 시각을 붙여 보낸다 (노드가 그 시각 상태부터 적용 -> 같은 프로세스와 같은 결과)
+        self.pub_cmd_vel = self.node.create_publisher(TwistStamped, "/cmd_vel_stamped", 10)
         self.latest_cmd = self.latest_est = None
+        self.cmds = []
         self._rx = 0                                  # 받은 메시지 수 (spin_some이 큐가 비었는지 판단)
         self.node.create_subscription(self._String, "/robot/low_cmd", self._on_low_cmd, 10)
         # 알고리즘의 상태 추정 (진단용). 판정자(러너)가 참값과 비교해 추정 오차 MOP를 남긴다
         self.node.create_subscription(self._String, "/control/estimate", self._on_estimate, 10)
 
     def _on_low_cmd(self, msg):
-        self.latest_cmd = json.loads(msg.data); self._rx += 1
+        cmd = json.loads(msg.data)
+        self.cmds.append(cmd)
+        del self.cmds[:-10]                            # 최근 명령 몇 개만 (상태 시각으로 고른다)
+        self.latest_cmd = cmd; self._rx += 1
+
+    def cmd_until(self, t):
+        """상태 시각 t 이하로 계산된 명령 중 가장 최근 것. 연결 지연을 한 주기로 고정해 실행을 결정적으로 만든다
+        (노드가 매우 빨라 같은 주기 안에 답이 와도 다음 주기에 실행 = 같은 프로세스의 latency_steps와 같다)."""
+        ok = [c for c in self.cmds if c.get("t", -1) <= t + 1e-9]
+        return ok[-1] if ok else None
 
     def _on_estimate(self, msg):
         self.latest_est = json.loads(msg.data); self._rx += 1
@@ -197,9 +210,10 @@ class Ros2StreamPublisher:
         js.header.stamp, js.name, js.position, js.velocity = stamp, self.joints, ls["q"], ls["dq"]
         self.pub_meas_js.publish(js)
 
-    def publish_cmd_vel(self, vx, yaw_rate):
-        msg = self._Twist2()
-        msg.linear.x, msg.angular.z = float(vx), float(yaw_rate)
+    def publish_cmd_vel(self, vx, yaw_rate, t):
+        msg = self._TwistS()
+        msg.header.stamp = self._stamp(t)
+        msg.twist.linear.x, msg.twist.angular.z = float(vx), float(yaw_rate)
         self.pub_cmd_vel.publish(msg)
 
     def spin_some(self, max_msgs=50):
@@ -210,6 +224,41 @@ class Ros2StreamPublisher:
             rclpy.spin_once(self.node, timeout_sec=0.0)
             if self._rx == before:
                 break
+
+    def wait_cmd(self, t_state, timeout):
+        """t_state 상태에 대한 명령이 올 때까지 최대 timeout초 기다린다. 시뮬레이터가 실시간보다 늦어져 따라잡는 동안에도
+        알고리즘 노드에 한 제어 주기만큼의 계산 시간을 준다 (실시간으로 도는 로봇과 같은 조건). 늦으면 그대로 진행한다."""
+        import time
+        end = time.perf_counter() + timeout
+        while (self.latest_cmd is None or self.latest_cmd.get("t", -1) < t_state - 1e-9) and time.perf_counter() < end:
+            self.spin_some()
+            time.sleep(0.0005)
+
+    def publish_odom_frame(self, p0):
+        """world -> odom (알고리즘 주행거리 좌표계 원점 = 시작 몸통 위치, 축은 월드와 같음). 화면 정렬용, 한 번만 발행."""
+        from rclpy.qos import DurabilityPolicy, QoSProfile
+        self.pub_tf_static = self.node.create_publisher(
+            self._TF, "/tf_static", QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        t = self._T()
+        t.header.stamp, t.header.frame_id, t.child_frame_id = self._stamp(0.0), self.frame, "odom"
+        t.transform.translation.x, t.transform.translation.y, t.transform.translation.z = map(float, p0)
+        t.transform.rotation.w = 1.0
+        self.pub_tf_static.publish(self._TF(transforms=[t]))
+
+    def publish_perception(self, snap):
+        """같은 프로세스 실행일 때 알고리즘의 지형 인지 상태 (control/ros_viz.py와 같은 토픽)."""
+        from control.ros_viz import perception_markers
+        if not hasattr(self, "pub_map"):
+            from sensor_msgs.msg import PointCloud2
+            from visualization_msgs.msg import MarkerArray
+            self.pub_map = self.node.create_publisher(PointCloud2, "/control/terrain_map", 2)
+            self.pub_feet = self.node.create_publisher(MarkerArray, "/control/footholds", 5)
+            self._viz_n = 0
+        cloud, feet = perception_markers(snap, self._stamp(snap["t"]))
+        self.pub_feet.publish(feet)
+        if self._viz_n % 5 == 0:
+            self.pub_map.publish(cloud)
+        self._viz_n += 1
 
     def publish_status(self, status):
         self.pub_status.publish(self._String(data=json.dumps(status)))

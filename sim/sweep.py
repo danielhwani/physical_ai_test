@@ -15,7 +15,7 @@ import io
 from .model_builder import ROOT
 from .runner import load_yaml, run
 
-COLUMNS = ["fell", "forward_x_m", "lateral_drift_m", "mean_speed_mps", "cost_of_transport",
+COLUMNS = ["fell", "fell_at_s", "forward_x_m", "lateral_drift_m", "mean_speed_mps", "cost_of_transport", "edge_touchdowns",
            "deformed_cells", "deform_mean_m", "deform_max_m", "min_vehicle_distance_m", "wall_time_s"]
 
 

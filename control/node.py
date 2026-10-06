@@ -4,6 +4,9 @@
   로봇 상태 (Unitree LowState를 본뜸): t, q[12], dq[12], imu{quat(x,y,z,w), gyro, accel}, foot_force[4]
   이동 명령 (운용자): vx, yaw_rate
   관절 명령 (Unitree LowCmd를 본뜸): q_des[12], dq_des[12], kp[12], kd[12], tau_ff[12]   (모델 관절 순서)
+  LiDAR 점군 (선택, 트롯의 perception.sensor): 센서 좌표 점들 + 스캔 시각. 센서의 참 자세는 받지 않는다
+스캔은 찍힌 시각의 추정 자세로 지도에 넣고, 찍힌 다음 제어 주기부터 쓴다. 그래서 ROS로 받을 때 상태 메시지와
+점군의 도착 순서가 바뀌어도(한 주기 안이면) 같은 프로세스 실행과 결과가 같다.
 시뮬레이터(sim/)와 MuJoCo를 import하지 않는다. 같은 프로세스에서 직접 부르거나 control/ros_node.py로 ROS2 노드가 된다.
 """
 from collections import deque
@@ -14,12 +17,15 @@ from .clock import GaitClock, StepContext
 from .estimator import LegOdometryEstimator
 from .interface import ControlInterface, load_card
 from .onnx_policy import OnnxPolicyController
+from .terrain_map import TerrainPerception
 from .trot import TrotController
 
 
 class ControllerNode:
-    def __init__(self, spec, controller_cfg=None, policy=None):
-        """controller_cfg: 시나리오의 controller 절 (트롯). policy: 정책 카드 경로 (ONNX)."""
+    def __init__(self, spec, controller_cfg=None, policy=None, lidar_defs=None):
+        """controller_cfg: 시나리오의 controller 절 (트롯). policy: 정책 카드 경로 (ONNX).
+        lidar_defs: specs/go2_sensors.yaml의 lidars (장착 보정값). 트롯의 perception.sensor가 있을 때 필요."""
+        self.terrain, self.sensor = None, None
         if policy:
             card = load_card(policy)
             self.iface = ControlInterface(spec, card)
@@ -29,6 +35,11 @@ class ControllerNode:
             self.iface = ControlInterface(spec)
             self.ctrl = TrotController(spec, controller_cfg, self.iface)
             self.desc, period = f"trot:{controller_cfg}", controller_cfg["period"]
+            pcfg = controller_cfg.get("perception")
+            if pcfg:
+                self.sensor = pcfg["sensor"]
+                assert lidar_defs and self.sensor in lidar_defs, f"지형 인지 센서 {self.sensor}의 장착 명세가 없음"
+                self.terrain = TerrainPerception(spec, lidar_defs[self.sensor], pcfg.get("map"))
         self.clock = GaitClock(period or 1.0)
         self.estimator = LegOdometryEstimator(spec)
         self.delay_steps = spec["action"].get("delay_steps", 0)
@@ -44,6 +55,41 @@ class ControllerNode:
         self.pending = deque([np.zeros(12)] * self.delay_steps)
         self.last_t, self.est = None, None
         self.q_des = self.iface.targets_from_action(self.action)
+        if self.terrain is not None:
+            self.terrain.reset()
+        self.scan_buf, self.pose_hist = [], {}
+
+    def perception_snapshot(self):
+        """화면용 지형 인지 상태 (odom 좌표). 지형 인지가 없으면 None.
+        cells: 아는 칸 (N, 3) 중심 x, y, 높이 / h_ref: 몸통 기준 지면 높이 / legs: 다리별 고른 자리와 원래 자리."""
+        if self.terrain is None or self.last_t is None:
+            return None
+        m, tr = self.terrain.map, self.ctrl
+        rows, cols = np.nonzero(np.isfinite(m.h))
+        xy = m.origin + (np.stack([cols, rows], 1) + 0.5) * m.res
+        legs = []
+        for i, fh in enumerate(tr.footholds):
+            if fh is None:
+                continue
+            h = fh.height if np.isfinite(fh.height) else tr.h_td[i]
+            legs.append({"leg": i, "swing": bool(tr.in_swing[i]), "chosen": [*fh.xy, h], "nominal": [*tr.nominal[i], h]})
+        return {"t": self.last_t, "res": m.res, "cells": np.column_stack([xy, m.h[rows, cols]]),
+                "h_ref": tr.h_ref, "legs": legs}
+
+    def on_scan(self, name, t, points):
+        """LiDAR 점군 (센서 좌표, (N, 3)). 다음 제어 주기에 지도에 넣는다."""
+        if self.terrain is not None and name == self.sensor:
+            self.scan_buf.append((t, np.asarray(points, dtype=float)))
+
+    def _integrate_scans(self, t, dt):
+        ready = [sc for sc in self.scan_buf if sc[0] <= t - 0.5 * dt]
+        self.scan_buf = [sc for sc in self.scan_buf if sc[0] > t - 0.5 * dt]
+        for ts, pts in ready:
+            key = min(self.pose_hist, key=lambda k: abs(k - ts)) if self.pose_hist else None
+            if key is not None and abs(key - ts) < 0.5 * dt:
+                self.terrain.add_scan(pts, *self.pose_hist[key])
+        for k in [k for k in self.pose_hist if k < t - 1.0]:          # 1초 넘은 자세 기록은 버린다
+            del self.pose_hist[k]
 
     def set_command(self, vx, yaw_rate):
         self.clock.set_command(vx, yaw_rate)
@@ -55,12 +101,15 @@ class ControllerNode:
         self.last_t = t
         self.clock.update(dt)
         est = self.est = self.estimator.update(ls)
+        if self.terrain is not None:
+            self.pose_hist[t] = self.terrain.update(est)
+            self._integrate_scans(t, self.iface.control_dt)
         # 관측은 추정값으로 만든다 (MuJoCo 배치 규약의 qpos/qvel 자리에 추정 자세, 측정 각속도, 엔코더 값)
         qpos = np.concatenate([[0.0, 0.0, 0.0], est.quat_wxyz, est.q])
         qvel = np.concatenate([est.R @ est.v_body, est.gyro, est.dq])
         self.obs = self.iface.obs.compute(qpos, qvel, self.clock.command_body(), self.action, self.clock.phase)
         ctx = StepContext(dt=dt, est=est, roll=est.roll, pitch=est.pitch, yaw=est.yaw, v_body_x=float(est.v_body[0]),
-                          wz_world=est.wz_world, clock=self.clock, obs=self.obs)
+                          wz_world=est.wz_world, clock=self.clock, obs=self.obs, terrain=self.terrain)
         action = self.ctrl.act(ctx)
         if self.on_action:
             action = self.on_action(ctx, action)

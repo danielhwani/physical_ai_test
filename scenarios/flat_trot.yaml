@@ -12,6 +12,7 @@ controller:
   period: 0.36
   swing_height: 0.07
   stand_height: 0.27
+  perception: null     # 지형 인지 (LiDAR 높이 지도 -> 디딜 곳, 발 높이). 켜기: --set controller.perception.sensor=front_lidar
 events:
   - {t: 1.0, action: set_command, vx: 0.4, yaw_rate: 0.0}
   - {t: 8.0, action: set_command, vx: 0.4, yaw_rate: 0.4}
