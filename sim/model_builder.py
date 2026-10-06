@@ -9,9 +9,12 @@ from pathlib import Path
 import mujoco
 import yaml
 
+from viz.terrain_look import add_terrain_look   # 화면 외형 (viz는 sim을 모르므로 이 방향 의존은 허용)
+
 ROOT = Path(__file__).resolve().parent.parent
 MJX_OVERRIDE = ROOT / "specs/go2_mjx_override.yaml"
 COLLISION_GROUP = 3
+TERRAIN_BODY = "terrain_window"   # 창 모드에서 지형 geom을 붙이는 mocap 바디 (렌더 스트림에서는 제외)
 
 _GEOM_TYPES = {"sphere": mujoco.mjtGeom.mjGEOM_SPHERE, "capsule": mujoco.mjtGeom.mjGEOM_CAPSULE,
                "box": mujoco.mjtGeom.mjGEOM_BOX, "cylinder": mujoco.mjtGeom.mjGEOM_CYLINDER}
@@ -66,18 +69,20 @@ def build_model(spec_cfg, terrain, variant="cpu"):
     s = robot_spec(spec_cfg, variant)
 
     # 사전 할당 heightfield (크기/해상도는 이후 변경 불가)
-    hf = s.add_hfield(name="terrain", nrow=terrain.nrow, ncol=terrain.ncol, size=terrain.hfield_size)
-    hf.userdata = [0.0] * (terrain.nrow * terrain.ncol)   # 실제 높이는 컴파일 후 write_all()로 기록
-    s.add_texture(name="grid", type=mujoco.mjtTexture.mjTEXTURE_2D,
-                  builtin=mujoco.mjtBuiltin.mjBUILTIN_CHECKER, width=256, height=256,
-                  rgb1=[0.35, 0.33, 0.28], rgb2=[0.28, 0.26, 0.22])
-    mat = s.add_material(name="terrain")
-    mat.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = "grid"
-    mat.texrepeat = [40, 40]
-    s.worldbody.add_geom(name="terrain", type=mujoco.mjtGeom.mjGEOM_HFIELD, hfieldname="terrain",
-                         pos=terrain.geom_pos, material="terrain")
-    s.worldbody.add_light(pos=[0, 0, 5], dir=[0, 0, -1], type=mujoco.mjtLightType.mjLIGHT_DIRECTIONAL,
-                          castshadow=False)   # 저사양: 그림자 끔
+    # MuJoCo에는 Terrain Map Service의 창만 할당한다 (창 = 세계 지도 전체일 수도 있다)
+    hf = s.add_hfield(name="terrain", nrow=terrain.wnrow, ncol=terrain.wncol, size=terrain.hfield_size)
+    hf.userdata = [0.0] * (terrain.wnrow * terrain.wncol)   # 실제 높이는 컴파일 후 write_all()로 기록
+    add_terrain_look(s, terrain.win_half)                  # 외형만 (흙 질감, 1 m 옅은 격자, 비스듬한 조명)
+    if terrain.windowed:
+        # 창을 옮길 때 지형 geom 위치를 바꾸면, MuJoCo가 모델 생성 때 계산해 둔 월드 고정 geom의 충돌 경계 상자가
+        # 그대로 남아 창 밖(처음 위치 기준)으로 나간 발의 접촉을 놓친다 (확인함). mocap 바디에 붙이면 경계 상자가
+        # 바디 좌표계 기준이라 함께 움직인다. 창 중심은 data.mocap_pos로 옮긴다.
+        body = s.worldbody.add_body(name=TERRAIN_BODY, mocap=True, pos=[*terrain.window_center, 0.0])
+        body.add_geom(name="terrain", type=mujoco.mjtGeom.mjGEOM_HFIELD, hfieldname="terrain",
+                      pos=[0.0, 0.0, terrain.z_min], material="terrain")
+    else:
+        s.worldbody.add_geom(name="terrain", type=mujoco.mjtGeom.mjGEOM_HFIELD, hfieldname="terrain",
+                             pos=terrain.geom_pos, material="terrain")
 
     model = s.compile()
     hid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_HFIELD, "terrain")

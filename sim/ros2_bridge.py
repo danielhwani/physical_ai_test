@@ -20,6 +20,7 @@ from pathlib import Path
 import mujoco
 
 from .adapters import mj_quat_to_ros
+from .model_builder import TERRAIN_BODY
 from .stream import TerrainPatchStream, build_manifest
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -73,7 +74,8 @@ class Ros2StreamPublisher:
             String, "/sim/terrain_patch", QoSProfile(depth=500, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.pub_status = self.node.create_publisher(String, "/sim/status", latched)
         self.frame = frame
-        self.bodies = [(i, mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, i)) for i in range(1, model.nbody)]
+        self.bodies = [(i, n) for i in range(1, model.nbody)
+                       if (n := mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, i)) != TERRAIN_BODY]
         self.joints = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, j) for j in range(1, model.njnt)]
 
         self.cosim = cosim

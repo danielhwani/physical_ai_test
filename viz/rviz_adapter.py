@@ -21,9 +21,10 @@ from rclpy.qos import DurabilityPolicy, QoSProfile
 from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
 
-from .stream_decode import TerrainGrid, check_manifest, quat_to_rpy
+from .stream_decode import TerrainGrid, TerrainWindow, check_manifest, quat_to_rpy
 
-TERRAIN_HALF = 6.0      # 표시 범위 (m, 원점 기준 반폭). 저사양 RViz를 위해 제한
+TERRAIN_HALF = 6.0      # 표시 범위 (m, 로봇 주변 창의 반폭). 저사양 RViz를 위해 제한
+WINDOW_TRIGGER = 2.0    # 로봇이 표시 창 중심에서 이만큼 멀어지면 창을 옮겨 다시 그린다 (m)
 MAX_CELLS = 100_000     # 표시 셀 수 상한: 지형이 작으면 원래 해상도(발자국 등), 크면 성기게
 TILE = 5                # 타일 한 변의 셀 수
 
@@ -91,6 +92,11 @@ class RvizAdapter(Node):
         self.manifest = check_manifest(json.loads(msg.data))
         self.frame = self.manifest["frame"]
         self.grid = TerrainGrid(self.manifest["terrain"])
+        # 창 반폭: 원래 해상도로 MAX_CELLS 안에 들어가는 크기 (2 cm 격자 -> 약 3 m, 5 cm -> 6 m). 세계가 창보다 크면 창을 옮긴다
+        t = self.manifest["terrain"]
+        res = 2 * t["half_size"][0] / (t["ncol"] - 1)
+        half = min(TERRAIN_HALF, max(1.0, np.floor(res * np.sqrt(MAX_CELLS) / 2)))
+        self.window = TerrainWindow(t, half=half, max_cells=0)
         self.pub_desc.publish(String(data=build_urdf(self.manifest)))
         self.get_logger().info(f"manifest: {len(self.manifest['bodies'])} bodies, {len(self.manifest['visuals'])} visuals")
         for p in self.pending:                      # 매니페스트보다 먼저 온 지형 패치
@@ -109,15 +115,12 @@ class RvizAdapter(Node):
         self.publish_terrain()
 
     def sampled(self):
-        """표시용 격자: 원래 격자의 k칸마다 한 점 (k는 셀 수가 MAX_CELLS 이하가 되는 가장 작은 값)."""
-        g = self.grid
-        cols = np.where(np.abs(g.xs()) <= TERRAIN_HALF)[0]
-        rows = np.where(np.abs(g.ys()) <= TERRAIN_HALF)[0]
+        """표시용 격자: 로봇 주변 창에서 k칸마다 한 점 (k는 셀 수가 MAX_CELLS 이하가 되는 가장 작은 값)."""
+        w = self.window
         k = 1
-        while (len(cols) // k) * (len(rows) // k) > MAX_CELLS:
+        while (w.wncol // k) * (w.wnrow // k) > MAX_CELLS:
             k += 1
-        cols, rows = cols[::k], rows[::k]
-        return g.xs()[cols], g.ys()[rows], g.heights[np.ix_(rows, cols)].astype(float)
+        return w.xs()[::k], w.ys()[::k], w.heights(self.grid)[::k, ::k].astype(float)
 
     def publish_terrain(self):
         xs, ys, H = self.sampled()
@@ -153,6 +156,11 @@ class RvizAdapter(Node):
     def on_status(self, msg):
         s = json.loads(msg.data)
         bx, by, bz = s["base_pos"]
+        if self.grid is not None and self.window.recenter(bx, by, WINDOW_TRIGGER):
+            clear = Marker(); clear.header.frame_id = self.frame; clear.ns = "terrain"; clear.action = Marker.DELETEALL
+            self.pub_terrain.publish(MarkerArray(markers=[clear]))   # 이전 창 지형 지우고 새 창 전체를 다시 보낸다
+            self.shown = None
+            self.publish_terrain()
         arr = MarkerArray()
         lines, alert = status_lines(s)
         txt = self.marker("info", 0, Marker.TEXT_VIEW_FACING,

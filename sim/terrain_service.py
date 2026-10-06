@@ -1,7 +1,9 @@
 """Terrain Map Service: 지형의 단일 원천 (문서 §5.1, §5.3).
 
 - 절대 높이(m) 격자를 원본으로 보관하고, MuJoCo heightfield에는 정규화 값으로 배포한다.
-- heightfield 크기/해상도는 모델 컴파일 시점에 고정되므로 시나리오 영역 전체를 미리 할당한다.
+- heightfield 크기/해상도는 모델 컴파일 시점에 고정된다. 세계 지도가 크면 MuJoCo에는 로봇 주변 "창"만
+  할당하고, 로봇이 창 중심에서 멀어지면 창을 옮겨 다시 채운다 (recenter). 창은 snap(기본 1 m) 단위로만
+  옮기므로 옮기기 전후 같은 월드 위치의 높이가 그대로다 (발밑 지형이 흔들리지 않음).
 - 로봇 발 근처 셀은 갱신을 미루고, 발이 떠난 뒤 반영한다 (발밑 지형 급변 방지).
 - 지금은 패치(요철, 경사, 홈)를 직접 생성하지만, 나중에 Chrono SCM 변형 결과를
   같은 apply_heights() 경로로 넣으면 된다.
@@ -10,8 +12,9 @@ import numpy as np
 
 
 class TerrainMapService:
-    def __init__(self, size, resolution, z_range, seed=0):
+    def __init__(self, size, resolution, z_range, seed=0, window=None, snap=1.0):
         self.half_x, self.half_y = size
+        self.res = resolution
         self.z_min, self.z_max = z_range
         self.ncol = int(round(2 * self.half_x / resolution)) + 1
         self.nrow = int(round(2 * self.half_y / resolution)) + 1
@@ -25,14 +28,50 @@ class TerrainMapService:
         self.version = 0            # 원천(target)이 바뀔 때 증가
         self.applied_version = 0    # 물리엔진 반영(applied)이 바뀔 때 증가 (렌더러 갱신 기준)
 
-    # ---- MuJoCo 모델 빌드용 파라미터 ----
+        # MuJoCo heightfield 창 (window=None이면 세계 지도 전체 = 예전 방식)
+        wx, wy = window if window is not None else size
+        self.win_half = (min(wx, self.half_x), min(wy, self.half_y))
+        self.wncol = int(round(2 * self.win_half[0] / resolution)) + 1
+        self.wnrow = int(round(2 * self.win_half[1] / resolution)) + 1
+        self.snap = snap
+        steps = [v / resolution for v in (*self.win_half, snap, self.half_x, self.half_y)]
+        assert all(abs(v - round(v)) < 1e-6 for v in steps), "창 반폭, snap, 세계 반폭은 격자 간격의 정수배여야 한다"
+        self.windowed = (self.wncol, self.wnrow) != (self.ncol, self.nrow)
+        self.wr0, self.wc0 = self._window_origin(0.0, 0.0)
+
+    # ---- MuJoCo 모델 빌드용 파라미터 (창 기준) ----
     @property
     def hfield_size(self):
-        return [self.half_x, self.half_y, self.z_max - self.z_min, 0.1]
+        return [self.win_half[0], self.win_half[1], self.z_max - self.z_min, 0.1]
+
+    @property
+    def window_center(self):
+        return self.xs[self.wc0] + self.win_half[0], self.ys[self.wr0] + self.win_half[1]
 
     @property
     def geom_pos(self):
-        return [0.0, 0.0, self.z_min]
+        return [*self.window_center, self.z_min]
+
+    def _window_origin(self, cx, cy):
+        """원하는 창 중심(snap 단위로 맞춤) -> 창 왼쪽 아래 격자 인덱스 (세계 지도 안으로 제한)."""
+        cx, cy = round(cx / self.snap) * self.snap, round(cy / self.snap) * self.snap
+        c0 = int(round((cx - self.win_half[0] + self.half_x) / self.res))
+        r0 = int(round((cy - self.win_half[1] + self.half_y) / self.res))
+        return int(np.clip(r0, 0, self.nrow - self.wnrow)), int(np.clip(c0, 0, self.ncol - self.wncol))
+
+    def recenter(self, x, y, trigger=1.0):
+        """로봇이 창 중심에서 trigger(m)보다 멀어지면 창을 로봇 쪽으로 옮긴다. 옮겼으면 True
+        (호출한 쪽이 MuJoCo 지형 geom 위치를 geom_pos로 바꾸고 write_all로 다시 채운다)."""
+        if not self.windowed:
+            return False
+        cx, cy = self.window_center
+        if max(abs(x - cx), abs(y - cy)) <= trigger:
+            return False
+        origin = self._window_origin(x, y)
+        if origin == (self.wr0, self.wc0):
+            return False
+        self.wr0, self.wc0 = origin
+        return True
 
     # ---- 패치 생성 ----
     def add_patch(self, p):
@@ -105,8 +144,10 @@ class TerrainMapService:
         return True
 
     def write_all(self, model, hfield_id):
+        """물리엔진에 반영된 지형 중 창 영역을 MuJoCo heightfield에 쓴다."""
         adr = model.hfield_adr[hfield_id]
-        norm = (self.applied - self.z_min) / (self.z_max - self.z_min)
+        win = self.applied[self.wr0:self.wr0 + self.wnrow, self.wc0:self.wc0 + self.wncol]
+        norm = (win - self.z_min) / (self.z_max - self.z_min)
         model.hfield_data[adr:adr + norm.size] = norm.ravel()
 
     def height_at(self, x, y):

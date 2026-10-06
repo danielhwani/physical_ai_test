@@ -1,0 +1,46 @@
+# 넓은 지형에서 자유롭게 걷기 + 발자국 (지형 창 이동, MuJoCo 4족 + Chrono SCM)
+# 세계 지도 20 x 20 m (2 cm 격자, 약 100만 칸)는 Terrain Map Service가 들고 있고, MuJoCo에는 로봇 주변
+# 6 x 6 m 창만 올린다. 로봇이 창 중심에서 1 m 이상 멀어지면 창을 1 m 단위로 옮긴다 (발밑 높이 그대로).
+# 로봇은 앞으로 걷다가 좌회전해 크게 돌고 다시 직진한다. 발자국이 곡선 경로를 따라 남는다.
+name: footprints_free
+duration: 30.0
+seed: 5
+terrain:
+  size: [10.0, 10.0]     # 세계 지도 반폭: x, y -10~10 m
+  resolution: 0.02
+  z_range: [-0.15, 0.15]
+  window: [3.0, 3.0]     # MuJoCo 창 반폭 (m)
+  window_trigger: 1.0    # 로봇이 창 중심에서 이만큼 멀어지면 창 이동 (m)
+  window_snap: 1.0       # 창 이동 단위 (m). 격자 칸과 흙 질감 한 칸의 정수배
+  guard_radius: 0.06
+  patches: []
+controller:
+  type: trot
+  period: 0.36
+  swing_height: 0.08
+  stand_height: 0.27
+events:
+  - {t: 1.0, action: set_command, vx: 0.35, yaw_rate: 0.0}
+  - {t: 6.0, action: set_command, vx: 0.35, yaw_rate: 0.3}    # 좌회전 (반지름 약 1.2 m)
+  - {t: 16.0, action: set_command, vx: 0.35, yaw_rate: 0.0}   # 다시 직진
+chrono:
+  sync_dt: 0.04
+  terrain_dt: 0.2
+  step: 1.0e-3
+  robot_feet:
+    mass: 2.0
+    damping: 300.0
+    fn_min: 5.0
+  scm:
+    center: [0.0, 0.0]
+    size: [20.0, 20.0]
+    resolution: 0.02
+    soil:
+      bekker_kphi: 1.0e7
+      bekker_kc: 0
+      bekker_n: 1.1
+      cohesion: 0
+      friction_deg: 30
+      janosi_shear: 0.01
+      elastic_k: 4.0e7
+      damping_r: 3.0e4

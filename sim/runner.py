@@ -30,7 +30,7 @@ from .control_interface import ControlInterface, load_card
 from .controllers.common import GaitClock, StepContext
 from .controllers.onnx_policy import OnnxPolicyController
 from .controllers.trot import TrotController
-from .model_builder import ROOT, build_model
+from .model_builder import ROOT, TERRAIN_BODY, build_model
 from .recorder import Recorder
 from .stream import build_status
 from .terrain_service import TerrainMapService
@@ -113,7 +113,10 @@ class Simulation:
             self.scn["seed"] = seed
         self.spec = load_yaml(spec_path)
         t = self.scn["terrain"]
-        self.terrain = TerrainMapService(t["size"], t["resolution"], t["z_range"], self.scn.get("seed", 0))
+        # window: MuJoCo에 올릴 로봇 주변 창의 반폭 (없으면 세계 지도 전체). 창은 window_snap(m) 단위로 옮긴다
+        self.terrain = TerrainMapService(t["size"], t["resolution"], t["z_range"], self.scn.get("seed", 0),
+                                         window=t.get("window"), snap=t.get("window_snap", 1.0))
+        self.window_trigger = t.get("window_trigger", 1.0)   # 로봇이 창 중심에서 이만큼 멀어지면 창을 옮긴다 (m)
         # 발 근처 셀 갱신 보류 반경 (m). 로봇이 자기 발자국을 밟게 하려면 보폭보다 작게 (문서 §5.3)
         self.guard_radius = t.get("guard_radius", 0.15)
         for p in t.get("patches", []):
@@ -143,6 +146,8 @@ class Simulation:
         self.base_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, self.spec["robot"]["base_body"])
         self.foot_ids = [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, f) for f in self.spec["robot"]["feet"]]
         self.terrain_geom = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "terrain")
+        tb = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, TERRAIN_BODY)
+        self.terrain_mocap = m.body_mocapid[tb] if tb >= 0 else -1
         self.total_mass = m.body_subtreemass[self.base_id]
         self.reset()
         self.cosim = None
@@ -237,7 +242,12 @@ class Simulation:
                     print(f"[t={d.time:6.2f}] event: vehicle_near ({dist:.2f} m)")
         terrain_changed = False
         if d.time >= self.next_terrain_commit:
-            terrain_changed = self.terrain.commit(self.model, self.hfield_id, self.feet_xy(), self.guard_radius)
+            if self.terrain.recenter(*d.qpos[:2], trigger=self.window_trigger):
+                # 창 이동: 지형 mocap 바디를 새 창 중심으로 옮기고 창 영역을 다시 채운다 (월드 좌표의 높이는 그대로)
+                d.mocap_pos[self.terrain_mocap] = [*self.terrain.window_center, 0.0]
+                self.terrain.write_all(self.model, self.hfield_id)
+                terrain_changed = True
+            terrain_changed |= self.terrain.commit(self.model, self.hfield_id, self.feet_xy(), self.guard_radius)
             self.next_terrain_commit += 1.0 / TERRAIN_COMMIT_HZ
 
         # 1) 명령/위상 갱신  2) 관측  3) 컨트롤러 -> action  4) 행동 처리 -> q_des  5) PD + 물리

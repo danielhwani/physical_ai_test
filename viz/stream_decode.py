@@ -64,3 +64,54 @@ def quat_to_rpy(q_xyzw):
 
 def load_obj_vertices(path):
     return np.array([[float(v) for v in line.split()[1:4]] for line in open(path) if line.startswith("v ")])
+
+
+class TerrainWindow:
+    """렌더러용 지형 창: 세계 격자가 크면 로봇 주변 창만 그린다 (물리 쪽 Terrain Map Service 창과 같은 규칙).
+    창은 snap(m, 흙 질감 한 칸) 단위로만 옮겨 높이와 무늬가 튀지 않게 한다."""
+
+    def __init__(self, terrain_meta, half=4.0, snap=1.0, max_cells=200_000):
+        self.half_x, self.half_y = terrain_meta["half_size"]
+        self.nrow, self.ncol = terrain_meta["nrow"], terrain_meta["ncol"]
+        self.res = 2 * self.half_x / (self.ncol - 1)
+        self.snap = snap
+        self.windowed = self.nrow * self.ncol > max_cells
+        if self.windowed:
+            wx, wy = min(half, self.half_x), min(half, self.half_y)
+            self.wncol, self.wnrow = int(round(2 * wx / self.res)) + 1, int(round(2 * wy / self.res)) + 1
+        else:
+            self.wncol, self.wnrow = self.ncol, self.nrow
+        self.win_half = ((self.wncol - 1) * self.res / 2, (self.wnrow - 1) * self.res / 2)
+        self.r0, self.c0 = self._origin(0.0, 0.0)
+
+    def _origin(self, cx, cy):
+        cx, cy = round(cx / self.snap) * self.snap, round(cy / self.snap) * self.snap
+        c0 = int(round((cx - self.win_half[0] + self.half_x) / self.res))
+        r0 = int(round((cy - self.win_half[1] + self.half_y) / self.res))
+        return int(np.clip(r0, 0, self.nrow - self.wnrow)), int(np.clip(c0, 0, self.ncol - self.wncol))
+
+    @property
+    def center(self):
+        return (-self.half_x + self.c0 * self.res + self.win_half[0], -self.half_y + self.r0 * self.res + self.win_half[1])
+
+    def recenter(self, x, y, trigger=1.0):
+        """로봇이 창 중심에서 trigger보다 멀어지면 창을 옮긴다. 옮겼으면 True."""
+        if not self.windowed:
+            return False
+        cx, cy = self.center
+        if max(abs(x - cx), abs(y - cy)) <= trigger:
+            return False
+        origin = self._origin(x, y)
+        if origin == (self.r0, self.c0):
+            return False
+        self.r0, self.c0 = origin
+        return True
+
+    def heights(self, grid):
+        return grid.heights[self.r0:self.r0 + self.wnrow, self.c0:self.c0 + self.wncol]
+
+    def xs(self):
+        return -self.half_x + (self.c0 + np.arange(self.wncol)) * self.res
+
+    def ys(self):
+        return -self.half_y + (self.r0 + np.arange(self.wnrow)) * self.res

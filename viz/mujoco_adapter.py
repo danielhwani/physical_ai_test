@@ -19,9 +19,12 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 
-from .stream_decode import TerrainGrid, check_manifest
+from .stream_decode import TerrainGrid, TerrainWindow, check_manifest
+from .terrain_look import add_terrain_look
 
 MAX_PATH = 300          # 경로 표시 최대 선분 수 (뷰어 user_scn 용량 제한)
+TERRAIN_BODY = "terrain_window"
+RENDER_WINDOW = 4.0     # 세계 지형이 크면 로봇 주변 이 반폭(m)만 그린다
 
 
 def _wxyz(q_xyzw):
@@ -30,27 +33,21 @@ def _wxyz(q_xyzw):
 
 
 def build_render_model(manifest):
-    """매니페스트 -> (MjModel, 바디이름->mocap 인덱스, hfield id). 물리용이 아닌 그리기 전용 모델."""
+    """매니페스트 -> (MjModel, 바디이름->mocap 인덱스, hfield id, TerrainWindow). 물리용이 아닌 그리기 전용 모델.
+    세계 지형이 크면 로봇 주변 창만 담고, 창은 mocap 바디로 옮긴다 (TerrainWindow 규칙)."""
     root = Path(manifest["asset_root"])
     s = mujoco.MjSpec()
     s.compiler.inertiafromgeom = mujoco.mjtInertiaFromGeom.mjINERTIAFROMGEOM_FALSE   # 질량 계산 불필요
     s.visual.global_.offwidth, s.visual.global_.offheight = 1280, 720
-    s.visual.headlight.ambient, s.visual.headlight.diffuse = [0.45, 0.45, 0.45], [0.6, 0.6, 0.6]
-    s.add_texture(name="sky", type=mujoco.mjtTexture.mjTEXTURE_SKYBOX, builtin=mujoco.mjtBuiltin.mjBUILTIN_GRADIENT,
-                  rgb1=[0.45, 0.6, 0.75], rgb2=[0.1, 0.12, 0.15], width=256, height=256)
-    s.add_texture(name="grid", type=mujoco.mjtTexture.mjTEXTURE_2D, builtin=mujoco.mjtBuiltin.mjBUILTIN_CHECKER,
-                  width=256, height=256, rgb1=[0.35, 0.33, 0.28], rgb2=[0.28, 0.26, 0.22])
-    mat = s.add_material(name="terrain")
-    mat.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = "grid"
-    mat.texrepeat = [40, 40]
-
     t = manifest["terrain"]
+    win = TerrainWindow(t, half=RENDER_WINDOW)
+    add_terrain_look(s, win.win_half)                            # 흙 질감, 1 m 옅은 격자, 비스듬한 조명
     zmin, zmax = t["z_range"]
-    hf = s.add_hfield(name="terrain", nrow=t["nrow"], ncol=t["ncol"], size=[*t["half_size"], zmax - zmin, 0.1])
-    hf.userdata = [0.0] * (t["nrow"] * t["ncol"])
-    s.worldbody.add_geom(name="terrain", type=mujoco.mjtGeom.mjGEOM_HFIELD, hfieldname="terrain",
-                         pos=[0, 0, zmin], material="terrain", contype=0, conaffinity=0)
-    s.worldbody.add_light(pos=[0, 0, 6], dir=[0, 0, -1], type=mujoco.mjtLightType.mjLIGHT_DIRECTIONAL, castshadow=False)
+    hf = s.add_hfield(name="terrain", nrow=win.wnrow, ncol=win.wncol, size=[*win.win_half, zmax - zmin, 0.1])
+    hf.userdata = [0.0] * (win.wnrow * win.wncol)
+    holder = s.worldbody.add_body(name=TERRAIN_BODY, mocap=True, pos=[*win.center, 0.0]) if win.windowed else s.worldbody
+    holder.add_geom(name="terrain", type=mujoco.mjtGeom.mjGEOM_HFIELD, hfieldname="terrain",
+                    pos=[0, 0, zmin], material="terrain", contype=0, conaffinity=0)
 
     meshes = {}
     for v in manifest["visuals"]:
@@ -69,13 +66,17 @@ def build_render_model(manifest):
     model = s.compile()
     mocap = {b["name"]: model.body_mocapid[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, b["name"])]
              for b in manifest["bodies"]}
-    return model, mocap, mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_HFIELD, "terrain")
+    tb = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, TERRAIN_BODY)
+    win.mocap = model.body_mocapid[tb] if tb >= 0 else -1
+    return model, mocap, mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_HFIELD, "terrain"), win
 
 
-def write_terrain(model, hid, grid, z_range):
+def write_terrain(model, hid, grid, z_range, window=None):
+    """지형 높이(창이 있으면 창 영역)를 그리기 모델의 heightfield에 쓴다."""
     zmin, zmax = z_range
+    h = window.heights(grid) if window is not None else grid.heights
     adr = model.hfield_adr[hid]
-    model.hfield_data[adr:adr + grid.heights.size] = ((grid.heights - zmin) / (zmax - zmin)).ravel()
+    model.hfield_data[adr:adr + h.size] = ((h - zmin) / (zmax - zmin)).ravel()
 
 
 def apply_poses(model, data, mocap, poses):
@@ -197,7 +198,7 @@ class MujocoViewerAdapter:
             if not self.rclpy.ok():
                 return
             time.sleep(0.1)
-        model, mocap, hid = build_render_model(self.manifest)
+        model, mocap, hid, win = build_render_model(self.manifest)
         data = mujoco.MjData(model)
         self.grid = TerrainGrid(self.manifest["terrain"])
         z_range = self.manifest["terrain"]["z_range"]
@@ -214,10 +215,14 @@ class MujocoViewerAdapter:
                 with self.lock:
                     patches, self.patches = self.patches, []
                     poses, status, path = dict(self.poses), self.status, list(self.path)
+                moved = status is not None and win.recenter(*status["base_pos"][:2])
+                if moved:                                 # 창 이동: 지형 mocap 바디를 옮긴다
+                    data.mocap_pos[win.mocap] = [*win.center, 0.0]
                 if patches:
                     for p in patches:
                         self.grid.apply(p)
-                    write_terrain(model, hid, self.grid, z_range)
+                if patches or moved:
+                    write_terrain(model, hid, self.grid, z_range, win)
                     viewer.update_hfield(hid)
                 with viewer.lock():
                     apply_poses(model, data, mocap, poses)

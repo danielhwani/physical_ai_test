@@ -82,6 +82,24 @@ Chrono 시나리오의 MOP에는 지면 변형량(`deformed_cells`, `deform_mean
 - **차이의 계층**: `compare_variants.py` 결과(rough_rut, 시드 8개), 설정 단순화로 생긴 MOP 차이는 시드 간 편차보다 작다
   (전진 거리 +0.09 m, 표준편차 0.25~0.50 m). 단, 규칙 기반 보행기 기준이며 학습 정책은 단순화된 충돌 형상을 이용할 수 있으니 정책이 생기면 다시 비교한다.
 
+## 넓은 지형: 로봇을 따라다니는 지형 창
+
+```bash
+python -m sim.runner scenarios/footprints_free.yaml --rviz   # 20 x 20 m 세계 지도, 좌회전하며 자유 보행 + 발자국
+python conformance/test_terrain_window.py                     # 창 시험
+```
+
+- MuJoCo heightfield는 크기가 모델 생성 때 고정된다. 그래서 세계 지도(`terrain.size`)는 Terrain Map Service가 들고 있고,
+  MuJoCo에는 로봇 주변 창(`terrain.window`, 반폭)만 올린다. 로봇이 창 중심에서 `window_trigger`(기본 1 m)보다 멀어지면
+  창을 `window_snap`(기본 1 m) 단위로 옮겨 다시 채운다. 격자 칸의 정수배로만 옮기므로 발밑 높이는 그대로다.
+- 지형 geom은 mocap 바디에 붙여 옮긴다. 월드에 붙인 geom의 위치만 바꾸면, MuJoCo가 모델 생성 때 계산한 충돌 경계
+  상자가 남아 처음 창 밖으로 나간 발의 접촉을 놓친다 (확인 후 수정, `test_window_matches_full_world_on_flat`).
+- 평지에서 창 모드와 세계 지도 전체 모드의 궤적이 부동소수점 수준(1e-13 m)으로 같다. 요철 지형은 보행이 혼돈적이라
+  (초기 위치 1e-9 m 차이로도 끝 위치가 0.5 m 달라짐) 창 좌표의 미세한 차이로 결과가 조금 다를 수 있다.
+- 렌더러도 세계 지도가 크면 로봇 주변만 그린다 (MuJoCo 렌더러 반폭 4 m, RViz는 원래 해상도로 그릴 수 있는 크기).
+  스트림 계약(월드 좌표의 매니페스트와 지형 패치)은 그대로다.
+- `terrain.window`가 없으면 창 = 세계 지도 전체 (기존 시나리오 그대로).
+
 ## Chrono 연동 (두 번째 물리엔진, 문서 §5)
 
 ```bash

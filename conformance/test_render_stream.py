@@ -116,7 +116,7 @@ def test_mujoco_render_model_matches_simulator():
             sim.step_control()
     m0, d0 = sim.model, sim.data
     manifest = _roundtrip(build_manifest(m0, sim.terrain))
-    model, mocap, hid = build_render_model(manifest)
+    model, mocap, hid, win = build_render_model(manifest)
     data = mujoco.MjData(model)
     poses = {b["name"]: (d0.xpos[b["id"]].tolist(), mj_quat_to_ros(d0.xquat[b["id"]]).tolist()) for b in manifest["bodies"]}
     apply_poses(model, data, mocap, poses)
@@ -138,7 +138,7 @@ def test_mujoco_render_model_matches_simulator():
 
     grid = TerrainGrid(manifest["terrain"])
     grid.apply(_roundtrip(TerrainPatchStream(sim.terrain).full()))
-    write_terrain(model, hid, grid, manifest["terrain"]["z_range"])
+    write_terrain(model, hid, grid, manifest["terrain"]["z_range"], win)
     zmin, zmax = manifest["terrain"]["z_range"]
     adr = model.hfield_adr[hid]
     h = model.hfield_data[adr:adr + grid.heights.size].reshape(grid.heights.shape) * (zmax - zmin) + zmin

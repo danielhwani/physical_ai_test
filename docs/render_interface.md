@@ -98,6 +98,9 @@
 
 `--rviz`와 `--mjviz`는 함께 켤 수 있다. 렌더러는 `sim/`(물리 시뮬레이션)을 import하지 않는다.
 
+세계 지형이 크면 렌더러는 로봇 주변 창만 그린다 (`viz/stream_decode.py`의 `TerrainWindow`: 상태의 `base_pos`를 따라
+1 m 단위로 이동). 물리 쪽 MuJoCo 창과는 독립이며, 스트림은 항상 세계 좌표의 전체 지형을 기준으로 한다.
+
 ## 계약 시험 (`conformance/test_render_stream.py`)
 
 | 시험 | 확인 내용 |

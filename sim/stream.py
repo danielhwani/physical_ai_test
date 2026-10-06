@@ -14,6 +14,7 @@ import mujoco
 import numpy as np
 
 from .adapters import mj_quat_to_ros, quat_to_yaw
+from .model_builder import TERRAIN_BODY
 
 STREAM_VERSION = "1.0"
 ROOT = Path(__file__).resolve().parent.parent
@@ -48,6 +49,8 @@ def build_manifest(model, terrain, cosim=None, physics_source="MuJoCo"):
     meshes = export_meshes(model)
     bodies, visuals = [], []
     for b in range(1, model.nbody):
+        if name(mujoco.mjtObj.mjOBJ_BODY, b) == TERRAIN_BODY:     # 물리용 지형 창 (렌더러는 지형 패치로 그린다)
+            continue
         parent = model.body_parentid[b]
         bodies.append({"id": b, "name": name(mujoco.mjtObj.mjOBJ_BODY, b),
                        "parent": "world" if parent == 0 else name(mujoco.mjtObj.mjOBJ_BODY, parent),
