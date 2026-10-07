@@ -109,6 +109,7 @@ def load_yaml(path):
 
 class Simulation:
     """scenario: YAML 경로 또는 dict. policy: 정책 카드 경로 (없으면 시나리오의 규칙 기반 보행기)."""
+    dis = None      # DIS 시나리오 콘솔 서버 (sim/dis_server.py). 콘솔 요청을 events에 넣는다
 
     def __init__(self, scenario, spec_path=ROOT / "specs/go2_control.yaml", variant="cpu", seed=None,
                  policy=None, sensors=None):
@@ -207,14 +208,17 @@ class Simulation:
         self.link_latency = int(link.get("latency_steps", 0))
         self.link_queue = deque()
         self.command = (0.0, 0.0)     # 운용자 이동 명령 (마지막 값)
-        self.events = sorted(self.scn.get("events", []), key=lambda e: e["t"])
+        self.events = sorted((dict(e) for e in self.scn.get("events", [])), key=lambda e: e["t"])
+        self.event_log = []         # 적용된 이벤트 (applied_t 포함). 콘솔 이벤트까지 넣어 다시 실행할 수 있는 시나리오를 만든다
         self.last_event = None      # (시각, 설명) 가시화용
         self.next_terrain_commit = 0.0
 
-    # ---- 이벤트 (나중에 DIS 시나리오 콘솔이 같은 경로로 주입) ----
+    # ---- 이벤트 (시나리오 파일과 DIS 시나리오 콘솔이 같은 경로로 넣는다) ----
     def _apply_events(self, verbose=True):
         while self.events and self.events[0]["t"] <= self.data.time + 1e-9:
             e = self.events.pop(0)
+            e["applied_t"] = self.data.time
+            self.event_log.append(e)
             if e["action"] == "set_command":       # 운용자 명령 -> 보행 알고리즘
                 self.command = (e["vx"], e.get("yaw_rate", 0.0))
                 if self.remote is not None:
@@ -230,7 +234,15 @@ class Simulation:
                 desc += f" {e['patch']['kind']}"
             self.last_event = (self.data.time, desc)
             if verbose:
-                print(f"[t={self.data.time:6.2f}] event: {e['action']}")
+                print(f"[t={self.data.time:6.2f}] event: {desc}" + (f"  (DIS {e['request']})" if e.get("source") == "dis" else ""))
+
+    def replay_scenario(self):
+        """이번 실행을 그대로 다시 돌리는 시나리오: 이벤트 = 적용된 이벤트(적용 시각으로, 콘솔 이벤트 포함) + 아직 안 된 시나리오 이벤트."""
+        scn = copy.deepcopy(self.scn)
+        applied = [{**{k: v for k, v in e.items() if k not in ("t", "applied_t")}, "t": round(e["applied_t"], 6)} for e in self.event_log]
+        pending = [dict(e) for e in self.events if e.get("source") != "dis"]
+        scn["events"] = applied + pending
+        return scn
 
     def feet_xy(self):
         return [self.data.geom_xpos[g][:2].copy() for g in self.foot_ids]
@@ -263,13 +275,13 @@ class Simulation:
                 "kd": iface.kd.tolist(), "tau_ff": zeros}
 
     def estimate(self):
-        """알고리즘의 최신 상태 추정 {t, v_body, yaw, contacts} (t = 그 추정이 쓴 로봇 상태 시각). 별도 노드면 받은 값."""
+        """알고리즘의 최신 상태 추정 {t, v_body, yaw, contacts, pos} (t = 그 추정이 쓴 로봇 상태 시각). 별도 노드면 받은 값."""
         if self.remote is not None:
             return self.remote.latest_est
         if getattr(self, "low_state", None) is None:
             return None
         e = self.controller.est
-        return {"t": self.low_state["t"], "v_body": e.v_body, "yaw": e.yaw, "contacts": e.contacts}
+        return {"t": self.low_state["t"], "v_body": e.v_body, "yaw": e.yaw, "contacts": e.contacts, "pos": e.pos}
 
     @property
     def command_display(self):
@@ -290,7 +302,11 @@ class Simulation:
         """제어 주기 1회 = 물리 스텝 decim회."""
         d = self.data
         dt = self.decim * self.model.opt.timestep
+        if self.dis is not None:
+            self.dis.poll()                      # 콘솔 요청 -> events (적용 시각이 이 주기 이후면 예약)
         self._apply_events(verbose)
+        if self.dis is not None:
+            self.dis.after_events()              # 적용된 요청에 Complete, 주기 보고
         if self.cosim is not None:
             self.cosim.sync(d.time)              # Chrono 결과 반영 (지형 원천 갱신 + 차량 포즈)
             dist = self.cosim.distance_to(d.qpos[:2])
@@ -369,6 +385,22 @@ def run(args):
         "host": platform.node(), "started": stamp,
     }
     rec = Recorder(out, meta)
+    dis_port = getattr(args, "dis_port", None)
+    if dis_port is not None:                 # DIS 시나리오 콘솔 (문서 §10): 콘솔 요청을 시나리오 이벤트로 받는다 (이 PC 안에서만)
+        from .dis_server import DisScenarioServer
+        out.mkdir(parents=True, exist_ok=True)
+        sim.dis = DisScenarioServer(sim, port=dis_port, log_path=out / "dis_events.jsonl")
+        if not (args.realtime or args.view):
+            args.realtime = True
+            meta["mode"] = "realtime"
+            print("DIS 콘솔: 사람이 명령을 넣을 수 있게 실시간으로 실행한다 (--realtime)")
+        print(f"DIS 시나리오 콘솔 대기: UDP 127.0.0.1:{sim.dis.port}  (python -m dis_console.console --sim 127.0.0.1:{sim.dis.port})")
+        if getattr(args, "dis_wait", False):
+            print("콘솔 접속을 기다린다 (Ctrl+C로 중단)...")
+            while not sim.dis.consoles:
+                sim.dis.poll(); sim.dis.after_events()
+                time.sleep(0.05)
+            print("콘솔 접속. 시작")
 
     viewer = bridge = None
     displays, helpers = [], []   # 창(닫으면 시험 종료) / 보조 프로세스(끝나면 정리)
@@ -384,8 +416,10 @@ def run(args):
         from .ros2_bridge import (Ros2StreamPublisher, launch_controller_node, launch_mujoco_viewer, launch_rviz_stack,
                                   launch_sensor_node)
         bridge = Ros2StreamPublisher(m, sim.terrain, sim.cosim)
-        if sim.controller.terrain is not None:   # 알고리즘 지형 지도(odom) 표시 정렬: 시작 몸통 위치 (판정자 쪽 참값, 표시 전용)
-            bridge.publish_odom_frame(d.qpos[:3].copy())
+        odom_offset = None                       # 알고리즘 지형 지도(odom) 표시 정렬 (판정자 쪽 참값, 표시 전용)
+        if sim.controller.terrain is not None:   # 시작: odom 원점 = 시작 몸통 위치
+            odom_offset = d.qpos[:3].copy()
+            bridge.publish_odom_frame(odom_offset, 0.0)
         if args.rviz:
             rviz, rviz_adapter = launch_rviz_stack(out)
             displays.append(("RViz", rviz))
@@ -500,6 +534,11 @@ def run(args):
             if bridge:
                 bridge.publish(d)
                 viz_count += 1
+                if odom_offset is not None and viz_count % 5 == 0 and (est := sim.estimate()) is not None and "pos" in est:
+                    # world -> odom을 계속 로봇에 맞춘다: 실제 몸통 위치 - 추정 위치 (1초 저역통과, 평행이동만).
+                    # 로봇 주변 지도가 실제 지면에 붙어 보이고, 오래전에 쌓은 먼 칸에는 그동안의 추정 표류가 남아 보인다
+                    odom_offset += 0.1 * (d.qpos[:3] - np.asarray(est["pos"]) - odom_offset)
+                    bridge.publish_odom_frame(odom_offset, d.time)
                 if sim.remote is None and viz_count % 5 == 0 and (snap := sim.controller.perception_snapshot()):
                     bridge.publish_perception(snap)      # 같은 프로세스: 알고리즘 지형 지도와 디딜 곳 (10 Hz, 지도 2 Hz)
                 if d.time >= next_status:
@@ -565,6 +604,9 @@ def run(args):
         "max_lag_s": round(max_lag, 4) if (args.realtime or viewer) else None,
     }
     rec.save(mop)
+    if sim.dis is not None:                  # 콘솔 이벤트를 적용 시각으로 넣은 시나리오: python -m sim.runner <이 파일> 로 같은 결과
+        sim.dis.close()
+        (out / "scenario_replay.yaml").write_text(yaml.safe_dump(sim.replay_scenario(), allow_unicode=True, sort_keys=False))
     for name, scans in scan_log.items():      # LiDAR 원시 출력: 프레임별 센서 좌표 점군 + 센서 월드 자세
         np.savez_compressed(out / f"{name}.npz", t=np.array([s["t"] for s in scans]),
                             frame=np.concatenate([np.full(len(s["points"]), i, np.int32) for i, s in enumerate(scans)]),
@@ -624,6 +666,9 @@ def main():
                     help="센서를 별도 프로세스(ROS2 중립 스트림만 구독)에서 계산 (--ros2, --realtime 자동. 결정성 없음)")
     ap.add_argument("--controller-node", action="store_true",
                     help="보행 알고리즘을 별도 ROS2 노드로 (로봇 상태/관절 명령 토픽으로만 주고받음. --ros2, --realtime 자동)")
+    ap.add_argument("--dis-port", type=int, metavar="PORT",
+                    help="DIS 시나리오 콘솔 요청을 받는다 (UDP 127.0.0.1, 보통 3000). 실시간으로 실행. 끝나면 scenario_replay.yaml")
+    ap.add_argument("--dis-wait", action="store_true", help="--dis-port와 함께: 콘솔이 접속할 때까지 시작하지 않는다")
     ap.add_argument("--set", action="append", metavar="KEY=VALUE",
                     help="시나리오 값 바꾸기 (여러 번 가능). 예: --set chrono.scm.soil.bekker_kphi=2e7")
     args = ap.parse_args()

@@ -8,7 +8,11 @@
       0 = v_body + ω × p_foot + J(q) dq + (ω + Ω_rel) × (-r n)
       ->  v_body = -(J dq + ω × p_foot + (ω + Ω_rel) × (-r n))
   디딘 발들의 평균을 저역통과한다. 발이 미끄러지면 오차가 생긴다 (실제 로봇과 같은 한계).
-- 위치(주행거리 좌표계 odom): 추정 속도를 월드 방향으로 돌려 적분한다. 시작 자세가 원점, 시간이 지나며 표류한다.
+- 위치(주행거리 좌표계 odom): 수평(x, y)은 추정 속도를 월드 방향으로 돌려 적분한다. 시작 자세가 원점, 시간이 지나며 표류한다.
+  높이(z)는 디딘 발에 묶는다: 발이 닿은 순간 그 접촉점의 odom 높이를 기억하고, 디딘 동안 몸통 높이 =
+  기억한 접촉점 높이 - (다리 기구학으로 구한 몸통 -> 접촉점 높이)의 평균. 속도 적분은 작은 치우침이 쌓여
+  평지 60초 보행에 +0.28 m 표류했다 (RViz에서 지도가 떠올라 로봇이 가라앉아 보임). 발에 묶으면 걸음마다
+  자세 잡음만큼의 작은 오차만 남는다. 모든 발이 떠 있는 동안만 속도로 적분한다.
   지형 지도(control/terrain_map.py)는 이 좌표계에 쌓는다.
 참값을 받지 않는다. MuJoCo를 import하지 않는다.
 """
@@ -55,6 +59,7 @@ class LegOdometryEstimator:
         self.v = np.zeros(3)
         self.pos = np.zeros(3)
         self.last_t = None
+        self.foot_z = {}                        # 디딘 발: 닿은 순간 접촉점의 odom 높이
 
     def update(self, ls):
         imu = ls["imu"]
@@ -67,6 +72,7 @@ class LegOdometryEstimator:
         gyro = np.asarray(imu["gyro"], dtype=float)
         q, dq = np.asarray(ls["q"], dtype=float), np.asarray(ls["dq"], dtype=float)
         contacts = np.asarray(ls["foot_force"]) > self.contact_force
+        rel_z = {}                                             # 디딘 발: 몸통 -> 접촉점 높이 (월드 방향)
         if contacts.any():
             est = []
             down = -self.kin.r * R[2, :]                       # 발 중심 -> 접촉점 (몸통 좌표): -r * (월드 z를 몸통 좌표로)
@@ -75,9 +81,16 @@ class LegOdometryEstimator:
                 p = self.kin.foot(i, qi)
                 omega_foot = gyro + self.kin.foot_angular_velocity(qi, dqi)
                 est.append(-(self.kin.jacobian(i, qi) @ dqi + np.cross(gyro, p) + np.cross(omega_foot, down)))
+                rel_z[int(i)] = float((R @ (p + down))[2])
             self.v += self.alpha * (np.mean(est, axis=0) - self.v)
         if self.last_t is not None:
             self.pos += (R @ self.v) * (ls["t"] - self.last_t)
+        for i in [i for i in self.foot_z if i not in rel_z]:   # 뗀 발은 잊는다
+            del self.foot_z[i]
+        if rel_z:
+            for i, rz in rel_z.items():                        # 새로 디딘 발: 지금 추정 높이로 접촉점 높이를 정한다
+                self.foot_z.setdefault(i, self.pos[2] + rz)
+            self.pos[2] = float(np.mean([self.foot_z[i] - rz for i, rz in rel_z.items()]))
         self.last_t = ls["t"]
         return Estimate(quat_wxyz=qw, R=R, roll=roll, pitch=pitch, yaw=yaw, gyro=gyro, v_body=self.v.copy(),
                         wz_world=float((R @ gyro)[2]), contacts=contacts, pos=self.pos.copy(), q=q, dq=dq)

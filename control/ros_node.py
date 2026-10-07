@@ -79,7 +79,8 @@ def main():
                     pub_map.publish(cloud)
         e = ctrl.est
         pub_est.publish(String(data=json.dumps({"t": cmd["t"], "v_body": e.v_body.tolist(), "yaw": e.yaw,
-                                                "roll": e.roll, "pitch": e.pitch, "contacts": e.contacts.tolist()})))
+                                                "roll": e.roll, "pitch": e.pitch, "contacts": e.contacts.tolist(),
+                                                "pos": e.pos.tolist()})))
 
     def on_cmd_vel(msg):
         ctrl.set_command(msg.linear.x, msg.angular.z)

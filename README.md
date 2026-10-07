@@ -36,6 +36,7 @@ python conformance/test_control.py                       # 로봇 경계: 알고
 python conformance/test_lidar.py                         # LiDAR: 스트림만으로 재현, 지형 표면, 자기 몸 제외
 python conformance/test_perception.py                    # 지형 인지: 높이 지도, 디딜 곳, LiDAR 지도 정확도, 점군만으로 재현, height_scan 규약
 python conformance/test_ros_equivalence.py               # ROS 노드 = 같은 프로세스(20 ms 지연 흉내) (ROS2 필요)
+python conformance/test_dis_console.py                   # DIS 콘솔: 봉투, 핸드셰이크(중복·거부), 콘솔 이벤트 기록으로 비트 단위 재실행
 python conformance/test_render_stream.py                 # 렌더 스트림 계약 (스트림만으로 장면 재구성 = 시뮬레이터)
 python conformance/compare_variants.py [--policy card.yaml]   # cpu vs mjx 설정의 MOP 분포 비교
 python conformance/make_obs_reference.py                 # (관측 명세를 바꾼 경우) 기준 벡터 재생성
@@ -55,7 +56,8 @@ Chrono 시나리오의 MOP에는 지면 변형량(`deformed_cells`, `deform_mean
 | `specs/go2_control.yaml` | 관절 순서, 기본 자세, 행동 처리 경로(scale/clip/PD/토크 한계), 관측 정의·스케일·허용 오차 | §12.2 |
 | `specs/go2_mjx_override.yaml` | MJX용 모델 차이 목록. 받아들인 항목(adopt)과 거부한 항목(reject)을 이유와 함께 기록 | §12.2 |
 | `control/observation.py` | 관측 기준 구현 (numpy, qpos/qvel 배치만 사용). JAX·C++ 구현이 맞춰야 할 기준 | §12.2 |
-| `scenarios/*.yaml` | 지형 패치, 시간 이벤트(명령 변경, 지형 변형) | §10 (DIS 콘솔 이전 단계) |
+| `scenarios/*.yaml` | 지형 패치, 시간 이벤트(명령 변경, 지형 변형). DIS 콘솔 이벤트도 같은 경로로 들어간다 | §10 |
+| `dis_console/`, `sim/dis_server.py` | DIS 시나리오 콘솔: 봉투(`envelope.py`, DIS_test에서 가져옴), 규약(`protocol.py`), 콘솔(`console.py`), 시뮬레이터 쪽 서버 | §10 |
 | `sim/terrain_service.py` | Terrain Map Service: 절대 높이 원천, heightfield 사전 할당, 발 근처 갱신 보류, 5 Hz 반영 | §5.1, §5.3 |
 | `sim/model_builder.py` | Menagerie Go2 MJCF + heightfield 결합 (MjSpec) | §4 |
 | `control/` | **보행 알고리즘 (시뮬레이터를 모름)**. `node.py` 로봇 상태 -> 관절 명령, `estimator.py` 상태 추정(IMU + 다리 주행거리계), `kinematics.py` 다리 기구학, `trot.py` 규칙 기반 트롯, `terrain_map.py` LiDAR 높이 지도, `foothold.py` 디딜 곳 평가, `onnx_policy.py` ONNX 정책, `interface.py` 명세 + 정책 카드, `clock.py` 명령 가속 제한·보행 위상, `ros_node.py` ROS2 노드 | §14 |
@@ -198,7 +200,12 @@ LiDAR 점군(센서 좌표, 10 Hz) ───────────────
 
 **① 상태 추정** (`estimator.py`)
 - 자세는 IMU 출력, 속도는 다리 주행거리계(디딘 발은 미끄러지지 않는다고 보고 관절 속도로 몸통 속도를 역산)로 구한다.
-- 그 속도를 적분한 **주행거리 위치(odom)**는 출발점이 원점이고 시간이 지나며 조금씩 틀어진다. 높이 지도는 이 좌표계에 쌓는다.
+- **주행거리 위치(odom)**는 출발점이 원점이고 시간이 지나며 조금씩 틀어진다. 높이 지도는 이 좌표계에 쌓는다.
+  - 수평(x, y)은 그 속도를 적분한다. IMU 방향 표류(0.05°/s)만큼 옆으로 틀어진다 (평지 60초, 21 m 보행에 옆 0.6 m).
+  - 높이(z)는 **디딘 발에 묶는다**: 발이 닿은 순간 접촉점 높이를 기억하고, 몸통 높이 = 기억한 접촉점 높이 - 다리 기구학 높이.
+    처음에는 속도를 적분했는데 작은 치우침이 쌓여 같은 보행에 +0.28 m 표류했다 (RViz에서 지도가 떠올라 로봇이 지도 상자에 파묻혀 보였다).
+    발에 묶은 뒤 -0.11 m이고 40초 이후로는 더 늘지 않았다. rut_crossing 8개 시드: 이전 6개, 바꾼 뒤 7개가 두 자국을 깨끗이 통과
+    (각각 다른 시드 1~2개가 첫 자국 근처에서 막힘. 넘어짐 없음), rough_rut 5개 시드 차이 없음.
 
 **② 높이 지도** (`terrain_map.py`, elevation map)
 - LiDAR 점(센서 좌표)을 스캔 시점의 추정 자세로 odom 좌표에 옮기고, 4 cm 칸마다 떨어진 점들의 평균 높이를 저장한다.
@@ -257,7 +264,9 @@ LiDAR 점군(센서 좌표, 10 Hz) ───────────────
   고른 칸의 높이로 발을 얼마나 내릴지 정한다. 공이 파란 줄(자국) 경계를 피해 바닥 가운데나 자국 밖 평지에 놓이는 것이 그 결과다.
 - **지면이 두 개 보인다**: **Terrain**은 시뮬레이터의 실제 지형(렌더 스트림으로 받은 참값, 알고리즘은 모름)이고,
   **Algorithm terrain map**은 알고리즘의 elevation map이다. 둘이 어긋나 보이면 그만큼이 위치 추정 표류다.
-  알고리즘 표시는 알고리즘 좌표계 `odom`에 있고, 러너가 `world -> odom`을 시작 위치로 한 번 발행해 맞춘다.
+  알고리즘 표시는 알고리즘 좌표계 `odom`에 있다. 러너가 `world -> odom`을 시작 위치로 맞춘 뒤, **계속 로봇에 맞춰 다시 정렬한다**
+  (실제 몸통 위치 - 추정 위치를 1초 저역통과, 평행이동만, 10 Hz, 표시 전용). 그래서 로봇 주변 지도는 실제 지면에 붙어 보이고,
+  오래전에 쌓은 먼 칸에만 그동안의 추정 표류가 남아 보인다. 한 번만 맞추던 때는 오래 걸으면 지도 전체가 떠오르거나 옆으로 밀렸다.
 - **갱신 속도**: 화면의 지도는 0.5초마다, 디딜 곳은 0.1초마다 갱신한다. 알고리즘 안의 지도는 스캔마다(0.1초) 바뀌므로 화면 지도가 조금 늦게 보일 수 있다.
 - 같은 프로세스 실행은 러너가, `--controller-node`는 알고리즘 노드가 발행한다 (명령을 보낸 뒤 발행하므로 명령 지연에 영향 없음).
 
@@ -397,6 +406,76 @@ python -m sim.sweep scenarios/footprints.yaml --param chrono.scm.soil.bekker_kph
 학습 시간 참고: 이 PC(메모리 7.7 GB, 스왑 없음)에서 작업자 5개로 돌리면 다른 프로그램과 함께 메모리가 모자라 시스템이 멈췄다.
 작업자 하나가 약 0.55 GB를 쓰므로 `--workers 3`(기본값)을 권장한다.
 에피소드마다 메모리가 약 100 MB씩 쌓이던 누수는 에피소드마다 `gc.collect()`, 작업자를 10 에피소드마다 새로 띄우기(`maxtasksperchild`)로 막았다.
+
+## DIS 시나리오 콘솔 (문서 §10, 가장 기본 구성)
+
+실행 중인 시뮬레이터에 운용자가 이벤트(로봇 이동 명령, 지형 변경)를 넣는 콘솔이다.
+봉투와 핸드셰이크는 [DIS_test](https://github.com/danielhwani/DIS_test)(SIMAN-R 프로토타입)의 것을 그대로 쓴다.
+
+```bash
+# 터미널 1: 시뮬레이터 (--dis-port를 주면 실시간으로 돈다. --dis-wait: 콘솔이 접속할 때까지 시작하지 않음)
+python -m sim.runner scenarios/dis_console.yaml --dis-port 3000 --dis-wait --rviz
+# 터미널 2: 콘솔 (대화형)
+python -m dis_console.console --sim 127.0.0.1:3000
+dis> cmd 0.35            # 전진 0.35 m/s
+dis> rut 3.0 @12         # 시뮬레이션 시각 12 s에 x = 3.0 m를 가로지르는 바퀴 자국 (폭 0.25, 깊이 0.05, 평평한 바닥)
+dis> ridge 5.0           # x = 5.0 m를 가로지르는 턱 (과속방지턱 모양, 폭 0.4, 높이 0.05), 바로 적용
+dis> bump 2.0 0.5        # 한 점 둔덕 (중심 (2.0, 0.5), 높이 0.05, 지름 0.4)
+dis> ahead rut 1.5       # 로봇 정면 1.5 m에 진행 방향을 가로지르는 자국 (ahead bump / ridge도 같음)
+dis> cmd 0.3 0.5         # 전진하며 왼쪽으로 회전
+dis> status              # 마지막 주기 보고 (시각, 로봇 위치·방향, 명령, 마지막 이벤트). watch: 1초마다 계속 표시
+dis> stop
+# 명령을 차례로 보내고 끝내기 (각각 완료까지 기다림)
+python -m dis_console.console --send "cmd 0.35" --send "rut 3.0 @12"
+```
+
+**구조**
+```
+콘솔 (2/1/1)                         시뮬레이터 (1/10/0, sim/dis_server.py)
+ │ Action Request-R  Request_Connection ───▶ │ 시나리오 이름, 시각, 지원 메시지
+ │ Action Request-R  Event_AddTerrainPatch ─▶ │ sim.events에 예약 (시나리오 파일 events와 같은 목록)
+ │◀── Action Response-R  Pending (예정 시각)   │
+ │                                          │ 제어 주기에서 그 시각이 되면 적용
+ │◀── Action Response-R  Complete (적용 시각)  │
+ │◀── Data PDU  Report_SimStatus (0.2 s) ────  │
+```
+- **봉투**: DIS 7 Action Request-R(56) / Action Response-R(57) / Data PDU(20)에 JSON 페이로드. 페이로드 언어는 시나리오 관리(4, 예시값).
+- **핸드셰이크**: 1초 안에 응답이 없으면 같은 Request ID로 3번까지 재전송. Pending 뒤 3초 동안 조용하면 같은 Request ID로 상태 재질의.
+  시뮬레이터는 (콘솔, Request ID)를 기억해 중복이면 다시 넣지 않고 마지막 응답만 보낸다.
+- **메시지**
+
+| 메시지 | body | 동작 |
+|---|---|---|
+| `Request_Connection` | – | 접속. 주기 보고를 받기 시작 |
+| `Event_SetCommand` | `vx`, `yaw_rate`, (`t_apply`) | 로봇 운용자 이동 명령 (가상 모드 전용. 범위 \|vx\| ≤ 1, \|yaw_rate\| ≤ 1.5) |
+| `Event_AddTerrainPatch` | `patch`, (`t_apply`) | 지형 변경: bump / rough / ramp / rut (시나리오 `patches`와 같은 형식). Complete에 `robot_rel` |
+| `Report_SimStatus` (Data PDU, 0.2 s) | – | 시뮬레이션 시각, 로봇 위치·방향(시험 판정자 쪽 참값), 명령, 마지막 이벤트 |
+
+- **좌표**: 시뮬레이터 세계 좌표 (원점 = 로봇 출발점, +x = 처음 바라본 방향, +y = 왼쪽, m). `dis_console` 시나리오의 지형은 ±30 m이고,
+  MuJoCo에는 로봇을 따라다니는 ±3 m 창만 올린다.
+- **로봇 기준으로 넣기 (`ahead`)**: 콘솔이 마지막 주기 보고(0.2 s 간격)와 명령 속도로 적용 시점의 로봇 위치를 예측해 세계 좌표로 바꿔 보낸다.
+  메시지와 기록은 절대 좌표 그대로라 재현성은 같다. 실제 속도가 명령보다 느리면 그만큼 조금 더 앞에 생긴다.
+- **적용 위치 확인**: 지형 패치의 Complete 응답에 적용 순간 로봇 기준 위치 `robot_rel` [앞, 왼쪽]이 들어간다.
+  콘솔은 `적용 완료 t=… (로봇 기준 앞 1.48 m, 왼쪽 0.02 m)`처럼 보여 주고, 로봇 뒤 0.3 m 넘게 떨어진 곳이면 "로봇이 이미 지나간 곳"이라고 알린다.
+- **턱 (`ridge`)**: 따로 메시지를 만들지 않고 깊이가 음수인 완만한(cosine) `rut` 패치로 보낸다. 시드 2개 확인에서 5 cm 턱은
+  지형 모름 트롯이 한 번은 넘고 한 번은 넘어졌고, 지형 인지 트롯은 둘 다 넘었다.
+- **시각 T 적용** (문서 §10.1): `t_apply`가 있으면 그 시뮬레이션 시각에, 없으면 받은 제어 주기에 적용. 이미 지난 시각은 거부(`T_APPLY_PASSED`).
+- **거부**: 접속 전 요청 `NOT_CONNECTED`, 범위 밖·값 누락 `INVALID_VALUE`, 모르는 메시지 `UNSUPPORTED`. 다른 Exercise ID와 다른 수신자 앞 PDU는 응답 없이 버린다.
+- **재현성** (문서 §10.1 "초기 구성과 이벤트 로그가 재실행 가능한 시나리오 스크립트"):
+  - 실행 폴더에 `dis_events.jsonl`(받은 요청과 보낸 응답, 벽시계와 시뮬레이션 시각)과
+    `scenario_replay.yaml`(적용된 이벤트를 적용 시각으로 넣은 시나리오)이 남는다.
+  - `python -m sim.runner runs/<실행>/scenario_replay.yaml`로 콘솔 없이 같은 결과가 나온다. 실시간 실행을 lockstep으로 다시 돌려도
+    로봇 궤적이 비트 단위로 같다 (`test_console_events_replay_bit_identical`, 실제 실행에서도 넘어진 시각과 전진 거리가 같았다).
+  - 이벤트는 제어 주기 시작에서 적용한다. 같은 프로세스 실행이 결정적이므로, 언제 도착했든 적용 시각만 같으면 결과가 같다.
+- **이 PC 안에서만**: 시뮬레이터는 127.0.0.1에서만 받는다. 다른 장비의 콘솔을 붙이려면 받는 주소를 바꾸고
+  메시지 인증(아래 "아직 없는 것")을 먼저 갖춰야 한다. 지금은 같은 네트워크의 누구나 명령을 보낼 수 있는 구조이기 때문이다.
+
+**아직 없는 것** (문서 §10.2의 나머지)
+- 개체 투입/제거 (Create/Remove Entity + Entity State), 임무 명령 (C-BML Order), 기상·환경, 지형 상태(토양 습윤도 -> Chrono SCM 값),
+  교전 효과, 장애물·지뢰, 전자전, 고장 주입 (센서 고장, 통신 두절), 실행 제어 (Start/Stop/Freeze)
+- 초기 구성 MSDL (지금은 시나리오 YAML), 링크 감시(양방향 heartbeat, 통신 두절 판정. DIS_test에는 있음), 기록 중계기·재생기 연결
+- 메시지 인증(HMAC)·암호화, 콘솔 제어권 (지금은 접속한 콘솔이 모두 명령 가능)
+- Live 로봇 권한 분리: 실제 로봇에는 이동 명령이 아니라 임무만 보내야 한다 (§10.1). 지금의 `Event_SetCommand`는 가상 모드 전용이다.
 
 ## 강화학습 준비 (GPU 장비에서)
 

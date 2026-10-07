@@ -234,16 +234,14 @@ class Ros2StreamPublisher:
             self.spin_some()
             time.sleep(0.0005)
 
-    def publish_odom_frame(self, p0):
-        """world -> odom (알고리즘 주행거리 좌표계 원점 = 시작 몸통 위치, 축은 월드와 같음). 화면 정렬용, 한 번만 발행."""
-        from rclpy.qos import DurabilityPolicy, QoSProfile
-        self.pub_tf_static = self.node.create_publisher(
-            self._TF, "/tf_static", QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+    def publish_odom_frame(self, offset, t_sim):
+        """world -> odom (알고리즘 주행거리 좌표계, 축은 월드와 같음). 화면 정렬용 평행이동.
+        러너가 시작 몸통 위치로 시작해 실제 위치 - 추정 위치를 따라가게 계속 발행한다 (/tf, 10 Hz)."""
         t = self._T()
-        t.header.stamp, t.header.frame_id, t.child_frame_id = self._stamp(0.0), self.frame, "odom"
-        t.transform.translation.x, t.transform.translation.y, t.transform.translation.z = map(float, p0)
+        t.header.stamp, t.header.frame_id, t.child_frame_id = self._stamp(t_sim), self.frame, "odom"
+        t.transform.translation.x, t.transform.translation.y, t.transform.translation.z = map(float, offset)
         t.transform.rotation.w = 1.0
-        self.pub_tf_static.publish(self._TF(transforms=[t]))
+        self.pub_tf.publish(self._TF(transforms=[t]))
 
     def publish_perception(self, snap):
         """같은 프로세스 실행일 때 알고리즘의 지형 인지 상태 (control/ros_viz.py와 같은 토픽)."""

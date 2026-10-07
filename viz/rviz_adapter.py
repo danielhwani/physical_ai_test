@@ -18,7 +18,7 @@ import rclpy
 from geometry_msgs.msg import Point
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
-from std_msgs.msg import String
+from std_msgs.msg import ColorRGBA, String
 from visualization_msgs.msg import Marker, MarkerArray
 
 from .stream_decode import TerrainGrid, TerrainWindow, check_manifest, quat_to_rpy
@@ -27,6 +27,9 @@ TERRAIN_HALF = 6.0      # 표시 범위 (m, 로봇 주변 창의 반폭). 저사
 WINDOW_TRIGGER = 2.0    # 로봇이 표시 창 중심에서 이만큼 멀어지면 창을 옮겨 다시 그린다 (m)
 MAX_CELLS = 100_000     # 표시 셀 수 상한: 지형이 작으면 원래 해상도(발자국 등), 크면 성기게
 TILE = 5                # 타일 한 변의 셀 수
+TERRAIN_RGB = np.array([0.55, 0.50, 0.42])
+SHADE_M = 0.08          # 높이에 따른 명암: 0 m = 기본색, -SHADE_M로 갈수록 어둡게, 위로 갈수록 밝게
+                        # (RViz 삼각형 마커는 한 색이면 음영이 거의 없어 5 cm 자국이 안 보였다)
 
 
 def build_urdf(manifest):
@@ -149,8 +152,10 @@ class RvizAdapter(Node):
             V = np.stack([X, Y, block], -1)
             a, b, d, e = V[:-1, :-1], V[:-1, 1:], V[1:, :-1], V[1:, 1:]
             tri = np.stack([a, b, e, a, e, d], 2).reshape(-1, 3)
-            m = self.marker("terrain", tid, Marker.TRIANGLE_LIST, (0.55, 0.50, 0.42, 1.0), (1, 1, 1))
+            m = self.marker("terrain", tid, Marker.TRIANGLE_LIST, (*TERRAIN_RGB, 1.0), (1, 1, 1))
             m.points = [Point(x=x, y=y, z=z) for x, y, z in tri.tolist()]
+            rgb = np.clip(TERRAIN_RGB * np.clip(1.0 + tri[:, 2:3] / SHADE_M, 0.3, 1.5), 0.0, 1.0)
+            m.colors = [ColorRGBA(r=r, g=g, b=b, a=1.0) for r, g, b in rgb.tolist()]
             arr.markers.append(m)
         if arr.markers:
             self.pub_terrain.publish(arr)
