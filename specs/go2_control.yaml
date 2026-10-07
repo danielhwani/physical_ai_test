@@ -1,6 +1,6 @@
 # 관측·행동·제어 명세 (문서 §12.2: 기계 판독 가능한 단일 명세)
 # 컨트롤러, 기록기, 향후 MJX 학습 환경과 ONNX 정책이 모두 이 파일을 읽는다.
-spec_version: "0.4.0"
+spec_version: "0.5.0"
 robot:
   name: unitree_go2
   model_source: third_party/mujoco_menagerie/unitree_go2/go2.xml
@@ -53,6 +53,32 @@ observation:
     - {name: gait_phase,        dim: 2,  scale: 1.0,  def: "[sin(2πφ), cos(2πφ)], φ = runner GaitClock 위상 (명령 0이면 정지)"}
   dim: 47
   # 다른 구현과 비교할 때의 허용 오차 (MJX 기본 float32 vs CPU double)
+  tolerance: {rtol: 1.0e-5, atol: 1.0e-5}
+
+
+# 지형 인지 정책의 관측 규약 (모방학습, 앞으로 GPU 강화학습 정책도 이 규약을 따른다)
+# = observation의 47개 항목 + height_scan. height_scan 입력은 "격자점의 지면 높이 - 몸통 높이"(m, 모르면 NaN)이고,
+#   배치 때는 알고리즘의 LiDAR 높이 지도(control/terrain_map.py)에서, 강화학습 때는 시뮬레이터 지형에서 직접 뽑는다
+#   (학습 때는 잡음, 위치 표류, 모르는 칸을 흉내 내는 것을 권장).
+observation_perceptive:
+  clip: 100.0
+  terms:
+    - {name: base_ang_vel,      dim: 3,  scale: 0.25}
+    - {name: projected_gravity, dim: 3,  scale: 1.0}
+    - {name: command,           dim: 3,  scale: [2.0, 2.0, 0.25]}
+    - {name: joint_pos_rel,     dim: 12, scale: 1.0}
+    - {name: joint_vel,         dim: 12, scale: 0.05}
+    - {name: last_action,       dim: 12, scale: 1.0}
+    - {name: gait_phase,        dim: 2,  scale: 1.0}
+    - name: height_scan
+      dim: 209
+      scale: 5.0
+      grid: {x: [-0.30, 0.60], y: [-0.25, 0.25], step: 0.05}   # 몸통 방향(yaw만) 기준. 순서: x가 바깥, y가 안쪽 루프 (x 오름차순, y 오름차순)
+      base_height_ref: 0.26   # 평지에서 걸을 때 몸통 높이 (트롯 실측 중앙값). 값 = clip(높이차 + base_height_ref, ±clip_m) -> 평지면 약 0
+      clip_m: 0.30
+      unknown: 0.0            # 모르는 칸(NaN)의 값 (scale 전) = 평지로 가정
+      def: "clip(h(p_i) - z_base + base_height_ref, -clip_m, clip_m), p_i = 몸통 xy + Rz(yaw) @ grid_i"
+  dim: 256
   tolerance: {rtol: 1.0e-5, atol: 1.0e-5}
 
 physics:

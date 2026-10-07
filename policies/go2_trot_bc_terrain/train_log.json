@@ -1,0 +1,128 @@
+[
+  {
+    "iter": 0,
+    "beta": 1.0,
+    "episodes": 40,
+    "falls_during_collection": 11,
+    "samples": 21754,
+    "train_mse": 0.00886,
+    "eval": [
+      {
+        "scenario": "flat_trot",
+        "forward_m": 0.192,
+        "fell_at": 4.38
+      },
+      {
+        "scenario": "rut_crossing",
+        "forward_m": 0.185,
+        "fell_at": null
+      }
+    ],
+    "sec": 229.0
+  },
+  {
+    "iter": 1,
+    "beta": 0.5,
+    "episodes": 30,
+    "falls_during_collection": 10,
+    "samples": 36545,
+    "train_mse": 0.00936,
+    "eval": [
+      {
+        "scenario": "flat_trot",
+        "forward_m": 0.206,
+        "fell_at": null
+      },
+      {
+        "scenario": "rut_crossing",
+        "forward_m": -0.032,
+        "fell_at": null
+      }
+    ],
+    "sec": 178.0
+  },
+  {
+    "iter": 2,
+    "beta": 0.25,
+    "episodes": 30,
+    "falls_during_collection": 7,
+    "samples": 52608,
+    "train_mse": 0.01245,
+    "eval": [
+      {
+        "scenario": "flat_trot",
+        "forward_m": 2.331,
+        "fell_at": null
+      },
+      {
+        "scenario": "rut_crossing",
+        "forward_m": 1.863,
+        "fell_at": 12.48
+      }
+    ],
+    "sec": 193.2
+  },
+  {
+    "iter": 3,
+    "beta": 0.1,
+    "episodes": 30,
+    "falls_during_collection": 5,
+    "samples": 69254,
+    "train_mse": 0.01795,
+    "eval": [
+      {
+        "scenario": "flat_trot",
+        "forward_m": 4.228,
+        "fell_at": null
+      },
+      {
+        "scenario": "rut_crossing",
+        "forward_m": 1.947,
+        "fell_at": 10.5
+      }
+    ],
+    "sec": 198.0
+  },
+  {
+    "iter": 4,
+    "beta": 0.0,
+    "episodes": 30,
+    "falls_during_collection": 8,
+    "samples": 85913,
+    "train_mse": 0.0209,
+    "eval": [
+      {
+        "scenario": "flat_trot",
+        "forward_m": 0.286,
+        "fell_at": 5.4
+      },
+      {
+        "scenario": "rut_crossing",
+        "forward_m": 2.428,
+        "fell_at": null
+      }
+    ],
+    "sec": 208.5
+  },
+  {
+    "iter": 5,
+    "beta": 0.0,
+    "episodes": 30,
+    "falls_during_collection": 10,
+    "samples": 100704,
+    "train_mse": 0.02244,
+    "eval": [
+      {
+        "scenario": "flat_trot",
+        "forward_m": 4.163,
+        "fell_at": null
+      },
+      {
+        "scenario": "rut_crossing",
+        "forward_m": 1.984,
+        "fell_at": 9.78
+      }
+    ],
+    "sec": 195.6
+  }
+]

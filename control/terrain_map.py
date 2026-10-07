@@ -79,6 +79,14 @@ class ElevationMap:
             out[rr0 - r0:rr1 - r0, cc0 - c0:cc1 - c0] = self.h[rr0:rr1, cc0:cc1]
         return out
 
+    def lookup(self, xy):
+        """여러 점 (N, 2)의 칸 값 그대로 (모르면 NaN). 정책 관측 height_scan용 (이웃 보간 없이 단순하게)."""
+        r, c = self.index(np.asarray(xy))
+        ok = (r >= 0) & (r < self.n) & (c >= 0) & (c < self.n)
+        out = np.full(len(r), np.nan)
+        out[ok] = self.h[r[ok], c[ok]]
+        return out
+
     def height(self, xy):
         """그 위치의 높이. 칸이 비어 있으면 바로 옆 칸들의 평균, 그것도 없으면 NaN."""
         w = self.window(xy, 1)

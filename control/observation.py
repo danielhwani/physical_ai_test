@@ -4,8 +4,8 @@
 JAX(MJX 학습)와 C++(실시간 시험) 구현이 맞춰야 하는 기준이다.
 MuJoCo 함수를 쓰지 않고 입력 배열만으로 계산한다 (다른 언어로 이식이 쉽도록).
 
-새 관측 항목(예: 지형 높이맵, 관측 이력)은 TERMS에 함수 하나를 등록하고,
-필요한 입력을 runner의 obs_inputs()에 추가하면 된다.
+새 관측 항목(예: 관측 이력)은 TERMS에 함수 하나를 등록하고, 필요한 입력을 control/node.py에서 넘기면 된다.
+height_scan(지형 높이 격자)의 입력은 "격자점 지면 높이 - 몸통 높이"이며, 어디서 뽑았는지(LiDAR 지도, 시뮬레이터 지형)는 모른다.
 """
 import numpy as np
 
@@ -22,6 +22,22 @@ def quat_rotate_inverse(q_wxyz, v):
     return R.T @ v
 
 
+def height_scan_grid(term):
+    """height_scan 격자점 (N, 2), 몸통 방향(yaw) 기준 x, y. 순서: x 바깥 루프, y 안쪽 루프 (둘 다 오름차순)."""
+    g = term["grid"]
+    xs = np.round(np.arange(g["x"][0], g["x"][1] + 1e-9, g["step"]), 6)
+    ys = np.round(np.arange(g["y"][0], g["y"][1] + 1e-9, g["step"]), 6)
+    return np.array([(x, y) for x in xs for y in ys])
+
+
+def _height_scan(inp, s):
+    """입력 height_scan = 격자점 지면 높이 - 몸통 높이 (m, 모르면 NaN)."""
+    t = s.term("height_scan")
+    h = np.asarray(inp["height_scan"], dtype=float) + t["base_height_ref"]
+    h = np.clip(h, -t["clip_m"], t["clip_m"])
+    return np.where(np.isfinite(h), h, t["unknown"])
+
+
 # 항목 이름 -> 계산 함수(inp, obs_spec). 관절 항목은 정책의 관절 순서로 재배열한다.
 TERMS = {
     "base_ang_vel":      lambda inp, s: inp["qvel"][3:6],
@@ -32,6 +48,7 @@ TERMS = {
     "last_action":       lambda inp, s: inp["last_action"],
     "gait_phase":        lambda inp, s: np.array([np.sin(2 * np.pi * inp["gait_phase"]),
                                                   np.cos(2 * np.pi * inp["gait_phase"])]),
+    "height_scan":       _height_scan,
 }
 INPUT_KEYS = ("qpos", "qvel", "command", "last_action", "gait_phase")
 
@@ -48,10 +65,17 @@ class ObservationSpec:
         assert not unknown, f"구현되지 않은 관측 항목: {unknown} (control/observation.py TERMS에 추가 필요)"
         assert sum(t["dim"] for t in self.terms) == self.dim, "observation dim 불일치"
 
-    def compute(self, qpos, qvel, command, last_action, gait_phase=0.0):
+    def term(self, name):
+        return next((t for t in self.terms if t["name"] == name), None)
+
+    @property
+    def needs_height_scan(self):
+        return self.term("height_scan") is not None
+
+    def compute(self, qpos, qvel, command, last_action, gait_phase=0.0, height_scan=None):
         inp = {"qpos": np.asarray(qpos, dtype=float), "qvel": np.asarray(qvel, dtype=float),
                "command": np.asarray(command, dtype=float), "last_action": np.asarray(last_action, dtype=float),
-               "gait_phase": float(gait_phase)}
+               "gait_phase": float(gait_phase), "height_scan": height_scan}
         parts = []
         for t in self.terms:
             v = np.asarray(TERMS[t["name"]](inp, self), dtype=float)

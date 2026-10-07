@@ -16,6 +16,7 @@ import numpy as np
 from .clock import GaitClock, StepContext
 from .estimator import LegOdometryEstimator
 from .interface import ControlInterface, load_card
+from .observation import height_scan_grid
 from .onnx_policy import OnnxPolicyController
 from .terrain_map import TerrainPerception
 from .trot import TrotController
@@ -31,20 +32,37 @@ class ControllerNode:
             self.iface = ControlInterface(spec, card)
             self.ctrl = OnnxPolicyController(card, self.iface)
             self.desc, period = f"onnx:{card['name']}", self.iface.gait_period
+            if self.iface.obs.needs_height_scan:             # 지형 인지 정책: 카드의 perception 절 (센서, 지도 설정)
+                pcfg = card.get("perception") or {}
+                self._make_terrain(spec, lidar_defs, pcfg.get("sensor", "front_lidar"), pcfg.get("map"))
         else:
             self.iface = ControlInterface(spec)
             self.ctrl = TrotController(spec, controller_cfg, self.iface)
             self.desc, period = f"trot:{controller_cfg}", controller_cfg["period"]
             pcfg = controller_cfg.get("perception")
             if pcfg:
-                self.sensor = pcfg["sensor"]
-                assert lidar_defs and self.sensor in lidar_defs, f"지형 인지 센서 {self.sensor}의 장착 명세가 없음"
-                self.terrain = TerrainPerception(spec, lidar_defs[self.sensor], pcfg.get("map"))
+                self._make_terrain(spec, lidar_defs, pcfg["sensor"], pcfg.get("map"))
         self.clock = GaitClock(period or 1.0)
         self.estimator = LegOdometryEstimator(spec)
         self.delay_steps = spec["action"].get("delay_steps", 0)
         self.on_action = None        # (ctx, action) -> action. 모방학습(DAgger)에서 실행 action 교체용
+        self.aux_obs_spec = None     # 모방학습: 학생 정책의 관측 규약 (ctx.aux_obs로 같은 입력의 학생 관측을 받는다)
         self.reset()
+
+    def _make_terrain(self, spec, lidar_defs, sensor, map_cfg):
+        assert lidar_defs and sensor in lidar_defs, f"지형 인지 센서 {sensor}의 장착 명세가 없음"
+        self.sensor = sensor
+        self.terrain = TerrainPerception(spec, lidar_defs[sensor], map_cfg)
+
+    def height_scan(self, obs_spec, est):
+        """관측 height_scan 입력: 격자점(몸통 방향 기준)의 지도 높이 - 몸통 높이 (odom, 모르면 NaN)."""
+        if self.terrain is None:
+            return np.full(obs_spec.term("height_scan")["dim"], np.nan)
+        _, p = self.terrain.pose(est)
+        grid = height_scan_grid(obs_spec.term("height_scan"))
+        c, s = np.cos(est.yaw), np.sin(est.yaw)
+        pts = p[:2] + grid @ np.array([[c, s], [-s, c]])        # Rz(yaw) @ grid
+        return self.terrain.map.lookup(pts) - p[2]
 
     def reset(self):
         self.ctrl.reset()
@@ -68,13 +86,17 @@ class ControllerNode:
         rows, cols = np.nonzero(np.isfinite(m.h))
         xy = m.origin + (np.stack([cols, rows], 1) + 0.5) * m.res
         legs = []
-        for i, fh in enumerate(tr.footholds):
+        for i, fh in enumerate(getattr(tr, "footholds", [])):     # 디딜 곳은 트롯만 고른다 (정책은 지도만 표시)
             if fh is None:
                 continue
             h = fh.height if np.isfinite(fh.height) else tr.h_td[i]
             legs.append({"leg": i, "swing": bool(tr.in_swing[i]), "chosen": [*fh.xy, h], "nominal": [*tr.nominal[i], h]})
+        h_ref = getattr(tr, "h_ref", None)
+        if h_ref is None:                                            # 정책: 몸통 높이 - 평지 기준 높이
+            t = self.iface.obs.term("height_scan")
+            h_ref = float(self.terrain.pose(self.est)[1][2] - (t["base_height_ref"] if t else 0.30))
         return {"t": self.last_t, "res": m.res, "cells": np.column_stack([xy, m.h[rows, cols]]),
-                "h_ref": tr.h_ref, "legs": legs}
+                "h_ref": h_ref, "legs": legs}
 
     def on_scan(self, name, t, points):
         """LiDAR 점군 (센서 좌표, (N, 3)). 다음 제어 주기에 지도에 넣는다."""
@@ -107,9 +129,15 @@ class ControllerNode:
         # 관측은 추정값으로 만든다 (MuJoCo 배치 규약의 qpos/qvel 자리에 추정 자세, 측정 각속도, 엔코더 값)
         qpos = np.concatenate([[0.0, 0.0, 0.0], est.quat_wxyz, est.q])
         qvel = np.concatenate([est.R @ est.v_body, est.gyro, est.dq])
-        self.obs = self.iface.obs.compute(qpos, qvel, self.clock.command_body(), self.action, self.clock.phase)
+        inputs = (qpos, qvel, self.clock.command_body(), self.action, self.clock.phase)
+        hs = self.height_scan(self.iface.obs, est) if self.iface.obs.needs_height_scan else None
+        self.obs = self.iface.obs.compute(*inputs, height_scan=hs)
+        aux = None
+        if self.aux_obs_spec is not None:
+            ahs = self.height_scan(self.aux_obs_spec, est) if self.aux_obs_spec.needs_height_scan else None
+            aux = self.aux_obs_spec.compute(*inputs, height_scan=ahs)
         ctx = StepContext(dt=dt, est=est, roll=est.roll, pitch=est.pitch, yaw=est.yaw, v_body_x=float(est.v_body[0]),
-                          wz_world=est.wz_world, clock=self.clock, obs=self.obs, terrain=self.terrain)
+                          wz_world=est.wz_world, clock=self.clock, obs=self.obs, terrain=self.terrain, aux_obs=aux)
         action = self.ctrl.act(ctx)
         if self.on_action:
             action = self.on_action(ctx, action)

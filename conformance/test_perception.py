@@ -7,6 +7,9 @@
 3. LiDAR로 만든 지도가 참 지형과 맞는다 (시작 자세 기준으로 옮겨 비교, 높이 표류만큼의 일정한 차이는 뺀다)
 4. 재현: 알고리즘이 받은 로봇 상태 메시지와 점군(센서 좌표)만 기록해 새 노드에 넣으면 같은 관절 명령이 나온다
    (센서의 참 자세나 지형 참값을 따로 읽지 않는다는 실행 증거)
+5. 관측 규약 height_scan (specs/go2_control.yaml observation_perceptive): 격자 순서, 평지 = 0, 모르는 칸, 자르기
+6. 걷는 동안 알고리즘이 뽑은 height_scan 입력이 참 지형(같은 격자, 참 자세)과 맞는다 -> 강화학습에서 시뮬레이터 지형으로
+   뽑는 값과 배치 때 LiDAR 지도에서 뽑는 값이 같은 뜻이다
 """
 import contextlib
 import copy
@@ -20,6 +23,8 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from control.foothold import FootholdPlanner  # noqa: E402
+from control.interface import ControlInterface  # noqa: E402
+from control.observation import height_scan_grid  # noqa: E402
 from control.node import ControllerNode  # noqa: E402
 from control.terrain_map import ElevationMap  # noqa: E402
 from sim.runner import Simulation, apply_overrides  # noqa: E402
@@ -122,6 +127,60 @@ def test_replay_from_low_state_and_points_only():
             fresh.set_command(*item)
     assert sum(k == "scan" for k, _ in log) >= 30 and fresh.terrain.scans_used > 0
     assert all(a["q_des"] == b["q_des"] for a, b in zip(replay, cmds)), "로봇 상태 + 점군만으로 재현되지 않음"
+
+
+def _perceptive_obs():
+    return ControlInterface(SPEC, {"observation": SPEC["observation_perceptive"]}).obs
+
+
+def test_height_scan_contract():
+    obs = _perceptive_obs()
+    t = obs.term("height_scan")
+    grid = height_scan_grid(t)
+    assert grid.shape == (t["dim"], 2) and obs.dim == SPEC["observation_perceptive"]["dim"]
+    assert tuple(grid[0]) == (-0.30, -0.25) and tuple(grid[1]) == (-0.30, -0.20) and tuple(grid[-1]) == (0.60, 0.25)
+    sl = obs.slices()["height_scan"]
+    base = (np.r_[0, 0, 0, 1, 0, 0, 0, np.zeros(12)], np.zeros(18), np.zeros(3), np.zeros(12), 0.0)
+    flat = np.full(t["dim"], -t["base_height_ref"])                 # 평지에 서 있음 -> 0
+    assert np.allclose(obs.compute(*base, height_scan=flat)[sl], 0.0)
+    hs = flat.copy(); hs[0], hs[1], hs[2] = np.nan, -t["base_height_ref"] - 0.05, 1.0
+    v = obs.compute(*base, height_scan=hs)[sl]
+    assert v[0] == t["unknown"] * t["scale"] and abs(v[1] + 0.05 * t["scale"]) < 1e-12 and v[2] == t["clip_m"] * t["scale"]
+    assert np.allclose(obs.compute(*base, height_scan=flat)[:47], SPEC_OBS().compute(*base))   # 앞 47개는 기존 규약과 같다
+
+
+def SPEC_OBS():
+    return ControlInterface(SPEC).obs
+
+
+def test_height_scan_input_matches_true_terrain():
+    sim = Simulation(_scenario("rough_rut", PERCEPTION))
+    obs = _perceptive_obs()
+    grid = height_scan_grid(obs.term("height_scan"))
+    errs = []
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            while sim.data.time < 6.0:
+                sim.step_control()
+                if sim.data.time > 3.0 and round(sim.data.time / 0.02) % 10 == 0:
+                    node = sim.controller
+                    est = node.est
+                    hs = node.height_scan(obs, est)
+                    d = sim.data
+                    yaw = np.arctan2(2 * (d.qpos[3] * d.qpos[6] + d.qpos[4] * d.qpos[5]), 1 - 2 * (d.qpos[5] ** 2 + d.qpos[6] ** 2))
+                    c, s_ = np.cos(yaw), np.sin(yaw)
+                    pts = d.qpos[:2] + grid @ np.array([[c, s_], [-s_, c]])
+                    truth = np.array([sim.terrain.height_at(x, y) for x, y in pts]) - d.qpos[2]
+                    ok = np.isfinite(hs)
+                    errs.append((hs[ok] - truth[ok], ok.mean()))
+    finally:
+        sim.close()
+    err = np.concatenate([e for e, _ in errs])
+    known = np.mean([k for _, k in errs])
+    spread = np.percentile(err, 90) - np.percentile(err, 10)
+    # 앞쪽 LiDAR가 이미 본 곳만 값이 있다. 오차 = 위치 표류(일정한 차이) + 격자 칸 크기 + 거리 잡음
+    assert known > 0.7, f"아는 격자점 비율 {known:.2f}"
+    assert spread < 0.04, f"height_scan 오차 폭(10~90%) {spread * 100:.1f} cm, 일정한 차이 {np.median(err) * 100:.1f} cm"
 
 
 if __name__ == "__main__":

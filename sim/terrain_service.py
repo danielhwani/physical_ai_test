@@ -91,7 +91,7 @@ class TerrainMapService:
             frac = np.clip((X - x0) / (x1 - x0), 0, 1)
             delta = np.where((Y >= y0) & (Y <= y1), frac * p["rise"], 0.0)
         elif kind == "rut":
-            # 선분을 따라가는 홈 (cosine 단면)
+            # 선분을 따라가는 홈. 단면 profile: cosine(기본, 완만) 또는 box(평평한 바닥, 가파른 벽)
             (ax, ay), (bx, by) = p["start"], p["end"]
             d = np.array([bx - ax, by - ay]); length = np.linalg.norm(d); d /= length
             px, py = X - ax, Y - ay
@@ -99,7 +99,10 @@ class TerrainMapService:
             dist = np.abs(px * d[1] - py * d[0])
             half_w = p["width"] / 2
             inside = (dist < half_w) & (along >= 0) & (along <= length)
-            delta = np.where(inside, -p["depth"] * 0.5 * (1 + np.cos(np.pi * dist / half_w)), 0.0)
+            if p.get("profile", "cosine") == "box":   # 평평한 바닥 + 가파른 벽 (Chrono SCM 바퀴 자국과 같은 모양)
+                delta = np.where(inside, -p["depth"], 0.0)
+            else:
+                delta = np.where(inside, -p["depth"] * 0.5 * (1 + np.cos(np.pi * dist / half_w)), 0.0)
         else:
             raise ValueError(f"unknown patch kind: {kind}")
         self.apply_heights(self.target + delta)

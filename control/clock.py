@@ -52,3 +52,4 @@ class StepContext:
     clock: GaitClock
     obs: np.ndarray      # 이 컨트롤러의 인터페이스로 계산한 관측 (추정값 기반)
     terrain: object = None   # control.terrain_map.TerrainPerception (LiDAR 높이 지도). 없으면 지형을 모르고 걷는다
+    aux_obs: np.ndarray = None   # 모방학습용: 학생 정책의 관측 (ControllerNode.aux_obs_spec이 있을 때)

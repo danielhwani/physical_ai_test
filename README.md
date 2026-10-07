@@ -34,7 +34,7 @@ python conformance/test_specs.py                         # 관측 기준 벡터,
 python conformance/test_policy.py [card.yaml]            # 정책 카드/ONNX 입출력/결정성/추론 지연 (기본 go2_trot_bc)
 python conformance/test_control.py                       # 로봇 경계: 알고리즘이 참값을 모름, 기구학, 다리 주행거리계, 재현
 python conformance/test_lidar.py                         # LiDAR: 스트림만으로 재현, 지형 표면, 자기 몸 제외
-python conformance/test_perception.py                    # 지형 인지: 높이 지도, 디딜 곳, LiDAR 지도 정확도, 점군만으로 재현
+python conformance/test_perception.py                    # 지형 인지: 높이 지도, 디딜 곳, LiDAR 지도 정확도, 점군만으로 재현, height_scan 규약
 python conformance/test_ros_equivalence.py               # ROS 노드 = 같은 프로세스(20 ms 지연 흉내) (ROS2 필요)
 python conformance/test_render_stream.py                 # 렌더 스트림 계약 (스트림만으로 장면 재구성 = 시뮬레이터)
 python conformance/compare_variants.py [--policy card.yaml]   # cpu vs mjx 설정의 MOP 분포 비교
@@ -268,6 +268,7 @@ LiDAR 점군(센서 좌표, 10 Hz) ───────────────
 | 시나리오 (시드 수) | 지형 모름 | 지형 인지 |
 |---|---|---|
 | vehicle_crossing (5) | **4번 넘어짐**, 전진 약 2.1 m, 모서리 착지 10~24 | **0번**, 전진 약 5.0 m (두 자국 통과), 모서리 착지 0~3 |
+| rut_crossing, Chrono 없이 만든 상자형 자국 5 cm (5) | 2번 넘어짐 (첫 자국에서 막힘) | **0번** |
 | vehicle_crossing_soft, 자국 15 cm (3) | 3번 넘어짐 | 2번 넘어짐 |
 | hmmwv_follow, 자국 안을 따라 걷기 (5) | 4번 넘어짐 | 3번 넘어짐 |
 | flat_trot (3) | 전진 3.86~3.93, CoT 2.40~2.46 | 3.85~3.93, CoT 2.44~2.51 (차이 없음) |
@@ -285,6 +286,21 @@ LiDAR 점군(센서 좌표, 10 Hz) ───────────────
 **한계**: 자국 안을 따라 걷기(hmmwv_follow)와 15 cm 자국은 아직 자주 넘어진다. 트롯은 걸음 주기가 고정이고 옆 방향 위치 제어가 없어
 자국 벽 쪽으로 흘러가는 것을 막지 못한다. 이 경우는 걸음 조절(멈춤, 짧은 걸음)이나 학습 정책이 필요할 것으로 보인다.
 LiDAR를 켜면 같은 프로세스 실행이 약 5배 느려진다 (스캔 계산).
+
+### 지형 인지 정책의 관측 규약 (`observation_perceptive`, 명세 0.5.0)
+
+학습 정책(모방이든 강화학습이든)이 지형을 입력으로 받을 때의 규약이다. `specs/go2_control.yaml`에 있다.
+- 256차원 = 기존 47개(`observation`과 같은 순서, 같은 값) + `height_scan` 209개.
+- `height_scan`: 몸통 기준 격자(앞뒤 -0.30~+0.60 m × 옆 ±0.25 m, 5 cm 간격, x 바깥 반복·y 안쪽 반복, 오름차순)를
+  몸통 방향(yaw)으로 돌린 점들의 지면 높이 - 몸통 높이 + 0.26 m. ±0.30 m에서 자르고 5배. 모르는 칸은 0.
+  평지에 서 있으면 모두 약 0이다 (0.26 m는 트롯이 평지에서 실제로 서는 몸통 높이).
+- **학습할 때**(시뮬레이터)는 참 지형에서, **배치할 때**(알고리즘 노드)는 LiDAR 높이 지도에서 같은 격자를 뽑는다.
+  두 값이 같은 뜻인지 `test_height_scan_input_matches_true_terrain`이 확인한다 (걷는 동안 오차 폭 4 cm 이내, 격자점 70% 이상 앎).
+- 배치: 정책 카드의 `observation`에 `height_scan`이 있으면 알고리즘 노드가 카드의 `perception: {sensor: front_lidar}`로 지도를 만든다.
+  코드 수정 없이 카드만으로 된다. 같은 프로세스와 ROS 노드 실행 결과가 같다 (rut_crossing 전진 1.74 / 1.74 m, 지연 20 ms).
+
+**시나리오 `rut_crossing`**: vehicle_crossing의 바퀴 자국(평평한 바닥, 가파른 벽)을 Chrono 없이 MuJoCo 지형 패치(`rut`, `profile: box`)로
+재현했다. 빠르게 돌릴 수 있어 학습과 반복 시험에 쓴다. 지형을 모르는 트롯은 첫 자국에서 막히고 지형 인지 트롯은 통과한다.
 
 ## 넓은 지형: 로봇을 따라다니는 지형 창
 
@@ -367,8 +383,46 @@ python -m sim.sweep scenarios/footprints.yaml --param chrono.scm.soil.bekker_kph
 - MJX 설정 모델에서는 트롯(전진 +0.09 m)보다 영향이 크다: 전진 -0.74 m, CoT +30% (시드 8개, 약 1.8σ, 참값·지연 없음 조건).
   학습한 모델 설정에 맞춰진 정책일수록 설정 차이에 민감하다는 것이 §13.2 계층 비교를 정책마다 다시 해야 하는 이유다.
 
+**정책 `go2_trot_bc_terrain` (실패, 탑재 경로 시험용)**: 지형 인지 트롯을 DAgger로 모방하려 했으나 **지형을 쓰지 못한다**.
+관측은 `observation_perceptive`, 학습 지형은 무작위 상자형 자국. 평지 4.23 m는 걷지만 rut_crossing에서는 지형을 모르는 트롯처럼
+첫 자국에서 막힌다 (1.95 m, 넘어짐). 오프라인으로 나눠 본 원인:
+- 처음에는 자국을 건너는 샘플이 2~5%뿐이었다. 자국을 촘촘히 배치해 61%로 늘려도 결과가 같았다.
+- 같은 데이터에서 높이 입력을 준 학생이 주지 않은 학생보다 교사 행동을 더 못 맞혔다 (자국 근처 시험 오차 0.019 vs 0.012).
+  높이 입력 압축(주성분 4~16개), 직전 행동 입력 빼기(교사의 결정을 그대로 따라 하는 효과 제거)도 나아지지 않았다.
+- 해석: 교사의 판단은 4 cm 칸의 미세한 높이 차, 문턱값(1.5 cm, 2 cm), 내부 기억(고른 자리, 발 든 높이)에 달려 있어
+  이 규모(10만 샘플)로는 학생이 규칙을 일반화하지 못하고 과적합한다.
+- 그래서 지형 사용은 보상으로 직접 배우는 강화학습(GPU)에 맡긴다 (아래 "강화학습 준비"). 관측 규약과 배치 경로는 그대로 쓴다.
+- 이 정책은 규약 확정 전(기준 몸통 높이 0.30 m)에 학습해 카드의 `base_height_ref`가 명세(0.26 m)와 다르다. 카드가 우선하므로 동작은 맞다.
+
 학습 시간 참고: 이 PC(메모리 7.7 GB, 스왑 없음)에서 작업자 5개로 돌리면 다른 프로그램과 함께 메모리가 모자라 시스템이 멈췄다.
 작업자 하나가 약 0.55 GB를 쓰므로 `--workers 3`(기본값)을 권장한다.
+에피소드마다 메모리가 약 100 MB씩 쌓이던 누수는 에피소드마다 `gc.collect()`, 작업자를 10 에피소드마다 새로 띄우기(`maxtasksperchild`)로 막았다.
+
+## 강화학습 준비 (GPU 장비에서)
+
+이 PC(GPU 없음)에서는 처리량이 나오지 않아 학습은 다른 장비에서 한다. 이 저장소는 **학습 결과(ONNX + 카드)를 받아 시험하는 쪽**이다.
+학습 쪽이 맞춰야 할 것과 이미 준비된 것:
+
+| 항목 | 상태 |
+|---|---|
+| 모델 | `go2_mjx.xml` + 명세 오버라이드 (위 "MJX 준비 사항", `test_specs.py`) |
+| 관측 | 지형 모름: `observation` 47개 / 지형 인지: `observation_perceptive` 256개. JAX 관측 함수는 `obs_reference.npz`와 1e-5 안에서 같아야 한다 |
+| 행동, PD, 제어 주기 | `action` 절 (기본 자세 + 0.25 × 행동, kp/kd, 20 ms) |
+| 배치 조건 | 관측은 추정값(센서 잡음 + 다리 주행거리계), 연결 지연 1주기. 학습 때 잡음과 지연 0~2주기를 무작위로 주기를 권장 (`go2_trot_bc`와 `go2_trot_bc_est`가 이 차이로 크게 갈렸다) |
+| 지형 | 무작위 상자형 자국(`train/imitate_trot.py`의 `random_ruts`: 3~6개, 깊이 3~6 cm, 폭 18~35 cm) + 요철. 시험은 rut_crossing, vehicle_crossing |
+| 탑재 | 카드 작성 -> `test_policy.py`, `compare_variants.py --policy`, `sim.sweep --param seed`, `test_ros_equivalence.py` |
+
+지형 인지 정책은 학습 때 `height_scan`을 참 지형에서 뽑되, 배치 때 LiDAR 지도의 오차(위치 표류로 생기는 수 cm의 일정한 차이, 앞쪽만 보임)를
+흉내 내도록 높이 잡음, 일정한 치우침, 일부 칸 모름(0)을 넣는 것이 좋다.
+
+**학습 방침: 배치용 관측으로 바로 강화학습, critic에만 특권 정보 (asymmetric actor-critic)**
+- 행동을 내는 정책(actor)은 처음부터 배치 때와 같은 입력만 받는다: `observation_perceptive`(추정값 + 잡음 섞은 `height_scan`).
+  학습 결과를 그대로 ONNX + 카드로 가져와 쓴다. 강화학습 교사를 따로 만들어 모방학습으로 옮기는 두 단계는 거치지 않는다.
+- 점수를 매기는 쪽(critic)은 학습 중에만 쓰므로 특권 정보(참 지형 높이, 참 속도, 발 접촉, 지면 마찰)를 받아도 된다. 학습이 쉬워진다.
+- 두 단계(교사 -> 학생 증류)가 필요한 경우: 잡음 많은 입력만으로는 학습이 안 될 때, 큰 정책을 작게 줄일 때, 입력 센서를 바꿀 때
+  (예: LiDAR -> 카메라). 그때는 `train/imitate_trot.py`의 DAgger를 신경망 교사로 바꿔 쓴다.
+- 룰 기반 교사 모방(`go2_trot_bc_*`)은 지형 판단 없는 기본 보행을 CPU로 빠르게 만들어 배치 경로를 시험하는 용도로 남긴다
+  (룰 기반 교사를 넘어설 수 없고, 미세한 문턱값 판단은 따라 하기도 어려웠다: 위 `go2_trot_bc_terrain`).
 
 ## 저사양을 고려해 의도적으로 뺀 것
 

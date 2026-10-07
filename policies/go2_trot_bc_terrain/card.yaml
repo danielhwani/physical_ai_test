@@ -1,0 +1,139 @@
+# 자동 생성: train/imitate_trot.py
+# 상태: 실패. 지형을 쓰지 못한다 (rut_crossing 첫 자국에서 막힘). 지형 인지 정책의 탑재 경로 시험용으로만 남긴다. README 'ONNX 정책 탑재' 참고
+name: go2_trot_bc_terrain
+onnx: policy.onnx
+io:
+  input: obs
+  output: actions
+joints:
+- FL_hip_joint
+- FL_thigh_joint
+- FL_calf_joint
+- FR_hip_joint
+- FR_thigh_joint
+- FR_calf_joint
+- RL_hip_joint
+- RL_thigh_joint
+- RL_calf_joint
+- RR_hip_joint
+- RR_thigh_joint
+- RR_calf_joint
+default_pose:
+- 0
+- 0.9
+- -1.8
+- 0
+- 0.9
+- -1.8
+- 0
+- 0.9
+- -1.8
+- 0
+- 0.9
+- -1.8
+action:
+  scale: 0.25
+  clip: 4.0
+  control_dt: 0.02
+  pd:
+    kp:
+    - 100
+    - 150
+    - 150
+    - 100
+    - 150
+    - 150
+    - 100
+    - 150
+    - 150
+    - 100
+    - 150
+    - 150
+    kd:
+    - 4
+    - 4
+    - 4
+    - 4
+    - 4
+    - 4
+    - 4
+    - 4
+    - 4
+    - 4
+    - 4
+    - 4
+    rate: physics
+observation:
+  clip: 100.0
+  terms:
+  - name: base_ang_vel
+    dim: 3
+    scale: 0.25
+  - name: projected_gravity
+    dim: 3
+    scale: 1.0
+  - name: command
+    dim: 3
+    scale:
+    - 2.0
+    - 2.0
+    - 0.25
+  - name: joint_pos_rel
+    dim: 12
+    scale: 1.0
+  - name: joint_vel
+    dim: 12
+    scale: 0.05
+  - name: last_action
+    dim: 12
+    scale: 1.0
+  - name: gait_phase
+    dim: 2
+    scale: 1.0
+  - name: height_scan
+    dim: 209
+    scale: 5.0
+    grid:
+      x:
+      - -0.3
+      - 0.6
+      y:
+      - -0.25
+      - 0.25
+      step: 0.05
+    base_height_ref: 0.3
+    clip_m: 0.3
+    unknown: 0.0
+    def: clip(h(p_i) - z_base + base_height_ref, -clip_m, clip_m), p_i = 몸통 xy + Rz(yaw)
+      @ grid_i
+  dim: 256
+  tolerance:
+    rtol: 1.0e-05
+    atol: 1.0e-05
+gait_clock:
+  period: 0.36
+provenance:
+  method: DAgger imitation of rule-based trot (control/trot.py) with terrain perception
+    (LiDAR elevation map, control/foothold.py)
+  observation_source: 'robot boundary: sensor noise + state estimator (no ground truth)'
+  link_latency_steps_range:
+  - 0
+  - 2
+  spec_version: 0.5.0
+  date: '2026-10-07'
+  network: MLP 256-256-128-12 ELU, obs normalization in graph
+  samples: 100704
+  dagger_iters: 6
+  train_seconds: 1202
+  selected_iter: 3
+  trained_on: CPU MuJoCo, model variant cpu; random box ruts (no Chrono), height map
+    from simulated LiDAR
+  final_eval:
+  - scenario: flat_trot
+    forward_m: 4.228
+    fell_at: null
+  - scenario: rut_crossing
+    forward_m: 1.947
+    fell_at: 10.5
+perception:
+  sensor: front_lidar
