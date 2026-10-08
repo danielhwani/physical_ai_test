@@ -143,6 +143,9 @@ class ControllerNode:
             self.recovery = (t, float(np.clip(np.abs(stand - q0).max() / RECOVER_RATE, RECOVER_MIN_S, 2.0)), q0)
             self.ctrl.reset()
             self.clock.cmd_f[:], self.clock.phase = 0.0, 0.0     # 명령 목표는 두고, 속도는 0에서 다시 가속
+            # 공백 동안의 움직임은 모른다: 끊기기 전 속도로 공백을 적분하면 추정 위치가 튄다 (3초 두절에 0.7 m,
+            # 지형 인지 보행의 지도·디딜 곳이 그만큼 어긋나 잘 걷지 못했다). 제자리에 있었다고 보고 속도 0에서 다시 시작
+            self.estimator.restart_after_gap()
         self.last_t = t
         if self.recovery is None:
             self.clock.update(dt)

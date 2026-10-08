@@ -316,23 +316,26 @@ def test_entity_and_soil_with_chrono():
         con.close(); sim.dis.close(); sim.close()
 
 def test_stand_up_after_link_loss():
-    """감쇠 모드로 1초(주저앉음), 3초(배를 대고 엎드림) 끊긴 뒤 일어서서 다시 걷는다. 넘어짐 판정 없음."""
-    for dur in (1.0, 3.0):
-        scn = dict(SCENARIO, events=[{"t": 0.0, "action": "set_command", "vx": 0.3, "yaw_rate": 0.0},
-                                     {"t": 1.0, "action": "inject_fault", "fault": "link_loss", "duration": dur,
-                                      "params": {"robot_behavior": "damp"}}])
+    """감쇠 모드로 1초(주저앉음), 3초(배를 대고 엎드림) 끊긴 뒤 일어서서 다시 걷는다. 넘어짐 판정 없음.
+    지형 인지 보행도: 공백 동안 추정 위치가 튀지 않고(공백 전 속도로 적분하지 않음) 지면 높이를 잃지 않아야 걷는다."""
+    for dur, sets in ((1.0, []), (3.0, []), (3.0, ["controller.perception.sensor=front_lidar"])):
+        scn = apply_overrides(dict(SCENARIO, events=[{"t": 0.0, "action": "set_command", "vx": 0.3, "yaw_rate": 0.0},
+                                                     {"t": 1.0, "action": "inject_fault", "fault": "link_loss", "duration": dur,
+                                                      "params": {"robot_behavior": "damp"}}]), sets)
         sim = Simulation(scn)
-        d, z_min = sim.data, 1.0
+        d, z_min, p0 = sim.data, 1.0, sim.data.qpos[:3].copy()
         try:
             while d.time < 1.0 + dur:
                 _, _, roll, pitch = _step_out(sim)
                 z_min = min(z_min, d.qpos[2])
                 assert not sim.fallen(roll, pitch), f"두절 중 넘어짐 판정 t={d.time:.2f}"
             x0 = d.qpos[0]
-            while d.time < 1.0 + dur + 4.0:
+            while d.time < 1.0 + dur + 6.0:
                 _, _, roll, pitch = _step_out(sim)
-                assert not sim.fallen(roll, pitch), f"복구 뒤 넘어짐 t={d.time:.2f}"
-            assert z_min < 0.16 and d.qpos[2] > 0.24 and d.qpos[0] - x0 > 0.5, (dur, z_min, d.qpos[2], d.qpos[0] - x0)
+                assert not sim.fallen(roll, pitch), f"복구 뒤 넘어짐 t={d.time:.2f} {sets}"
+            err = np.abs(sim.controller.est.pos - (d.qpos[:3] - p0)).max()
+            assert z_min < 0.16 and d.qpos[2] > 0.24 and d.qpos[0] - x0 > 1.0 and err < 0.1, \
+                (dur, sets, z_min, d.qpos[2], d.qpos[0] - x0, err)
         finally:
             sim.close()
 

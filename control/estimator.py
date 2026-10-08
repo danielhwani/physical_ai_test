@@ -60,6 +60,17 @@ class LegOdometryEstimator:
         self.pos = np.zeros(3)
         self.last_t = None
         self.foot_z = {}                        # 디딘 발: 닿은 순간 접촉점의 odom 높이
+        self.ground_z = 0.0                     # 마지막으로 안 지면 높이 (디딘 접촉점 평균, odom)
+        self.reanchor = False                   # 상태 공백 뒤: 새로 디딘 발을 공백 전 지면 높이에 맞춘다
+
+    def restart_after_gap(self):
+        """로봇 상태가 한동안 오지 않았을 때 (링크 두절). 그 사이 움직임은 모르므로 제자리에 있었다고 보고 속도 0에서 다시 시작한다.
+        로봇이 주저앉거나 엎드리면 발 하중이 사라져 기억한 접촉점을 잃으므로, 다시 디딘 발은 공백 전 지면 높이에 놓는다
+        (지금 추정 몸통 높이로 잡으면 주저앉은 만큼 지면이 높다고 믿게 되어, 3초 두절 뒤 지형 인지 보행이 발을 뻗다 튀어 넘어졌다)."""
+        self.v[:] = 0.0
+        self.last_t = None
+        self.foot_z = {}
+        self.reanchor = True
 
     def update(self, ls):
         imu = ls["imu"]
@@ -89,8 +100,10 @@ class LegOdometryEstimator:
             del self.foot_z[i]
         if rel_z:
             for i, rz in rel_z.items():                        # 새로 디딘 발: 지금 추정 높이로 접촉점 높이를 정한다
-                self.foot_z.setdefault(i, self.pos[2] + rz)
+                self.foot_z.setdefault(i, self.ground_z if self.reanchor else self.pos[2] + rz)
+            self.reanchor = False
             self.pos[2] = float(np.mean([self.foot_z[i] - rz for i, rz in rel_z.items()]))
+            self.ground_z = float(np.mean([self.foot_z[i] for i in rel_z]))
         self.last_t = ls["t"]
         return Estimate(quat_wxyz=qw, R=R, roll=roll, pitch=pitch, yaw=yaw, gyro=gyro, v_body=self.v.copy(),
                         wz_world=float((R @ gyro)[2]), contacts=contacts, pos=self.pos.copy(), q=q, dq=dq)
