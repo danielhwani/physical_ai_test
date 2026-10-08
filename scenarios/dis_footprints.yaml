@@ -1,0 +1,45 @@
+# DIS 시나리오 콘솔 + Chrono 로봇 발자국 (흙 상태를 바꾸며 발자국 보기). 문서 §10.2 "지형 상태"
+#   python -m sim.runner scenarios/dis_footprints.yaml --dis-port 3000 --dis-wait --rviz
+#   python -m dis_console.console --sim 127.0.0.1:3000
+#   dis> soil soft      흙을 무르게 -> 이후 디딘 발자국이 깊어짐 (hard / firm / soft / mud)
+#   dis> cmd 0.35       x 1~9 m 변형 지면 위를 걷는다
+# HMMWV는 없다: 발자국에는 2 cm 격자와 Chrono 1 ms 스텝이 필요한데, HMMWV까지 같은 조건으로 계산하면 이 PC에서
+# 실시간의 0.06배로 느려진다 (발자국만이면 약 2배 빠름). HMMWV와 자국은 dis_chrono.yaml
+# 로봇은 원점에서 +x를 보고 선다. 변형 지면(SCM)은 x 1~9 m, y -1.5~1.5 m. 그 밖은 MuJoCo 지형만 (발자국 없음)
+name: dis_footprints
+duration: 300.0
+seed: 4
+terrain:
+  size: [10.0, 4.0]      # 반폭: x -10~10 m, y -4~4 m
+  resolution: 0.02       # 발 반지름 2.2 cm보다 촘촘해야 한다 (5 cm면 발이 격자점 사이로 빠진다)
+  z_range: [-0.15, 0.15]
+  guard_radius: 0.06     # 트롯 보폭보다 작게: 앞발 자국이 반영되어 뒷발이 밟는다
+  patches: []
+controller:
+  type: trot
+  period: 0.36
+  swing_height: 0.08
+  stand_height: 0.27
+  perception: null
+events: []
+chrono:
+  sync_dt: 0.04
+  terrain_dt: 0.2
+  step: 1.0e-3           # 작은 발 접촉에 필요 (footprints.yaml 참고)
+  robot_feet:
+    mass: 2.0
+    damping: 300.0
+    fn_min: 5.0
+  scm:
+    center: [5.0, 0.0]
+    size: [8.0, 3.0]
+    resolution: 0.02     # = terrain.resolution
+    soil:                # firm. soil 명령으로 hard / firm / soft / mud
+      bekker_kphi: 5.0e6
+      bekker_kc: 0
+      bekker_n: 1.1
+      cohesion: 0
+      friction_deg: 30
+      janosi_shear: 0.01
+      elastic_k: 4.0e7
+      damping_r: 3.0e4

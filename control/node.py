@@ -21,6 +21,12 @@ from .onnx_policy import OnnxPolicyController
 from .terrain_map import TerrainPerception
 from .trot import TrotController
 
+# 일어서기 (링크 두절 뒤): 로봇 상태가 RECOVER_GAP_S 넘게 오지 않다가 다시 오면, 보행을 멈추고 지금 관절 각도에서
+# 서 있는 자세(기본 자세)까지 천천히 옮긴 뒤(관절 최대 RECOVER_RATE rad/s, 최소 RECOVER_MIN_S) RECOVER_HOLD_S 동안 서 있다가
+# 보행을 처음 위상부터 다시 시작한다. 두절 중 로봇이 주저앉았는데(감쇠 모드) 그 자세에서 곧바로 트롯을 이으면 큰 PD 오차가
+# 한꺼번에 걸려 고꾸라졌다 (확인함). 정상 실행에서는 상태가 매 주기 오므로 동작하지 않는다
+RECOVER_GAP_S, RECOVER_RATE, RECOVER_MIN_S, RECOVER_HOLD_S = 0.1, 1.0, 0.3, 0.5
+
 
 class ControllerNode:
     def __init__(self, spec, controller_cfg=None, policy=None, lidar_defs=None):
@@ -73,6 +79,7 @@ class ControllerNode:
         self.pending = deque([np.zeros(12)] * self.delay_steps)
         self.last_t, self.est = None, None
         self.q_des = self.iface.targets_from_action(self.action)
+        self.recovery = None          # 일어서기 중: (시작 시각, 옮기는 시간, 시작 관절 각도)
         if self.terrain is not None:
             self.terrain.reset()
         self.scan_buf, self.pose_hist = [], {}
@@ -113,6 +120,16 @@ class ControllerNode:
         for k in [k for k in self.pose_hist if k < t - 1.0]:          # 1초 넘은 자세 기록은 버린다
             del self.pose_hist[k]
 
+    def _recover_action(self, t):
+        t0, T, q0 = self.recovery
+        s = (t - t0) / T
+        if s >= 1.0 + RECOVER_HOLD_S / T:                 # 다 일어섰다: 다음 주기부터 보행
+            self.recovery = None
+        u = min(s, 1.0)
+        u = u * u * (3 - 2 * u)                            # 부드럽게 시작하고 멈춤
+        stand = self.iface.targets_from_action(np.zeros(12))
+        return self.iface.action_from_targets(q0 + u * (stand - q0))
+
     def set_command(self, vx, yaw_rate):
         self.clock.set_command(vx, yaw_rate)
 
@@ -120,8 +137,15 @@ class ControllerNode:
         """로봇 상태 메시지 -> 관절 명령 메시지 (dict)."""
         t = ls["t"]
         dt = self.iface.control_dt if self.last_t is None else t - self.last_t
+        if self.last_t is not None and dt > RECOVER_GAP_S:      # 상태가 끊겼다가 다시 옴 (링크 두절): 일어서기부터
+            q0 = np.asarray(ls["q"], dtype=float)
+            stand = self.iface.targets_from_action(np.zeros(12))
+            self.recovery = (t, float(np.clip(np.abs(stand - q0).max() / RECOVER_RATE, RECOVER_MIN_S, 2.0)), q0)
+            self.ctrl.reset()
+            self.clock.cmd_f[:], self.clock.phase = 0.0, 0.0     # 명령 목표는 두고, 속도는 0에서 다시 가속
         self.last_t = t
-        self.clock.update(dt)
+        if self.recovery is None:
+            self.clock.update(dt)
         est = self.est = self.estimator.update(ls)
         if self.terrain is not None:
             self.pose_hist[t] = self.terrain.update(est)
@@ -138,7 +162,10 @@ class ControllerNode:
             aux = self.aux_obs_spec.compute(*inputs, height_scan=ahs)
         ctx = StepContext(dt=dt, est=est, roll=est.roll, pitch=est.pitch, yaw=est.yaw, v_body_x=float(est.v_body[0]),
                           wz_world=est.wz_world, clock=self.clock, obs=self.obs, terrain=self.terrain, aux_obs=aux)
-        action = self.ctrl.act(ctx)
+        if self.recovery is not None:
+            action = self._recover_action(t)
+        else:
+            action = self.ctrl.act(ctx)
         if self.on_action:
             action = self.on_action(ctx, action)
         self.action = np.clip(action, -self.iface.clip, self.iface.clip)

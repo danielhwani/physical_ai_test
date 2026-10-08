@@ -33,9 +33,14 @@ from .robot_io import RobotIO
 from .stream import build_status
 from .terrain_service import TerrainMapService
 
+# 고장 주입 (DIS 콘솔, 문서 §10.2). 모두 로봇 쪽 경계에서 일어난다: 알고리즘은 "안 온다", "다르게 온다"만 안다
+FAULTS = ("lidar_blackout", "link_loss", "imu_bias", "battery_low")
+CONTROL_ACTIONS = ("freeze", "stop")      # 실행 제어: 물리에 영향 없음. 다시 실행할 시나리오에서는 뺀다 (stop은 duration으로)
+
 SIM_VERSION = "0.3.0"
 TERRAIN_COMMIT_HZ = 5.0       # 지형 갱신은 수 Hz로 충분 (문서 §5.3)
-FALL_HEIGHT = 0.12            # 몸통 높이(지면 기준)가 이보다 낮으면 넘어짐
+FALL_HEIGHT = 0.08            # 몸통 높이(지면 기준)가 이보다 낮으면 넘어짐. 배를 대고 엎드린 자세(약 0.12 m)는 넘어짐이 아니다
+                              # (링크 두절 감쇠 모드 뒤 일어설 수 있음). 0.12 -> 0.08로 바꿔도 기존 시나리오 9개 실행의 판정이 같았다
 FALL_TILT = 1.0               # rad
 
 
@@ -212,6 +217,9 @@ class Simulation:
         self.event_log = []         # 적용된 이벤트 (applied_t 포함). 콘솔 이벤트까지 넣어 다시 실행할 수 있는 시나리오를 만든다
         self.last_event = None      # (시각, 설명) 가시화용
         self.next_terrain_commit = 0.0
+        self.faults = {}            # 고장 이름 -> {"until": 끝 시각 또는 None, "params": {...}}
+        self.frozen = False         # 실행 제어: 일시정지 (실시간 루프가 시뮬레이션을 진행하지 않음)
+        self.stop_requested = False # 실행 제어: 시험 종료
 
     # ---- 이벤트 (시나리오 파일과 DIS 시나리오 콘솔이 같은 경로로 넣는다) ----
     def _apply_events(self, verbose=True):
@@ -227,22 +235,84 @@ class Simulation:
                     self.controller.set_command(*self.command)
             elif e["action"] == "add_patch":
                 self.terrain.add_patch(e["patch"])
+            elif e["action"] == "inject_fault":
+                self._set_fault(e["fault"], e.get("duration"), e.get("params") or {})
+            elif e["action"] == "clear_fault":
+                self._clear_fault(e["fault"])
+            elif e["action"] == "create_entity":    # 개체 투입 (Chrono 차량 슬롯)
+                self.cosim.spawn_vehicle(e.get("speed"))
+                self.cosim.near_event_sent = False
+            elif e["action"] == "remove_entity":
+                self.cosim.remove_vehicle()
+            elif e["action"] == "set_soil":
+                self.cosim.set_soil(e["soil"])
+            elif e["action"] == "freeze":
+                self.frozen = True
+            elif e["action"] == "stop":
+                self.stop_requested = True
             desc = e["action"]
             if e["action"] == "set_command":
                 desc += f" vx={e['vx']:.2f} yaw={e.get('yaw_rate', 0.0):.2f}"
             elif e["action"] == "add_patch":
                 desc += f" {e['patch']['kind']}"
+            elif e["action"] in ("create_entity", "remove_entity"):
+                desc += f" {e.get('entity_type', 'HMMWV')}"
+            elif e["action"] == "set_soil":
+                desc += f" {e.get('preset', 'custom')}"
+            elif e["action"] in ("inject_fault", "clear_fault"):
+                desc += f" {e['fault']}" + (f" {e['duration']:g}s" if e.get("duration") else "")
             self.last_event = (self.data.time, desc)
             if verbose:
                 print(f"[t={self.data.time:6.2f}] event: {desc}" + (f"  (DIS {e['request']})" if e.get("source") == "dis" else ""))
 
     def replay_scenario(self):
-        """이번 실행을 그대로 다시 돌리는 시나리오: 이벤트 = 적용된 이벤트(적용 시각으로, 콘솔 이벤트 포함) + 아직 안 된 시나리오 이벤트."""
+        """이번 실행을 그대로 다시 돌리는 시나리오: 이벤트 = 적용된 이벤트(적용 시각으로, 콘솔 이벤트 포함) + 아직 안 된 시나리오 이벤트.
+        실행 제어(일시정지, 종료)는 물리에 영향이 없으므로 빼고, 콘솔로 종료했으면 그 시각을 duration으로 한다."""
         scn = copy.deepcopy(self.scn)
-        applied = [{**{k: v for k, v in e.items() if k not in ("t", "applied_t")}, "t": round(e["applied_t"], 6)} for e in self.event_log]
-        pending = [dict(e) for e in self.events if e.get("source") != "dis"]
+        applied = [{**{k: v for k, v in e.items() if k not in ("t", "applied_t")}, "t": round(e["applied_t"], 6)}
+                   for e in self.event_log if e["action"] not in CONTROL_ACTIONS]
+        pending = [dict(e) for e in self.events if not e.get("source", "").startswith("dis") and e["action"] not in CONTROL_ACTIONS]
         scn["events"] = applied + pending
+        if self.stop_requested:            # 끝난 시각보다 반 주기 앞: 루프(while t < duration)가 같은 스텝에서 멈춘다 (부동소수점 비교)
+            scn["duration"] = round(self.data.time - 0.5 * self.decim * self.model.opt.timestep, 6)
         return scn
+
+    # ---- 고장 주입 (로봇 쪽 경계) ----
+    def _set_fault(self, name, duration, params):
+        assert name in FAULTS, name
+        self.faults[name] = {"until": None if duration is None else self.data.time + duration, "params": params}
+        if name == "imu_bias":
+            self.robot.sensors.set_fault(params.get("gyro_bias", (0, 0, 0)), params.get("attitude_offset_deg", (0, 0, 0)))
+        elif name == "battery_low":
+            self.robot.torque_scale = float(params.get("torque_scale", 0.6))
+        elif name == "link_loss":
+            self.link_queue.clear()             # 전송 중이던 명령도 잃는다
+            self.prev_state_t = None
+
+    def _clear_fault(self, name):
+        if self.faults.pop(name, None) is None:
+            return
+        if name == "imu_bias":
+            self.robot.sensors.clear_fault()
+        elif name == "battery_low":
+            self.robot.torque_scale = 1.0
+
+    def _expire_faults(self, verbose):
+        for name, f in list(self.faults.items()):
+            if f["until"] is not None and self.data.time >= f["until"] - 1e-9:
+                self._clear_fault(name)
+                self.last_event = (self.data.time, f"fault_cleared {name}")
+                if verbose:
+                    print(f"[t={self.data.time:6.2f}] fault cleared: {name}")
+
+    def fallback_cmd(self):
+        """명령이 오지 않을 때 로봇 쪽 동작: 마지막으로 받은 명령 유지 (처음이면 기본 자세).
+        link_loss의 robot_behavior=damp면 감쇠 모드 (위치 게인 0, 속도 게인만: 천천히 주저앉는다)."""
+        f = self.faults.get("link_loss")
+        if f and f["params"].get("robot_behavior") == "damp":
+            zeros = [0.0] * 12
+            return {"q_des": self.data.qpos[7:].tolist(), "dq_des": zeros, "kp": zeros, "kd": [5.0] * 12, "tau_ff": zeros}
+        return self.low_cmd if self.low_cmd is not None else self.hold_cmd()
 
     def feet_xy(self):
         return [self.data.geom_xpos[g][:2].copy() for g in self.foot_ids]
@@ -304,10 +374,12 @@ class Simulation:
         dt = self.decim * self.model.opt.timestep
         if self.dis is not None:
             self.dis.poll()                      # 콘솔 요청 -> events (적용 시각이 이 주기 이후면 예약)
+        self._expire_faults(verbose)
         self._apply_events(verbose)
         if self.dis is not None:
             self.dis.after_events()              # 적용된 요청에 Complete, 주기 보고
         if self.cosim is not None:
+            self.cosim.robot_xy = d.qpos[:2]      # 다음 Chrono 요청에 실림 (차량 양보 판단)
             self.cosim.sync(d.time)              # Chrono 결과 반영 (지형 원천 갱신 + 차량 포즈)
             dist = self.cosim.distance_to(d.qpos[:2])
             if dist < self.cosim.near_dist and not self.cosim.near_event_sent:
@@ -327,10 +399,13 @@ class Simulation:
 
         # 로봇 경계: 센서 측정 -> 보행 알고리즘 -> 관절 명령 -> 모터. 알고리즘은 참값을 모른다
         self.low_state = self.robot.read()
-        if self.remote is None:
+        if "link_loss" in self.faults:         # 제어 링크 두절: 상태가 알고리즘에 가지 않고 명령도 오지 않는다
+            self.low_cmd = self.fallback_cmd()
+        elif self.remote is None:
             self.link_queue.append(self.controller.step(self.low_state))
-            # ROS 배치와 같은 지연: 지연 주기만큼 쌓인 뒤부터 실행. 그 전에는 기본 자세 유지 (첫 명령 전 ROS와 같음)
-            self.low_cmd = self.link_queue.popleft() if len(self.link_queue) > self.link_latency else self.hold_cmd()
+            # ROS 배치와 같은 지연: 지연 주기만큼 쌓인 뒤부터 실행. 그 전에는 기본 자세 유지 (첫 명령 전 ROS와 같음),
+            # 링크가 복구된 직후에는 마지막 명령 유지
+            self.low_cmd = self.link_queue.popleft() if len(self.link_queue) > self.link_latency else self.fallback_cmd()
         else:                                  # 별도 노드: 상태를 보내고, 마지막으로 받은 명령을 실행 (실제 로봇처럼)
             prev = self.prev_state_t
             if prev is not None:               # 직전 상태의 명령을 한 주기까지 기다린다 (실시간보다 늦어진 동안에도 노드에 계산 시간)
@@ -339,13 +414,16 @@ class Simulation:
             self.remote.publish_low_state(self.low_state)
             self.remote.spin_some()
             # 직전 주기까지의 상태로 계산된 명령만 실행 (연결 지연 한 주기 고정). 노드가 늦으면 더 오래된 명령 -> 지연 MOP에 드러난다
-            self.low_cmd = (self.remote.cmd_until(prev) if prev is not None else None) or self.hold_cmd()
+            self.low_cmd = (self.remote.cmd_until(prev) if prev is not None else None) or self.fallback_cmd()
         energy = self.robot.apply(self.low_cmd)
         if self.cosim is not None and self.cosim.feet_enabled:
             # 발자국: 물리 스텝마다 평균한 발 수직력 참값 (흙에 걸리는 실제 하중)
             self.cosim.observe_feet(d.geom_xpos[self.foot_ids], self.robot.foot_force)
         roll, pitch = quat_to_roll_pitch(d.qpos[3:7])          # 넘어짐 판정용 참값 (시험 판정자 쪽)
         self.new_scans = self.sense() if self.sensor_renderer is not None else []
+        f = self.faults.get("lidar_blackout")
+        if f:                                  # 센서 고장: 점군이 나오지 않는다 (지정한 센서만, 없으면 전부)
+            self.new_scans = [n for n in self.new_scans if f["params"].get("sensor") not in (None, n)]
         if self.remote is None:                # 같은 프로세스: 점군(센서 좌표)과 시각만 알고리즘에 건넨다. 별도 노드는 ROS 토픽으로 받는다
             for name in self.new_scans:
                 self.controller.on_scan(name, self.scans[name]["t"], self.scans[name]["points"])
@@ -389,7 +467,8 @@ def run(args):
     if dis_port is not None:                 # DIS 시나리오 콘솔 (문서 §10): 콘솔 요청을 시나리오 이벤트로 받는다 (이 PC 안에서만)
         from .dis_server import DisScenarioServer
         out.mkdir(parents=True, exist_ok=True)
-        sim.dis = DisScenarioServer(sim, port=dis_port, log_path=out / "dis_events.jsonl")
+        sim.dis = DisScenarioServer(sim, port=dis_port, log_path=out / "dis_events.jsonl",
+                                    comm_lost_behavior=getattr(args, "dis_comm_lost", "STOP"))
         if not (args.realtime or args.view):
             args.realtime = True
             meta["mode"] = "realtime"
@@ -468,8 +547,27 @@ def run(args):
     was_paused = False
 
     interrupted = False
+    frozen_since, next_frozen_status = None, 0.0
     try:
         while d.time < scn["duration"]:
+            if sim.frozen:                      # 실행 제어 (DIS 콘솔): 일시정지. 콘솔 요청은 계속 받는다 (재개, 예약 등)
+                if frozen_since is None:
+                    frozen_since = time.perf_counter()
+                    print(f"[t={d.time:6.2f}] frozen (DIS)")
+                if sim.dis is not None:
+                    sim.dis.poll(); sim.dis.after_events()
+                if bridge and time.perf_counter() >= next_frozen_status:
+                    bridge.publish_status(build_status(sim, start_xy, energy_total, late))
+                    next_frozen_status = time.perf_counter() + 0.5
+                if any(p.poll() is not None for _, p in displays):
+                    break
+                time.sleep(0.02)
+                continue
+            if frozen_since is not None:        # 재개: 정지한 시간은 실시간 지연으로 세지 않는다
+                stopped = time.perf_counter() - frozen_since
+                wall0 += stopped; paused_total += stopped
+                frozen_since = None
+                print(f"[t={d.time:6.2f}] resumed (DIS)")
             if viewer:
                 if pause.paused and pause.step_requests == 0:
                     if not was_paused:
@@ -572,6 +670,9 @@ def run(args):
                 fell_at = d.time
                 print(f"[t={d.time:6.2f}] FALL detected")
                 break
+            if sim.stop_requested:
+                print(f"[t={d.time:6.2f}] stopped (DIS)")
+                break
 
     except KeyboardInterrupt:          # Ctrl+C: 지금까지의 기록과 MOP는 저장하고 정리
         interrupted = True
@@ -586,6 +687,7 @@ def run(args):
         "wall_time_s": round(wall, 3),
         "realtime_factor": round(d.time / wall, 2),
         "fell": fell_at is not None, "fell_at_s": fell_at, "interrupted": interrupted,
+        "stopped_by_console": sim.stop_requested,
         "distance_m": round(dist, 3),
         "forward_x_m": round(float(d.qpos[0] - start_xy[0]), 3),
         "lateral_drift_m": round(float(d.qpos[1] - start_xy[1]), 3),
@@ -669,6 +771,8 @@ def main():
     ap.add_argument("--dis-port", type=int, metavar="PORT",
                     help="DIS 시나리오 콘솔 요청을 받는다 (UDP 127.0.0.1, 보통 3000). 실시간으로 실행. 끝나면 scenario_replay.yaml")
     ap.add_argument("--dis-wait", action="store_true", help="--dis-port와 함께: 콘솔이 접속할 때까지 시작하지 않는다")
+    ap.add_argument("--dis-comm-lost", choices=["STOP", "CONTINUE"], default="STOP",
+                    help="콘솔이 모두 5초 넘게 조용하면(통신 두절): STOP = 로봇 이동 명령 0 (기본), CONTINUE = 그대로")
     ap.add_argument("--set", action="append", metavar="KEY=VALUE",
                     help="시나리오 값 바꾸기 (여러 번 가능). 예: --set chrono.scm.soil.bekker_kphi=2e7")
     args = ap.parse_args()

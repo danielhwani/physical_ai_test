@@ -137,10 +137,12 @@ def build_status(sim, start_xy, energy, late, final_mop=None):
         "feet": {n: {"pos": d.geom_xpos[g].tolist(), "contact": bool(c)}
                  for n, g, c in zip(FOOT_NAMES, sim.foot_ids, sim.foot_contacts())},
         "late_steps": late,
-        "vehicles": [] if sim.cosim is None or not sim.cosim.has_vehicle else [{
+        "vehicles": [] if sim.cosim is None or not sim.cosim.has_vehicle or not sim.cosim.vehicle_visible else [{
             "name": "hmmwv", "pos": sim.cosim.vehicle["pos"], "speed": sim.cosim.vehicle["speed"],
             "distance": float(np.linalg.norm(np.array(sim.cosim.vehicle["pos"][:2]) - d.qpos[:2]))}],
         "event": {"t": sim.last_event[0], "desc": sim.last_event[1]} if sim.last_event else None,
+        "faults": {n: (None if f["until"] is None else round(f["until"] - d.time, 2)) for n, f in getattr(sim, "faults", {}).items()},
+        "frozen": bool(getattr(sim, "frozen", False)),
         "final_mop": final_mop,
     }
 

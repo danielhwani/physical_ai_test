@@ -73,7 +73,12 @@ def status_lines(s):
     ev = s.get("event")
     if ev and s["t"] - ev["t"] < 3.0:
         lines.append(f"event@{ev['t']:.1f}s:{ev['desc']}")
-    return [ln.replace(" ", "_") for ln in lines], False
+    faults = s.get("faults") or {}
+    for name, left in faults.items():
+        lines.append(f"FAULT:{name}" + ("" if left is None else f"({left:.1f}s)"))
+    if s.get("frozen"):
+        lines.append("==FROZEN==")
+    return [ln.replace(" ", "_") for ln in lines], bool(faults) or bool(s.get("frozen"))
 
 
 class RvizAdapter(Node):

@@ -8,7 +8,10 @@
 
 요청/응답 (cosim/wire.py)
   {"cmd": "init", "config": {...}}            -> {"bodies": [...], "scm": {...}}
-  {"cmd": "advance", "t": T, "terrain": bool, "feet": [...]|null}
+  {"cmd": "advance", "t": T, "terrain": bool, "feet": [...]|null, "vehicle_cmd": {...}|null, "soil": {...}|null}
+      robot_xy: 로봇 몸통 위치 (vehicle.yield_to_robot이면 차 앞 진로에 로봇이 있는 동안 제동하고 기다린다)
+      vehicle_cmd: {"action": "start", "speed": m/s|null} 출발 (vehicle.t_start가 null이면 이 명령까지 제동하고 기다린다),
+                   {"action": "stop"} 제동. soil: SCM 흙 값 (이번 구간부터)
                                               -> {"t": T, "poses": [...], "vehicle": {...}|null, "feet": [...], "terrain": {...}|null}
   {"cmd": "close"}
 """
@@ -60,9 +63,7 @@ class ChronoServer:
 
         # SCM: 기준 평면 원점 = 영역 중심, 격자 간격 = MuJoCo 지형 해상도 (칸 단위 정합, 문서 §5.3)
         self.terrain = veh.SCMTerrain(self.sys)
-        sp = {k: float(v) for k, v in scm["soil"].items()}     # YAML은 1.0e6을 문자열로 읽으므로 숫자로 변환
-        self.terrain.SetSoilParameters(sp["bekker_kphi"], sp["bekker_kc"], sp["bekker_n"], sp["cohesion"],
-                                       sp["friction_deg"], sp["janosi_shear"], sp["elastic_k"], sp["damping_r"])
+        self.set_soil(scm["soil"])
         cx, cy = scm["center"]
         self.terrain.SetReferenceFrame(chrono.ChCoordsysd(chrono.ChVector3d(cx, cy, 0.0), chrono.QUNIT))
         self.delta = scm["resolution"]
@@ -75,6 +76,22 @@ class ChronoServer:
         return {"bodies": self.export_bodies() if self.car is not None else [],
                 "scm": {"center": [cx, cy], "size": scm["size"], "resolution": self.delta},
                 "feet": [f["name"] for f in self.feet]}
+
+    def set_soil(self, soil):
+        sp = {k: float(v) for k, v in soil.items()}     # YAML은 1.0e6을 문자열로 읽으므로 숫자로 변환
+        self.terrain.SetSoilParameters(sp["bekker_kphi"], sp["bekker_kc"], sp["bekker_n"], sp["cohesion"],
+                                       sp["friction_deg"], sp["janosi_shear"], sp["elastic_k"], sp["damping_r"])
+
+    def vehicle_command(self, cmd):
+        """DIS 콘솔 개체 투입/제거. 차량은 시작 때 만들어 둔다 (실행 중 생성은 Chrono SCM에서 비정상 침하·충돌 확인)."""
+        if self.car is None:
+            return
+        if cmd["action"] == "start":
+            self.t_start, self.stopped = self.sys.GetChTime(), False
+            if cmd.get("speed"):
+                self.driver.SetDesiredSpeed(float(cmd["speed"]))
+        elif cmd["action"] == "stop":
+            self.stopped = True
 
     def _init_vehicle(self, v):
         start, end = np.array(v["start"], float), np.array(v["end"], float)
@@ -100,8 +117,11 @@ class ChronoServer:
         self.driver.GetSteeringController().SetGains(0.8, 0, 0)
         self.driver.GetSpeedController().SetGains(0.4, 0, 0)
         self.driver.Initialize()
-        self.t_start, self.end, self.stopped = v.get("t_start", 0.0), end[:2], False
+        self.t_start, self.end, self.stopped = v.get("t_start", 0.0), end[:2], False   # t_start None: 출발 명령까지 대기
         self.direction = (end[:2] - start[:2]) / np.linalg.norm(end[:2] - start[:2])
+        # 양보: 차 앞 진로(앞 0~yield_ahead m, 옆 ±yield_half_width m)에 로봇이 있으면 제동 (로봇과 물리 작용이 없어 뚫고 지나가는 것을 막음)
+        self.yield_cfg = (v.get("yield_ahead", 9.0), v.get("yield_half_width", 1.8)) if v.get("yield_to_robot") else None
+        self.robot_xy, self.yielding = None, False
 
     def _init_feet(self, fc):
         """로봇 발 대리 물체: MuJoCo 발과 같은 반지름의 구. MuJoCo가 보낸 수직 하중으로 흙을 누른다.
@@ -193,14 +213,27 @@ class ChronoServer:
         p = self.car.GetVehicle().GetPos()
         if not self.stopped and np.dot([p.x - self.end[0], p.y - self.end[1]], self.direction) > 0:
             self.stopped = True
-        if t < self.t_start or self.stopped:
+        self.yielding = False
+        if self.yield_cfg and self.robot_xy is not None and not (self.t_start is None or t < self.t_start or self.stopped):
+            rel = np.asarray(self.robot_xy) - [p.x, p.y]
+            along = float(rel @ self.direction)
+            lateral = abs(float(rel[0] * self.direction[1] - rel[1] * self.direction[0]))
+            self.yielding = 0.0 < along < self.yield_cfg[0] and lateral < self.yield_cfg[1]
+        if self.t_start is None or t < self.t_start or self.stopped or self.yielding:
             di = veh.DriverInputs()
             di.m_throttle, di.m_steering, di.m_braking, di.m_clutch = 0.0, 0.0, 1.0, 0.0
             return di, False
         return self.driver.GetInputs(), True
 
-    def advance(self, t_target, want_terrain, feet=None):
-        """feet: 이번 구간 동안 쓸 로봇 발 목표 [{"pos": [x,y,z], "fn": N}, ...] (robot_feet 설정 시)."""
+    def advance(self, t_target, want_terrain, feet=None, vehicle_cmd=None, soil=None, robot_xy=None):
+        """feet: 이번 구간 동안 쓸 로봇 발 목표 [{"pos": [x,y,z], "fn": N}, ...] (robot_feet 설정 시).
+        vehicle_cmd, soil: DIS 콘솔 명령 (이번 구간 시작부터)."""
+        if robot_xy is not None:
+            self.robot_xy = robot_xy
+        if vehicle_cmd:
+            self.vehicle_command(vehicle_cmd)
+        if soil:
+            self.set_soil(soil)
         if feet:
             for f, tgt in zip(self.feet, feet):
                 f["target"] = tgt
@@ -230,7 +263,7 @@ class ChronoServer:
         vehicle = None
         if self.car is not None:
             v = self.car.GetVehicle()
-            vehicle = {"speed": v.GetSpeed(), "pos": vec(v.GetPos()), "stopped": self.stopped}
+            vehicle = {"speed": v.GetSpeed(), "pos": vec(v.GetPos()), "stopped": self.stopped, "yielding": self.yielding}
         return {"t": self.sys.GetChTime(), "poses": poses, "vehicle": vehicle,
                 "feet": [{"z": f["body"].GetPos().z, "loaded": not f["lifted"]} for f in self.feet],
                 "terrain": self.terrain_changes() if want_terrain else None}
@@ -263,7 +296,8 @@ def main():
         if msg["cmd"] == "init":
             reply = server.init(msg["config"])
         elif msg["cmd"] == "advance":
-            reply = server.advance(msg["t"], msg.get("terrain", False), msg.get("feet"))
+            reply = server.advance(msg["t"], msg.get("terrain", False), msg.get("feet"), msg.get("vehicle_cmd"), msg.get("soil"),
+                                   msg.get("robot_xy"))
         elif msg["cmd"] == "close":
             wire.send(sock, {"busy_s": busy})
             break

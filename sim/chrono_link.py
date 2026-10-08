@@ -43,6 +43,11 @@ class ChronoLink:
         self.terrain_every = max(1, round(cfg.get("terrain_dt", 0.2) / self.sync_dt))
         self.near_dist = cfg.get("near_distance", 3.0)
         self.has_vehicle = "vehicle" in cfg
+        # DIS 콘솔로 투입하는 차량: vehicle.t_start가 null이면 시작 때 만들어 출발점에 제동해 두고 숨긴다
+        # (화면·LiDAR에 안 보이고 근접 판정도 안 함). 투입 명령에 출발, 제거 명령에 제동하고 다시 숨긴다
+        self.vehicle_visible = self.has_vehicle and cfg["vehicle"].get("t_start", 0.0) is not None
+        self._next_cmds = {}           # 다음 요청에 실을 명령 (vehicle_cmd, soil)
+        self.robot_xy = None           # 러너가 제어 주기마다 넣는다. 요청에 실어 보낸다 (차량 양보 판단용, 시뮬레이션 시각 기준이라 결정적)
         self.feet_enabled = bool(cfg.get("robot_feet"))
         self._fn_sum, self._n_obs, self._feet_pos = np.zeros(4), 0, np.zeros((4, 3))
 
@@ -85,6 +90,10 @@ class ChronoLink:
     # ---- 동기 ----
     def _request(self, k):
         msg = {"cmd": "advance", "t": round(k * self.sync_dt, 9), "terrain": k % self.terrain_every == 0}
+        msg.update(self._next_cmds)
+        if self.robot_xy is not None:
+            msg["robot_xy"] = [round(float(v), 6) for v in self.robot_xy]
+        self._next_cmds = {}
         if self.feet_enabled and self._n_obs:
             # 지난 교환 이후 제어 주기들의 평균 수직 하중과 마지막 발 위치 (다음 구간 동안 Chrono가 사용)
             fn = self._fn_sum / self._n_obs
@@ -119,9 +128,21 @@ class ChronoLink:
             # SCM 노드 (i, j) = 기준 평면 원점에서 (i*δ, j*δ). 격자 행 = y, 열 = x
             self.terrain.set_cells(self.r0 + j, self.c0 + i, h)
 
+    # ---- DIS 콘솔: 개체 투입·제거, 흙 상태 (다음 교환 구간부터 적용, 시뮬레이션 시각 기준이라 결정적) ----
+    def spawn_vehicle(self, speed=None):
+        self.vehicle_visible = True
+        self._next_cmds["vehicle_cmd"] = {"action": "start", "speed": speed}
+
+    def remove_vehicle(self):
+        self.vehicle_visible = False
+        self._next_cmds["vehicle_cmd"] = {"action": "stop"}
+
+    def set_soil(self, soil):
+        self._next_cmds["soil"] = dict(soil)
+
     # ---- 로봇과의 관계 (물리 작용 없음, 논리 판정만) ----
     def distance_to(self, xy):
-        if not self.has_vehicle:
+        if not self.has_vehicle or not self.vehicle_visible:
             return np.inf
         d = float(np.linalg.norm(np.array(self.vehicle["pos"][:2]) - xy))
         self.min_dist = min(self.min_dist, d)
@@ -132,6 +153,9 @@ class ChronoLink:
         return [dict(b, physics_source="Chrono", entity="hmmwv") for b in self.bodies]
 
     def stream_poses(self):
+        """숨긴 차량은 땅속 깊이 둔다 (매니페스트는 그대로, 렌더러와 LiDAR에 보이지 않음)."""
+        if self.has_vehicle and not self.vehicle_visible:
+            return [(n, np.array([0.0, 0.0, -100.0]), q) for n, (p, q) in zip(self.names, self.poses)]
         return [(n, p, q) for n, (p, q) in zip(self.names, self.poses)]
 
     def close(self):

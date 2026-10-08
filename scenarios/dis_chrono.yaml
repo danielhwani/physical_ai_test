@@ -1,0 +1,46 @@
+# DIS 시나리오 콘솔 + Chrono (개체 투입, 흙 상태). 문서 §10.2
+#   python -m sim.runner scenarios/dis_chrono.yaml --dis-port 3000 --dis-wait --rviz
+#   python -m dis_console.console --sim 127.0.0.1:3000
+#   dis> spawn          HMMWV가 (5, -8)에서 나타나 x = 5 m 선을 따라 +y로 달린다 (로봇 진행 방향을 가로지름)
+#   dis> spawn ahead    로봇 앞 2.5 m 지점을 차가 먼저 지나가도록 시뮬레이터가 출발 시각을 맞춘다 (로봇이 걷는 중에)
+#   dis> soil soft      흙을 무르게 (이후 생기는 자국이 깊어짐)
+# 로봇은 원점에서 +x를 보고 선다. SCM 변형 지면은 x 3.5~6.5 m, y -9.5~9.5 m (그 밖은 MuJoCo 지형만)
+name: dis_chrono
+duration: 300.0
+seed: 2
+terrain:
+  size: [10.0, 10.0]
+  resolution: 0.05
+  z_range: [-0.3, 0.4]
+  patches: []
+controller:
+  type: trot
+  period: 0.36
+  swing_height: 0.08
+  stand_height: 0.27
+  perception: null     # 지형 인지: --set controller.perception.sensor=front_lidar
+events: []
+chrono:
+  sync_dt: 0.04
+  terrain_dt: 0.2
+  near_distance: 3.0
+  vehicle:
+    model: hmmwv
+    start: [5.0, -8.0]
+    end: [5.0, 8.0]
+    speed: 3.0
+    t_start: null        # 콘솔의 spawn(Event_CreateEntity)까지 출발점에 제동해 두고 숨긴다
+    yield_to_robot: true # 차 앞 진로(앞 9 m, 옆 ±1.8 m)에 로봇이 있으면 제동하고 기다린다 (뚫고 지나가지 않게)
+  scm:
+    center: [5.0, 0.0]
+    size: [3.0, 19.0]
+    resolution: 0.05
+    soil:                # firm (콘솔 soil 명령으로 바꿀 수 있음: hard / firm / soft / mud)
+      bekker_kphi: 5.0e6
+      bekker_kc: 0
+      bekker_n: 1.1
+      cohesion: 0
+      friction_deg: 30
+      janosi_shear: 0.01
+      elastic_k: 4.0e7
+      damping_r: 3.0e4

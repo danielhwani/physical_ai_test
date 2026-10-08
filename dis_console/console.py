@@ -34,6 +34,17 @@ HELP = """명령 (좌표는 세계 좌표 m: 원점 = 로봇 출발점, +x = 처
   ahead bump <앞> [왼쪽] [height] [radius]   로봇 기준 위치에 둔덕 (적용 시점의 로봇 위치를 예측해 세계 좌표로 보냄)
   ahead rut <앞> [width] [depth]           로봇 정면 <앞> m에 진행 방향을 가로지르는 바퀴 자국
   ahead ridge <앞> [width] [height]        로봇 정면 <앞> m에 진행 방향을 가로지르는 턱
+  fault lidar <초> [센서]         LiDAR 점군이 알고리즘에 오지 않음 (초 자리에 - 를 쓰면 clear까지)
+  fault link <초> [damp]         제어 링크 두절 (로봇은 마지막 명령 유지, damp면 감쇠 모드로 주저앉음)
+  fault imu <초> [gyro=gx,gy,gz] [att=롤,피치,방향]   IMU 각속도 편향(rad/s), 자세 출력 오프셋(도). 기본 방향 각속도 0.05
+  fault battery <초> [비율]      모터 토크 한계를 비율로 줄임 (기본 0.6)
+  clear <lidar|link|imu|battery> 고장 해제
+  spawn [속도]                   HMMWV 투입 (Chrono 시나리오에 선언한 경로로 바로 출발, 기본 속도는 시나리오 값)
+  spawn ahead [간격] [속도]      차가 로봇 앞 (간격, 기본 2.5) m 지점을 먼저 지나가도록 시뮬레이터가 출발 시각을 맞춤
+  despawn                        HMMWV 제거 (제동하고 숨김)
+  soil <hard|firm|soft|mud>      흙 상태 (Chrono SCM)
+  freeze / resume                일시정지 / 재개 (freeze는 @T 가능)
+  end                            시험 종료 (기록·MOP 저장, @T 가능)
   status                         마지막 주기 보고
   watch                          주기 보고 계속 표시 켜기/끄기
   help / quit"""
@@ -49,6 +60,7 @@ class Console:
         self.reqs, self.lock = {}, threading.Lock()
         self.report, self.report_rx, self.next_watch = None, None, 0.0
         self.watch, self.running = False, True
+        self.connected, self.hb_seq, self.next_hb, self.link_state = False, 0, 0.0, "OK"
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
@@ -90,6 +102,27 @@ class Console:
             except E.DecodeError:
                 pass
             self._timers()
+            self._link()
+
+    def _link(self):
+        """heartbeat 송신 (1 s)과 시뮬레이터 보고 끊김 판정 (STALE 3 s, LOST 5 s)."""
+        if not self.connected:
+            return
+        now = time.monotonic()
+        if now >= self.next_hb:
+            self.next_hb, self.hb_seq = now + P.HEARTBEAT_S, self.hb_seq + 1
+            hb = E.DataPdu(self.exercise_id, self.entity, P.SIM_ENTITY,
+                           P.payload(P.HEARTBEAT, {"seq": self.hb_seq, "link_state": self.link_state}))
+            try:
+                self.sock.send(E.encode(hb))
+            except ConnectionRefusedError:
+                pass
+        silent = now - (self.report_rx or now)
+        state = "LOST" if silent > P.CONSOLE_LOST_S else "STALE" if silent > P.CONSOLE_STALE_S else "OK"
+        if state != self.link_state:
+            self.link_state = state
+            self.out({"OK": "  링크 정상", "STALE": f"  정보 갱신 안 됨 ({silent:.0f} s)",
+                      "LOST": f"  통신 두절 ({silent:.0f} s): 시뮬레이터가 단절 시 동작을 실행했을 수 있음"}[state])
 
     def _handle(self, data):
         pdu = E.decode(data)
@@ -117,6 +150,8 @@ class Console:
             if result == "ACCEPTED" and "scheduled_t" in body:   # 먼 시각에 적용할 이벤트는 그만큼 더 기다린다
                 r["deadline"] = time.monotonic() + FINAL_TIMEOUT + max(0.0, body["scheduled_t"] - body.get("t_sim", 0.0))
             final = pdu.request_status in E.FINAL_STATUSES
+            if r["type"] == P.CONNECT and result == "COMPLETED":
+                self.connected, self.report_rx = True, time.monotonic()
         self.out(f"  [{pdu.request_id}] {r['type']}: {self.format_result(result, body)}")
         if final:
             r["final"].set()
@@ -133,6 +168,8 @@ class Console:
                             give_up.append((req_id, "응답 없음"))
                         else:
                             r["tries"] += 1; r["sent"] = now; resend.append(r["raw"])
+                elif self.report and self.report.get("frozen"):   # 일시정지 중: 시뮬레이션 시각이 멈춰 있으니 기다린다
+                    r["deadline"] = max(r["deadline"], now + FINAL_TIMEOUT)
                 elif now > r["deadline"]:
                     give_up.append((req_id, "최종 응답 시간 초과"))
                 elif now - max(r["last_rx"], r["sent"]) > POLL_S:   # Pending 뒤 조용함: 같은 Request ID로 상태 재질의
@@ -166,6 +203,8 @@ class Console:
     # ---- 표시 ----
     @staticmethod
     def format_result(result, body):
+        if result == "ACCEPTED" and body.get("timing") == "cross_ahead":
+            return f"접수, 로봇 앞을 지나가도록 t={body['scheduled_t']:.2f}쯤 출발 예정 ({body.get('detail', '')})"
         if result == "ACCEPTED":
             return f"접수, t={body['scheduled_t']:.2f}에 적용 예정 (지금 t={body['t_sim']:.2f})"
         if result == "COMPLETED":
@@ -188,8 +227,21 @@ class Console:
         if r is None:
             return "  주기 보고 없음 (접속 전이거나 시뮬레이터가 멈춤)"
         rb, c = r["robot"], r["command"]
-        return (f"  t={r['t_sim']:.1f}/{r['duration']} s  로봇 x={rb['x']:.2f} y={rb['y']:.2f} 방향 {rb['yaw_deg']:.0f}°  "
+        text = (f"  t={r['t_sim']:.1f}/{r['duration']} s  로봇 x={rb['x']:.2f} y={rb['y']:.2f} 방향 {rb['yaw_deg']:.0f}°  "
                 f"명령 vx={c['vx']:.2f} yaw={c['yaw_rate']:.2f}  마지막 이벤트: {r['last_event']}")
+        faults = r.get("faults") or {}
+        if faults:
+            text += "  고장: " + ", ".join(n + ("" if left is None else f"({left:.1f} s)") for n, left in faults.items())
+        for v in r.get("vehicles") or []:
+            text += f"  {v['type']} x={v['x']:.1f} y={v['y']:.1f} {v['speed']:.1f} m/s"
+        if r.get("frozen"):
+            text += "  [일시정지]"
+        if r.get("comm_state", "OK") != "OK":
+            text += f"  [시뮬레이터 쪽 링크 {r['comm_state']}]"
+        return text
+
+
+FAULT_ALIASES = {"lidar": "lidar_blackout", "link": "link_loss", "imu": "imu_bias", "battery": "battery_low"}
 
 
 def parse_command(line, pose=None):
@@ -226,6 +278,46 @@ def parse_command(line, pose=None):
         kind = P.ADD_PATCH
     elif op == "patch":
         body, kind = {"patch": json.loads(rest)}, P.ADD_PATCH
+    elif op == "fault":
+        name = FAULT_ALIASES.get(a[0], a[0])
+        dur = None if a[1] == "-" else float(a[1])
+        opts = a[2:]
+        params = {}
+        if name == "lidar_blackout" and opts:
+            params["sensor"] = opts[0]
+        elif name == "link_loss" and opts:
+            params["robot_behavior"] = "damp" if opts[0] == "damp" else opts[0]
+        elif name == "imu_bias":
+            params = {"gyro_bias": [0.0, 0.0, 0.05], "attitude_offset_deg": [0.0, 0.0, 0.0]}
+            for o in opts:
+                key, _, val = o.partition("=")
+                vals = [float(v) for v in val.split(",")]
+                if key == "gyro":
+                    params["gyro_bias"] = vals
+                elif key == "att":
+                    params["attitude_offset_deg"] = vals
+                    if "gyro=" not in rest:
+                        params["gyro_bias"] = [0.0, 0.0, 0.0]
+                else:
+                    raise ValueError(f"imu 옵션은 gyro=, att= : {o}")
+        elif name == "battery_low" and opts:
+            params["torque_scale"] = float(opts[0])
+        body, kind = {"fault": name, "duration": dur, "params": params}, P.INJECT_FAULT
+    elif op == "clear":
+        body, kind = {"fault": FAULT_ALIASES.get(a[0], a[0])}, P.CLEAR_FAULT
+    elif op == "spawn":
+        if a and a[0] == "ahead":
+            body = {"entity_type": "HMMWV", "cross_ahead": float(a[1]) if len(a) > 1 else 2.5,
+                    **({"speed": float(a[2])} if len(a) > 2 else {})}
+        else:
+            body = {"entity_type": "HMMWV", **({"speed": float(a[0])} if a else {})}
+        kind = P.CREATE_ENTITY
+    elif op == "despawn":
+        body, kind = {"entity_type": "HMMWV"}, P.REMOVE_ENTITY
+    elif op == "soil":
+        body, kind = {"preset": a[0]}, P.SET_SOIL
+    elif op in ("freeze", "resume", "end"):
+        body, kind = {}, {"freeze": P.FREEZE, "resume": P.RESUME, "end": P.STOP}[op]
     elif op == "ahead":
         if pose is None:
             raise ValueError("ahead는 콘솔 접속 후에만 쓸 수 있다")

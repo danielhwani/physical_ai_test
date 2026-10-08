@@ -18,6 +18,7 @@ class RobotIO:
         self.accel_adr = m.sensor_adr[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SENSOR, "imu_accel")]
         self.torque_limit = np.array(sim.spec["action"]["torque_limit"], dtype=float)
         self.foot_force = np.zeros(4)
+        self.torque_scale = 1.0          # 고장 주입 battery_low: 토크 한계 비율
 
     def read(self):
         """로봇 상태 메시지 (지금 시각의 측정값)."""
@@ -33,7 +34,8 @@ class RobotIO:
         energy, fn = 0.0, np.zeros(4)
         for _ in range(sim.decim):
             tau = kp * (q_des - d.qpos[7:]) + kd * (dq_des - d.qvel[6:]) + tau_ff
-            d.ctrl[:] = np.clip(tau, -self.torque_limit, self.torque_limit)
+            limit = self.torque_limit * self.torque_scale
+            d.ctrl[:] = np.clip(tau, -limit, limit)
             mujoco.mj_step(sim.model, d)
             energy += np.abs(d.ctrl * d.qvel[6:]).sum() * sim.model.opt.timestep
             fn += sim.foot_normal_forces()

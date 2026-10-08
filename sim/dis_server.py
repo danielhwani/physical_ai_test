@@ -7,7 +7,10 @@
   - 승인되지 않은 Exercise ID, 다른 수신자 앞 PDU는 응답 없이 버린다
   - (콘솔 Entity ID, Request ID)로 처리한 요청을 기억해 중복이면 다시 넣지 않고 마지막 응답만 다시 보낸다
   - 받으면 ACCEPTED(Pending, 적용 예정 시각), 적용되면 COMPLETED(Complete, 적용 시각)
-  - 기록: <실행 폴더>/dis_events.jsonl (요청과 결과)
+  - 고장 주입·해제, 시험 종료, 일시정지는 이벤트로 넣는다 (일시정지·종료는 다시 실행할 시나리오에서 빠진다). 재개는 바로 처리한다
+  - 링크 감시: 접속한 콘솔 모두에게서 comm_lost_s 동안 아무것도 오지 않으면 통신 두절. 단절 시 동작 STOP이면
+    로봇 이동 명령 0을 이벤트로 넣는다 (source: dis_comm_lost, 기록되므로 다시 실행해도 같다). 다시 받으면 OK로 되돌린다
+  - 기록: <실행 폴더>/dis_events.jsonl (요청과 결과, 링크 상태 변화)
 """
 import bisect
 import json
@@ -24,8 +27,14 @@ RETAIN_S = 60.0          # 끝난 요청 기억 시간 (벽시계 s)
 
 
 class DisScenarioServer:
-    def __init__(self, sim, port=P.DEFAULT_PORT, host="127.0.0.1", exercise_id=P.EXERCISE_ID, log_path=None):
+    def __init__(self, sim, port=P.DEFAULT_PORT, host="127.0.0.1", exercise_id=P.EXERCISE_ID, log_path=None,
+                 comm_lost_s=P.COMM_LOST_S, comm_lost_behavior="STOP"):
+        assert comm_lost_behavior in ("STOP", "CONTINUE")
         self.sim, self.exercise_id = sim, exercise_id
+        self.comm_lost_s, self.comm_lost_behavior = comm_lost_s, comm_lost_behavior
+        self.last_rx = {}        # 콘솔 -> 마지막으로 무엇이든 받은 벽시계 시각
+        self.timed = {}          # (콘솔, Request ID) -> 출발 시각을 기다리는 투입 {gap, speed}
+        self.comm_state = "OK"
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((host, port))
         self.sock.setblocking(False)
@@ -62,9 +71,29 @@ class DisScenarioServer:
                 if e["action"] == "add_patch":           # 적용 순간 로봇 기준 위치 (앞 +, 왼쪽 +). 로봇이 이미 지나간 곳인지 콘솔이 알린다
                     body["robot_rel"] = self.robot_relative(e["patch"])
                 self._respond(h, orig, req_id, "COMPLETED", body, final=True)
+        self._check_timed()
+        self._check_link()
         if self.consoles and time.monotonic() >= self.next_report:
             self.next_report = time.monotonic() + REPORT_DT
             self._report()
+
+    def _check_link(self):
+        if not self.consoles:
+            return
+        silent = time.monotonic() - max(self.last_rx.get(c, 0.0) for c in self.consoles)
+        if self.comm_state == "OK" and silent > self.comm_lost_s:
+            self.comm_state = "LOST"
+            sim = self.sim
+            stop = self.comm_lost_behavior == "STOP"
+            print(f"[t={sim.data.time:6.2f}] DIS 통신 두절 ({silent:.1f} s 무응답) -> 단절 시 동작 {self.comm_lost_behavior}")
+            self._write({"comm_state": "LOST", "silent_s": round(silent, 2), "behavior": self.comm_lost_behavior})
+            if stop and sim.command != (0.0, 0.0):          # 로봇을 세운다: 다른 이벤트처럼 넣어 기록·재현되게
+                event = {"action": "set_command", "vx": 0.0, "yaw_rate": 0.0, "t": sim.data.time, "source": "dis_comm_lost"}
+                sim.events.insert(bisect.bisect_right([e["t"] for e in sim.events], event["t"]), event)
+        elif self.comm_state == "LOST" and silent <= self.comm_lost_s:
+            self.comm_state = "OK"
+            print(f"[t={self.sim.data.time:6.2f}] DIS 링크 복구 (명령은 자동으로 되돌리지 않는다)")
+            self._write({"comm_state": "OK"})
 
     # ---- 요청 처리 ----
     def _handle(self, data, addr):
@@ -73,9 +102,11 @@ class DisScenarioServer:
         except E.DecodeError as e:
             self._write({"from": f"{addr[0]}:{addr[1]}", "error": f"decode: {e}"})
             return
-        if pdu is None or pdu.exercise_id != self.exercise_id or not isinstance(pdu, E.ActionRequestR):
-            return                                   # 다른 훈련, 모르는 PDU, 콘솔 heartbeat 등은 무시
-        if not pdu.receiving.matches(P.SIM_ENTITY):
+        if pdu is None or pdu.exercise_id != self.exercise_id or not pdu.receiving.matches(P.SIM_ENTITY):
+            return                                   # 다른 훈련, 모르는 PDU, 다른 수신자 앞은 무시
+        if pdu.originating in self.consoles:         # 접속한 콘솔에서 온 것은 무엇이든 생존 신호 (heartbeat, 요청, 재전송)
+            self.last_rx[pdu.originating] = time.monotonic()
+        if not isinstance(pdu, E.ActionRequestR):
             return
         key = (pdu.originating, pdu.request_id)
         if key in self.handled:                      # 중복 (재전송, 상태 재질의): 다시 실행하지 않고 마지막 응답
@@ -90,12 +121,35 @@ class DisScenarioServer:
             return self._reject(h, key, "UNSUPPORTED", "UNSUPPORTED_MESSAGE")
         if p.type == P.CONNECT:
             self.consoles[pdu.originating] = addr
+            self.last_rx[pdu.originating] = time.monotonic()
             self.next_report = 0.0
             info = {"scenario": self.sim.scn["name"], "t_sim": round(self.sim.data.time, 6),
-                    "duration": self.sim.scn["duration"], "mode": "virtual", "supported": P.SUPPORTED}
+                    "duration": self.sim.scn["duration"], "mode": "virtual", "supported": P.SUPPORTED,
+                    "comm_lost_s": self.comm_lost_s, "comm_lost_behavior": self.comm_lost_behavior}
             return self._respond(h, *key, "COMPLETED", info, final=True)
         if pdu.originating not in self.consoles:
             return self._reject(h, key, "DENIED", "NOT_CONNECTED")
+        if p.type == P.RESUME:                       # 재개는 바로 (일시정지 중에는 시뮬레이션 시각이 멈춰 이벤트로 넣을 수 없다)
+            if not self.sim.frozen:
+                return self._reject(h, key, "DENIED", "NOT_FROZEN")
+            self.sim.frozen = False
+            self.sim.last_event = (self.sim.data.time, "resume")
+            return self._respond(h, *key, "COMPLETED", {"applied_t": round(self.sim.data.time, 6)}, final=True)
+        if p.type == P.CLEAR_FAULT and p.body.get("fault") not in self.sim.faults and not any(
+                e["action"] == "inject_fault" and e["fault"] == p.body.get("fault") for e in self.sim.events):
+            return self._reject(h, key, "DENIED", "FAULT_NOT_ACTIVE")
+        cosim = self.sim.cosim
+        if p.type in (P.CREATE_ENTITY, P.REMOVE_ENTITY, P.SET_SOIL) and cosim is None:
+            return self._reject(h, key, "DENIED", "NO_CHRONO", "개체·흙은 Chrono 시나리오에서만 (예: scenarios/dis_chrono.yaml)")
+        if p.type in (P.CREATE_ENTITY, P.REMOVE_ENTITY):
+            if not cosim.has_vehicle:
+                return self._reject(h, key, "DENIED", "NO_ENTITY_SLOT", "시나리오 chrono.vehicle이 없다")
+            if p.type == P.CREATE_ENTITY and cosim.vehicle_visible:
+                return self._reject(h, key, "DENIED", "ENTITY_ACTIVE")
+            if p.type == P.REMOVE_ENTITY and not cosim.vehicle_visible:
+                return self._reject(h, key, "DENIED", "ENTITY_NOT_ACTIVE")
+        if p.type == P.CREATE_ENTITY and p.body.get("cross_ahead") is not None:
+            return self._accept_timed(h, key, p.body, pdu)
         try:
             event = self._to_event(p)
         except (KeyError, TypeError, ValueError) as e:
@@ -109,6 +163,61 @@ class DisScenarioServer:
         events.insert(bisect.bisect_right([e["t"] for e in events], t), event)
         h["event"] = event
         self._respond(h, *key, "ACCEPTED", {"scheduled_t": round(t, 6)})
+
+    # ---- 개체 투입 시각 맞추기 (cross_ahead): 차가 로봇 진행선의 로봇 앞 gap m 지점을 로봇보다 먼저 지나가게 ----
+    LEAD = 0.3            # 차 꼬리가 지나간 뒤 로봇이 그 지점에 오기까지 여유 (s)
+    CLEAR = 3.0           # 교차점을 완전히 지나기까지 더 갈 거리 = HMMWV 반 길이 2.4 m + 0.6 m
+
+    def _crossing(self, gap, speed):
+        """(로봇이 gap 지점에 오기까지 남은 시간 - 차가 교차점을 다 지나는 데 걸리는 시간, 설명). 교차가 없으면 (None, 이유)."""
+        sim = self.sim
+        v = sim.cosim.cfg["vehicle"]
+        s, e = np.asarray(v["start"], float), np.asarray(v["end"], float)
+        u = (e - s) / np.linalg.norm(e - s)
+        x, y, yaw = self.robot_pose()
+        hd = np.array([np.cos(yaw), np.sin(yaw)])
+        A = np.column_stack([hd, -u])
+        if abs(np.linalg.det(A)) < 0.2:
+            return None, "로봇 진행 방향이 차량 경로와 거의 나란하다"
+        a, b = np.linalg.solve(A, s - [x, y])          # 로봇 -> 교차점 거리 a, 차량 출발점 -> 교차점 거리 b
+        if a < 0 or not 0 <= b <= np.linalg.norm(e - s):
+            return None, "로봇 진행선이 차량 경로와 앞에서 만나지 않는다"
+        vel = speed or v["speed"]
+        t_vehicle = (b + self.CLEAR) / (0.95 * vel) + 0.15 + 0.08 * vel     # 이 PC 측정: 목표 속도의 95%, 출발 지연
+        v_robot = max(sim.command[0], 0.0)
+        if v_robot < 0.05:                               # 로봇이 서 있음: gap보다 멀면 언제든 앞을 지난다
+            return (np.inf if a > gap else -np.inf), f"로봇 정지, 교차점까지 {a:.1f} m"
+        return (a - gap) / v_robot - t_vehicle, f"교차점까지 {a:.1f} m, 차량 {t_vehicle:.1f} s"
+
+    def _accept_timed(self, h, key, body, pdu):
+        cosim = self.sim.cosim
+        gap = float(body["cross_ahead"])
+        speed = None if body.get("speed") is None else float(body["speed"])
+        if not 0.5 <= gap <= 10.0 or (speed is not None and not 0 < speed <= 15.0):
+            return self._reject(h, key, "FAILED", "INVALID_VALUE", "cross_ahead 0.5~10 m, speed 0~15 m/s")
+        slack, why = self._crossing(gap, speed)
+        if slack is None:
+            return self._reject(h, key, "DENIED", "NO_CROSSING", why)
+        if slack < 0:
+            return self._reject(h, key, "DENIED", "TOO_LATE", f"로봇이 너무 가깝다 ({why})")
+        self.timed[key] = {"gap": gap, "speed": speed, "request": f"{pdu.originating}#{pdu.request_id}"}
+        wait = 0.0 if np.isinf(slack) else max(0.0, slack - self.LEAD)
+        self._respond(h, *key, "ACCEPTED", {"scheduled_t": round(self.sim.data.time + wait, 6), "timing": "cross_ahead",
+                                           "detail": why})
+
+    def _check_timed(self):
+        for key, w in list(self.timed.items()):
+            h = self.handled[key]
+            slack, why = self._crossing(w["gap"], w["speed"])
+            if slack is None or slack < 0:              # 기다리는 동안 로봇이 방향을 바꾸거나 너무 가까워짐
+                del self.timed[key]
+                self._reject(h, key, "FAILED", "TOO_LATE" if slack is not None else "NO_CROSSING", why)
+            elif slack <= self.LEAD or np.isinf(slack):  # 지금 출발하면 꼬리가 LEAD초 여유로 로봇 앞을 지나간다
+                del self.timed[key]
+                event = {"action": "create_entity", "entity_type": "HMMWV", "speed": w["speed"], "t": self.sim.data.time,
+                         "source": "dis", "request": w["request"]}
+                self.sim.events.insert(bisect.bisect_right([e["t"] for e in self.sim.events], event["t"]), event)
+                h["event"] = event
 
     def robot_pose(self):
         """로봇 몸통 위치와 방향 (시험 판정자 쪽 참값): x, y, yaw(rad)."""
@@ -136,6 +245,53 @@ class DisScenarioServer:
     @staticmethod
     def _to_event(p):
         b = p.body
+        if p.type in (P.CREATE_ENTITY, P.REMOVE_ENTITY):
+            etype = str(b.get("entity_type", "HMMWV")).upper()
+            if etype not in P.ENTITY_TYPES:
+                raise ValueError(f"모르는 개체: {etype} (지원: {', '.join(P.ENTITY_TYPES)})")
+            if p.type == P.REMOVE_ENTITY:
+                return {"action": "remove_entity", "entity_type": etype}
+            speed = b.get("speed")
+            if speed is not None and not 0 < float(speed) <= 15.0:
+                raise ValueError("speed는 0 < v <= 15 m/s")
+            return {"action": "create_entity", "entity_type": etype, "speed": None if speed is None else float(speed)}
+        if p.type == P.SET_SOIL:
+            if "preset" in b:
+                if b["preset"] not in P.SOIL_PRESETS:
+                    raise ValueError(f"preset: {', '.join(P.SOIL_PRESETS)}")
+                return {"action": "set_soil", "preset": b["preset"], "soil": dict(P.SOIL_PRESETS[b["preset"]])}
+            soil = {k: float(v) for k, v in b["soil"].items()}
+            missing = [k for k in P.SOIL_KEYS if k not in soil]
+            if missing:
+                raise ValueError(f"soil에 없는 값: {missing}")
+            if soil["bekker_kphi"] <= 0:
+                raise ValueError("bekker_kphi > 0")
+            return {"action": "set_soil", "soil": soil}
+        if p.type in (P.FREEZE, P.STOP):
+            return {"action": "freeze" if p.type == P.FREEZE else "stop"}
+        if p.type in (P.INJECT_FAULT, P.CLEAR_FAULT):
+            fault = b["fault"]
+            if fault not in P.FAULTS:
+                raise ValueError(f"모르는 고장: {fault} (지원: {', '.join(P.FAULTS)})")
+            if p.type == P.CLEAR_FAULT:
+                return {"action": "clear_fault", "fault": fault}
+            dur = b.get("duration")
+            if dur is not None and not 0 < float(dur) <= P.MAX_FAULT_S:
+                raise ValueError(f"duration은 0 < d <= {P.MAX_FAULT_S:g} s")
+            params = dict(b.get("params") or {})
+            if fault == "link_loss" and params.get("robot_behavior", "hold_last") not in ("hold_last", "damp"):
+                raise ValueError("robot_behavior: hold_last 또는 damp")
+            if fault == "imu_bias":
+                g = [float(v) for v in params.get("gyro_bias", (0, 0, 0))]
+                a = [float(v) for v in params.get("attitude_offset_deg", (0, 0, 0))]
+                if len(g) != 3 or len(a) != 3 or max(map(abs, g)) > 1.0 or max(map(abs, a)) > 30.0:
+                    raise ValueError("gyro_bias 3개 (|값| <= 1 rad/s), attitude_offset_deg 3개 (|값| <= 30도)")
+                params = {"gyro_bias": g, "attitude_offset_deg": a}
+            if fault == "battery_low":
+                params["torque_scale"] = float(params.get("torque_scale", 0.6))
+                if not 0.1 <= params["torque_scale"] <= 1.0:
+                    raise ValueError("torque_scale은 0.1 ~ 1.0")
+            return {"action": "inject_fault", "fault": fault, "duration": None if dur is None else float(dur), "params": params}
         if p.type == P.SET_COMMAND:
             vx, wz = float(b["vx"]), float(b.get("yaw_rate", 0.0))
             if not (abs(vx) <= P.MAX_VX and abs(wz) <= P.MAX_YAW_RATE):
@@ -168,7 +324,12 @@ class DisScenarioServer:
         body = {"t_sim": round(d.time, 3), "duration": sim.scn["duration"],
                 "robot": {"x": round(x, 3), "y": round(y, 3), "yaw_deg": round(float(np.degrees(yaw)), 1)},
                 "command": {"vx": sim.command[0], "yaw_rate": sim.command[1]},
-                "last_event": sim.last_event[1] if sim.last_event else None}
+                "last_event": sim.last_event[1] if sim.last_event else None,
+                "faults": {n: (None if f["until"] is None else round(f["until"] - d.time, 2)) for n, f in sim.faults.items()},
+                "frozen": sim.frozen, "comm_state": self.comm_state,
+                "vehicles": [] if sim.cosim is None or not sim.cosim.vehicle_visible else [
+                    {"type": "HMMWV", "x": round(sim.cosim.vehicle["pos"][0], 2), "y": round(sim.cosim.vehicle["pos"][1], 2),
+                     "speed": round(sim.cosim.vehicle["speed"], 2)}]}
         for ent, addr in self.consoles.items():
             pdu = E.DataPdu(self.exercise_id, P.SIM_ENTITY, ent, P.payload(P.REPORT, body))
             self.sock.sendto(E.encode(pdu), addr)

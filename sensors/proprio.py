@@ -48,6 +48,15 @@ class ProprioSensors:
         self.accel_bias = rng.normal(0, spec.accel_bias, 3)
         self.yaw_drift = np.radians(rng.normal(0, spec.yaw_drift_deg_s))   # rad/s
         self.n = 0
+        self.clear_fault()
+
+    def set_fault(self, gyro_bias=(0, 0, 0), attitude_offset_deg=(0, 0, 0)):
+        """고장 주입 (DIS 콘솔): 자이로 편향 추가(rad/s), AHRS 자세 출력 오프셋(롤, 피치, 방향, 도)."""
+        self.fault_gyro = np.asarray(gyro_bias, dtype=float)
+        self.fault_att = np.radians(np.asarray(attitude_offset_deg, dtype=float))
+
+    def clear_fault(self):
+        self.set_fault()
 
     def measure(self, t, quat_wxyz, gyro, accel, q, dq, foot_force):
         """참값 -> 측정값 (로봇 상태 메시지의 내용). 쿼터니언 출력은 x, y, z, w (ROS 규약)."""
@@ -55,7 +64,8 @@ class ProprioSensors:
         rng = np.random.default_rng((s.seed, self.n))
         self.n += 1
         att = np.radians(s.attitude_noise_deg)
-        err = quat_from_rpy(rng.normal(0, att), rng.normal(0, att), self.yaw_drift * t)   # 월드 기준 오차 회전
+        fr, fp, fy = self.fault_att
+        err = quat_from_rpy(rng.normal(0, att) + fr, rng.normal(0, att) + fp, self.yaw_drift * t + fy)   # 월드 기준 오차 회전
         qm = quat_mul(err, np.asarray(quat_wxyz, dtype=float))
         qm /= np.linalg.norm(qm)
         return {
@@ -63,7 +73,7 @@ class ProprioSensors:
             "q": (np.asarray(q) + rng.normal(0, s.joint_pos_noise, 12)).tolist(),
             "dq": (np.asarray(dq) + rng.normal(0, s.joint_vel_noise, 12)).tolist(),
             "imu": {"quat": [qm[1], qm[2], qm[3], qm[0]],
-                    "gyro": (np.asarray(gyro) + self.gyro_bias + rng.normal(0, s.gyro_noise, 3)).tolist(),
+                    "gyro": (np.asarray(gyro) + self.gyro_bias + rng.normal(0, s.gyro_noise, 3) + self.fault_gyro).tolist(),
                     "accel": (np.asarray(accel) + self.accel_bias + rng.normal(0, s.accel_noise, 3)).tolist()},
             "foot_force": np.maximum(np.asarray(foot_force) + rng.normal(0, s.foot_force_noise, 4), 0.0).tolist(),
         }

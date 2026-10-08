@@ -36,7 +36,7 @@ python conformance/test_control.py                       # 로봇 경계: 알고
 python conformance/test_lidar.py                         # LiDAR: 스트림만으로 재현, 지형 표면, 자기 몸 제외
 python conformance/test_perception.py                    # 지형 인지: 높이 지도, 디딜 곳, LiDAR 지도 정확도, 점군만으로 재현, height_scan 규약
 python conformance/test_ros_equivalence.py               # ROS 노드 = 같은 프로세스(20 ms 지연 흉내) (ROS2 필요)
-python conformance/test_dis_console.py                   # DIS 콘솔: 봉투, 핸드셰이크(중복·거부), 콘솔 이벤트 기록으로 비트 단위 재실행
+python conformance/test_dis_console.py                   # DIS 콘솔: 핸드셰이크, 고장 주입, 실행 제어, 링크 감시, HMMWV 투입·흙(Chrono), 기록으로 비트 단위 재실행
 python conformance/test_render_stream.py                 # 렌더 스트림 계약 (스트림만으로 장면 재구성 = 시뮬레이터)
 python conformance/compare_variants.py [--policy card.yaml]   # cpu vs mjx 설정의 MOP 분포 비교
 python conformance/make_obs_reference.py                 # (관측 명세를 바꾼 경우) 기준 벡터 재생성
@@ -407,9 +407,9 @@ python -m sim.sweep scenarios/footprints.yaml --param chrono.scm.soil.bekker_kph
 작업자 하나가 약 0.55 GB를 쓰므로 `--workers 3`(기본값)을 권장한다.
 에피소드마다 메모리가 약 100 MB씩 쌓이던 누수는 에피소드마다 `gc.collect()`, 작업자를 10 에피소드마다 새로 띄우기(`maxtasksperchild`)로 막았다.
 
-## DIS 시나리오 콘솔 (문서 §10, 가장 기본 구성)
+## DIS 시나리오 콘솔 (문서 §10)
 
-실행 중인 시뮬레이터에 운용자가 이벤트(로봇 이동 명령, 지형 변경)를 넣는 콘솔이다.
+실행 중인 시뮬레이터에 운용자가 이벤트(로봇 이동 명령, 지형 변경, 고장 주입, 개체 투입, 흙 상태, 실행 제어)를 넣는 콘솔이다.
 봉투와 핸드셰이크는 [DIS_test](https://github.com/danielhwani/DIS_test)(SIMAN-R 프로토타입)의 것을 그대로 쓴다.
 
 ```bash
@@ -425,6 +425,13 @@ dis> ahead rut 1.5       # 로봇 정면 1.5 m에 진행 방향을 가로지르�
 dis> cmd 0.3 0.5         # 전진하며 왼쪽으로 회전
 dis> status              # 마지막 주기 보고 (시각, 로봇 위치·방향, 명령, 마지막 이벤트). watch: 1초마다 계속 표시
 dis> stop
+dis> fault lidar 5       # 5초 동안 LiDAR 점군이 알고리즘에 오지 않음 (link / imu / battery, clear로 해제)
+dis> freeze              # 일시정지 (resume로 재개), end: 시험 종료
+# Chrono 시나리오: 숨겨 둔 HMMWV 투입, 흙 상태
+python -m sim.runner scenarios/dis_chrono.yaml --dis-port 3000 --dis-wait --rviz
+dis> cmd 0.35
+dis> spawn ahead         # 차가 로봇 앞 2.5 m 지점을 먼저 지나가도록 시뮬레이터가 출발 시각을 맞춤 (spawn 4: 바로 4 m/s로 출발)
+dis> soil soft           # 흙을 무르게 (hard / firm / soft / mud)
 # 명령을 차례로 보내고 끝내기 (각각 완료까지 기다림)
 python -m dis_console.console --send "cmd 0.35" --send "rut 3.0 @12"
 ```
@@ -449,7 +456,72 @@ python -m dis_console.console --send "cmd 0.35" --send "rut 3.0 @12"
 | `Request_Connection` | – | 접속. 주기 보고를 받기 시작 |
 | `Event_SetCommand` | `vx`, `yaw_rate`, (`t_apply`) | 로봇 운용자 이동 명령 (가상 모드 전용. 범위 \|vx\| ≤ 1, \|yaw_rate\| ≤ 1.5) |
 | `Event_AddTerrainPatch` | `patch`, (`t_apply`) | 지형 변경: bump / rough / ramp / rut (시나리오 `patches`와 같은 형식). Complete에 `robot_rel` |
-| `Report_SimStatus` (Data PDU, 0.2 s) | – | 시뮬레이션 시각, 로봇 위치·방향(시험 판정자 쪽 참값), 명령, 마지막 이벤트 |
+| `Event_InjectFault` | `fault`, `duration`(없으면 해제까지), `params`, (`t_apply`) | 고장 주입 (아래 표) |
+| `Event_ClearFault` | `fault`, (`t_apply`) | 고장 해제. 걸려 있지 않으면 거부 `FAULT_NOT_ACTIVE` |
+| `Event_CreateEntity` | `entity_type`(HMMWV), `speed`, `cross_ahead`, (`t_apply`) | 개체 투입 (Chrono 시나리오, 아래 설명). `cross_ahead`: 로봇 앞을 지나가도록 출발 시각 자동 |
+| `Event_RemoveEntity` | `entity_type`, (`t_apply`) | 개체 제거: 제동하고 숨김 |
+| `Event_SetSoil` | `preset`(hard/firm/soft/mud) 또는 `soil`(SCM 값 8개), (`t_apply`) | 흙 상태 (Chrono SCM, 이후 생기는 변형에 적용) |
+| `Event_Freeze` / `Event_Resume` | (`t_apply`) / – | 일시정지 / 재개. 재개는 바로 (정지 중에는 시뮬레이션 시각이 멈춤) |
+| `Event_Stop` | (`t_apply`) | 시험 종료: 기록과 MOP 저장 (`stopped_by_console`) |
+| `Report_SimStatus` (Data PDU, 0.2 s) | – | 시뮬레이션 시각, 로봇 위치·방향(시험 판정자 쪽 참값), 명령, 마지막 이벤트, 고장(남은 시간), 일시정지, 차량, 링크 상태 |
+| `Report_ConsoleHeartbeat` (Data PDU, 1 s) | `seq`, `link_state` | 콘솔 -> 시뮬레이터 생존 신호 (DIS_test와 같음) |
+
+**고장 주입** (문서 §10.2 "고장 주입", 모두 로봇 쪽 경계에서 일어난다. 알고리즘은 실제 로봇처럼 "안 온다", "다르게 온다"만 안다)
+
+| `fault` | 콘솔 | 로봇 쪽에서 일어나는 일 |
+|---|---|---|
+| `lidar_blackout` | `fault lidar <초> [센서]` | LiDAR 점군이 알고리즘에 오지 않는다 (기록과 ROS 토픽에서도 빠짐). 지형 인지 보행은 이미 쌓은 지도로만 걷는다 |
+| `link_loss` | `fault link <초> [damp]` | 제어 링크 두절: 로봇 상태가 알고리즘에 가지 않고 관절 명령도 오지 않는다. 로봇은 마지막 명령을 계속 실행(`hold_last`, 기본) 또는 감쇠 모드(`damp`: 위치 게인 0, 속도 게인 5로 천천히 주저앉음). 전송 중이던 명령도 잃는다 |
+| `imu_bias` | `fault imu <초> [gyro=gx,gy,gz] [att=롤,피치,방향]` | IMU 각속도 편향(rad/s, 기본 방향 축 0.05)과 자세 출력 오프셋(도) |
+| `battery_low` | `fault battery <초> [비율]` | 모터 토크 한계를 비율만큼 (기본 0.6, 전압 저하) |
+
+**링크 복구 뒤 일어서기** (알고리즘 쪽, `control/node.py`): 로봇 상태가 0.1 s 넘게 오지 않다가 다시 오면 보행을 멈추고, 지금 관절 각도에서
+서 있는 자세까지 천천히(관절 최대 1 rad/s) 옮긴 뒤 0.5 s 서 있다가 보행을 처음 위상부터 다시 시작한다. 처음에는 주저앉은 자세에서 곧바로
+트롯을 이어 큰 PD 오차가 한꺼번에 걸려 고꾸라졌다 (감쇠 1초 뒤 피치 -65°, 뒤집힘). 지금은 감쇠 1초(몸통 0.14 m), 3초(배를 대고 엎드림, 0.12 m)
+모두 일어서서 다시 걷는다 (`test_stand_up_after_link_loss`). 이에 맞춰 넘어짐 판정의 몸통 높이 기준을 0.12 m에서 0.08 m로 낮췄다
+(엎드린 자세는 넘어짐이 아님. 뒤집히면 0.06 m이고 기울기로도 걸린다). 기존 시나리오 3종 × 시드 3개의 판정과 넘어진 시각은 그대로였다.
+
+`<초>` 자리에 `-`를 쓰면 `clear`까지 유지한다. 시간이 다 되면 시뮬레이션 시각 기준으로 저절로 풀리므로 기록으로 다시 돌려도 같은 스텝에서 풀린다.
+RViz 정보판에 `FAULT:이름(남은 초)`가 빨간 글씨로 나온다. 센서를 별도 노드로 돌리는 `--sensor-node`에서는 `lidar_blackout`이 적용되지 않는다.
+
+**실행 제어**: `freeze`(일시정지)와 `end`(종료)는 예약할 수 있고, 적용된 제어 주기를 마친 뒤 멈춘다. 일시정지 동안에도 콘솔 요청과
+주기 보고, heartbeat는 계속된다. 일시정지·종료는 물리에 영향이 없으므로 `scenario_replay.yaml`에서 빠지고, 콘솔로 종료했으면 그 시각이 `duration`이 된다.
+
+**링크 감시** (DIS_test와 같은 양방향 heartbeat)
+- 콘솔 -> 시뮬레이터 `Report_ConsoleHeartbeat` 1 s, 시뮬레이터 -> 콘솔 주기 보고 0.2 s. 상대에게서 온 어떤 PDU든 생존 신호로 본다.
+- 시뮬레이터: 접속한 콘솔 모두에게서 5 s 동안 아무것도 오지 않으면 통신 두절. 단절 시 동작 `--dis-comm-lost STOP`(기본)이면
+  로봇 이동 명령 0을 이벤트로 넣는다 (`source: dis_comm_lost`, 기록되므로 다시 실행해도 같다). `CONTINUE`면 그대로.
+  다시 받으면 OK로 돌아가지만 명령은 자동으로 되돌리지 않는다.
+- 콘솔: 시뮬레이터 보고가 3 s 끊기면 "정보 갱신 안 됨", 5 s면 "통신 두절"로 표시한다.
+
+**개체 투입과 흙 상태** (Chrono 시나리오, 예: `scenarios/dis_chrono.yaml`)
+- 시나리오의 `chrono.vehicle`에 `t_start: null`을 두면 HMMWV를 시작 때 만들어 출발점에 제동해 두고 **숨긴다**
+  (땅속 깊이 둔 포즈로 내보내 화면과 LiDAR에 보이지 않고 근접 판정도 하지 않음). `spawn`이면 나타나 시나리오에 선언한 경로를 따라 출발한다
+  (`dis_chrono`: (5, -8) -> (5, 8), 로봇 진행선을 x = 5 m에서 가로지름. 변형 지면은 x 3.5~6.5 m).
+  속도만 콘솔에서 정할 수 있다. `despawn`이면 제동하고 다시 숨긴다.
+- 실행 중에 새로 만들지 않는 이유: Chrono에서 시뮬레이션을 진행한 뒤 HMMWV를 만들면 SCM 흙에 비정상적으로 깊이 빠졌고
+  (차체 높이 0.57 -> 0.36 m), SCM 계산 영역(active domain)을 붙이면 프로세스가 죽었다 (`SCMLoader::UpdateActiveDomain`). 그래서 미리 만든 슬롯을 투입하는 방식이다.
+  숨겨 둔 동안에도 차량 무게로 출발점의 흙이 조금 눌린다.
+- **로봇 앞으로 지나가게 하기** (`spawn ahead [간격] [속도]`, `cross_ahead`): 차량과 로봇 사이에는 물리 작용이 없어(문서 §5.4)
+  시점을 잘못 맞추면 차가 로봇을 뚫고 지나갔다. 시뮬레이터가 로봇의 위치·방향·명령 속도와 차량 경로로 교차점을 구하고,
+  차 꼬리가 로봇 진행선의 "로봇 앞 (간격) m 지점"을 로봇보다 0.3초 먼저 지나가는 순간에 출발시킨다
+  (차량 이동 시간은 이 PC 측정값: 목표 속도의 95%, 출발 지연 0.15 + 0.08 × 속도 초). 접수 응답에 예상 출발 시각이 오고,
+  로봇이 너무 가까우면 `TOO_LATE`, 진행선이 경로와 만나지 않으면 `NO_CROSSING`. 기다리는 동안 로봇이 방향을 바꿔도 다시 판단한다.
+  확인: 로봇이 출발 직후 요청 -> 3.0초에 출발, 차 꼬리가 지날 때 로봇은 선보다 2.7 m 앞, 최소 거리 2.96 m.
+- **양보** (`vehicle.yield_to_robot: true`, `dis_chrono`에서 켬): 차 앞 진로(앞 9 m, 옆 ±1.8 m, 차체 중심 기준)에 로봇이 있으면 HMMWV가 제동하고
+  기다린다. 시점이 어긋난 `spawn`이면 차가 로봇 앞에서 서 있다가 로봇이 건너간 뒤 그 뒤로 지나간다 (확인: 약 10초 대기, 최소 거리 2.89 m).
+  로봇 위치는 Chrono 교환 때마다 보내므로(0.04 s) 결정적이다. `vehicle_crossing` 등 기존 시나리오는 꺼져 있어 결과가 같다.
+- **로봇 발자국** (`scenarios/dis_footprints.yaml`): `dis_chrono`는 HMMWV 자국만 계산하고 로봇 발자국은 계산하지 않는다
+  (5 cm 격자에서는 발이 격자점 사이로 빠지고, 발자국 연결도 꺼져 있음). 발자국에는 2 cm 격자와 Chrono 1 ms 스텝이 필요한데,
+  HMMWV까지 같은 조건으로 계산하면 이 PC에서 실시간의 0.06배로 느려졌다. 그래서 HMMWV 없이 발자국만 계산하는 콘솔 시나리오를 따로 두었다
+  (실시간의 약 2.6배). 변형 지면은 x 1~9 m. 12초 걷기, 흙별 발자국 깊이 평균/최대:
+  hard 0.7 / 1.2 cm, firm 1.9 / 4.9 cm, soft 3.0 / 8.4 cm (같은 시간에 전진 4.1 / 3.6 / 2.8 m: 무를수록 발이 빠져 느려짐).
+  mud는 변형 지면에 들어서자마자(x 약 1.25 m) 발이 계속 빠지며 갇힌다 (구덩이 15 cm = 시나리오 지형 높이 하한, 몸통 0.18 m까지 내려앉음, 넘어지지는 않음).
+- 흙: `soil hard|firm|soft|mud`. HMMWV 자국 깊이 약 1.8 / 5.5 / 15 cm, mud는 더 무르고 미끄럽다. 이후 생기는 변형부터 적용된다.
+  확인: `soil soft` 뒤 투입한 HMMWV가 14.7 cm 자국을 남겼다.
+- 투입·흙 명령은 다음 Chrono 교환 구간(0.04 s)부터 적용된다. 교환 시각이 시뮬레이션 시각으로 정해져 있어 기록으로 다시 돌리면
+  로봇과 차량 위치가 비트 단위로 같다 (`test_entity_and_soil_with_chrono`). Chrono 없는 시나리오에서는 거부(`NO_CHRONO`).
+- 이 PC에서 HMMWV가 달리는 동안은 실시간의 약 0.87배로 돈다.
 
 - **좌표**: 시뮬레이터 세계 좌표 (원점 = 로봇 출발점, +x = 처음 바라본 방향, +y = 왼쪽, m). `dis_console` 시나리오의 지형은 ±30 m이고,
   MuJoCo에는 로봇을 따라다니는 ±3 m 창만 올린다.
@@ -460,20 +532,22 @@ python -m dis_console.console --send "cmd 0.35" --send "rut 3.0 @12"
 - **턱 (`ridge`)**: 따로 메시지를 만들지 않고 깊이가 음수인 완만한(cosine) `rut` 패치로 보낸다. 시드 2개 확인에서 5 cm 턱은
   지형 모름 트롯이 한 번은 넘고 한 번은 넘어졌고, 지형 인지 트롯은 둘 다 넘었다.
 - **시각 T 적용** (문서 §10.1): `t_apply`가 있으면 그 시뮬레이션 시각에, 없으면 받은 제어 주기에 적용. 이미 지난 시각은 거부(`T_APPLY_PASSED`).
-- **거부**: 접속 전 요청 `NOT_CONNECTED`, 범위 밖·값 누락 `INVALID_VALUE`, 모르는 메시지 `UNSUPPORTED`. 다른 Exercise ID와 다른 수신자 앞 PDU는 응답 없이 버린다.
+- **거부**: 접속 전 요청 `NOT_CONNECTED`, 범위 밖·값 누락 `INVALID_VALUE`, 모르는 메시지 `UNSUPPORTED`, 정지 중이 아닌데 재개 `NOT_FROZEN`,
+  개체 `ENTITY_ACTIVE` / `ENTITY_NOT_ACTIVE` / `NO_ENTITY_SLOT`. 다른 Exercise ID와 다른 수신자 앞 PDU는 응답 없이 버린다.
 - **재현성** (문서 §10.1 "초기 구성과 이벤트 로그가 재실행 가능한 시나리오 스크립트"):
   - 실행 폴더에 `dis_events.jsonl`(받은 요청과 보낸 응답, 벽시계와 시뮬레이션 시각)과
     `scenario_replay.yaml`(적용된 이벤트를 적용 시각으로 넣은 시나리오)이 남는다.
   - `python -m sim.runner runs/<실행>/scenario_replay.yaml`로 콘솔 없이 같은 결과가 나온다. 실시간 실행을 lockstep으로 다시 돌려도
-    로봇 궤적이 비트 단위로 같다 (`test_console_events_replay_bit_identical`, 실제 실행에서도 넘어진 시각과 전진 거리가 같았다).
+    로봇 궤적이 비트 단위로 같다 (`test_console_events_replay_bit_identical`, 고장 주입 포함). 실제 실행에서도
+    링크 두절·일시정지·예약 종료가 들어간 세션의 종료 시각, 전진 거리, 옆 표류가 같았다.
   - 이벤트는 제어 주기 시작에서 적용한다. 같은 프로세스 실행이 결정적이므로, 언제 도착했든 적용 시각만 같으면 결과가 같다.
 - **이 PC 안에서만**: 시뮬레이터는 127.0.0.1에서만 받는다. 다른 장비의 콘솔을 붙이려면 받는 주소를 바꾸고
   메시지 인증(아래 "아직 없는 것")을 먼저 갖춰야 한다. 지금은 같은 네트워크의 누구나 명령을 보낼 수 있는 구조이기 때문이다.
 
 **아직 없는 것** (문서 §10.2의 나머지)
-- 개체 투입/제거 (Create/Remove Entity + Entity State), 임무 명령 (C-BML Order), 기상·환경, 지형 상태(토양 습윤도 -> Chrono SCM 값),
-  교전 효과, 장애물·지뢰, 전자전, 고장 주입 (센서 고장, 통신 두절), 실행 제어 (Start/Stop/Freeze)
-- 초기 구성 MSDL (지금은 시나리오 YAML), 링크 감시(양방향 heartbeat, 통신 두절 판정. DIS_test에는 있음), 기록 중계기·재생기 연결
+- 임의 위치·여러 대 개체 투입 (지금은 시나리오에 선언한 HMMWV 한 대), 표준 Entity State PDU, 임무 명령 (C-BML Order),
+  기상(날씨, 시정 -> 센서 영향), 교전 효과, 장애물·지뢰, 전자전 (GNSS 재밍, 통신 열화. 링크 두절은 고장 주입으로 가능)
+- 초기 구성 MSDL (지금은 시나리오 YAML), 기록 중계기·재생기 연결
 - 메시지 인증(HMAC)·암호화, 콘솔 제어권 (지금은 접속한 콘솔이 모두 명령 가능)
 - Live 로봇 권한 분리: 실제 로봇에는 이동 명령이 아니라 임무만 보내야 한다 (§10.1). 지금의 `Event_SetCommand`는 가상 모드 전용이다.
 
