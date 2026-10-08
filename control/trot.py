@@ -112,9 +112,14 @@ class TrotController:
         target = cmd_f + [0.0, self.k_heading * heading_err]
         # 개루프 보폭은 추종 지연·미끄러짐으로 속도가 모자라므로 측정 오차만큼 보폭을 키운다
         err = target - self.meas_f
-        self.err_i = np.clip(self.err_i + err * dt, -0.5, 0.5)
-        vx, wz = target + self.k_vel * err + self.ki_vel * self.err_i
-        vx, wz = np.clip(vx, -1.0, 1.0), np.clip(wz, -1.5, 1.5)
+        # 와인드업 방지 (조건부 적분): 출력이 이미 한계에 걸린 방향으로는 오차를 더 쌓지 않는다. 쌓으면 로봇이 못 움직이는 동안
+        # (배터리 저하로 멈춤, 자국에 걸림) 적분이 상한까지 차 있다가 풀리는 순간 한꺼번에 나가 몸통이 홱 돈다 (-40°/0.5 s 확인함)
+        lim = np.array([1.0, 1.5])
+        err_i = np.clip(self.err_i + err * dt, -0.5, 0.5)
+        raw = target + self.k_vel * err + self.ki_vel * err_i
+        hold = (np.abs(raw) > lim) & (np.sign(err) == np.sign(raw))
+        self.err_i = np.where(hold, self.err_i, err_i)
+        vx, wz = np.clip(target + self.k_vel * err + self.ki_vel * self.err_i, -lim, lim)
         moving = clock.moving
 
         if terrain is not None:

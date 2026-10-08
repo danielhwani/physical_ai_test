@@ -10,7 +10,8 @@
    콘솔 없이도 로봇 궤적이 비트 단위로 같다 (즉흥 투입 이벤트도 재실행 가능한 시나리오가 된다)
 4. 고장 주입 (로봇 쪽 경계): LiDAR 끊김(점군 안 옴), 링크 두절(알고리즘에 상태 안 가고 로봇은 마지막 명령 유지),
    IMU 편향, 배터리 저하(토크 한계). 지정 시간 뒤 저절로 풀리고, 해제 명령으로도 풀린다.
-   링크 두절 중 감쇠 모드로 주저앉아도 복구 뒤 알고리즘이 일어서기부터 해서 다시 걷는다
+   링크 두절 중 감쇠 모드로 주저앉아도 복구 뒤 알고리즘이 일어서기부터 해서 다시 걷는다.
+   배터리 저하로 다리가 처지면 일어서기로 들어가 토크가 돌아올 때 튕겨 돌지 않는다
 5. 실행 제어: 일시정지(예약 가능) -> 재개, 종료(예약 시각에 멈추고 다시 실행할 시나리오의 duration이 됨)
 6. 링크 감시: 콘솔이 조용해지면 통신 두절 -> 로봇 이동 명령 0 이벤트 (기록됨)
 7. 개체·흙 (Chrono, scenarios/dis_chrono.yaml): 숨겨 둔 HMMWV 투입 -> 보이고 출발, 흙을 무르게 -> 자국이 깊다,
@@ -406,6 +407,31 @@ def test_soil_changes_robot_footprints():
         finally:
             con.close(); sim.dis.close(); sim.close()
     assert depth["soft"] > 2 * depth["hard"], depth
+
+def test_battery_low_recovery():
+    """배터리 저하로 토크가 모자라면 (20%, 30%) 알고리즘이 다리 처짐을 보고 일어서기로 들어가, 토크가 돌아올 때 튕겨 돌지 않는다.
+    고치기 전: 해제 순간 0.5초 만에 -40° (20%), 30%에서는 계속 돌아 -110°. 40%는 평지 보행에 영향이 없어 일어서기도 없다."""
+    from sim.adapters import quat_to_yaw
+    for scale, want_rec in ((0.2, True), (0.3, True), (0.4, False)):
+        scn = dict(SCENARIO, events=[{"t": 0.0, "action": "set_command", "vx": 0.3, "yaw_rate": 0.0},
+                                     {"t": 2.0, "action": "inject_fault", "fault": "battery_low", "duration": 6.0,
+                                      "params": {"torque_scale": scale}}])
+        sim = Simulation(scn)
+        d, n_rec, prev, yaw_dev = sim.data, 0, None, 0.0
+        try:
+            while d.time < 8.0:
+                _step_out(sim)
+                r = sim.controller.recovery
+                n_rec += r is not None and prev is None
+                prev = r
+            x0 = d.qpos[0]
+            while d.time < 14.0:
+                _, _, roll, pitch = _step_out(sim)
+                yaw_dev = max(yaw_dev, abs(np.degrees(quat_to_yaw(d.qpos[3:7]))))
+                assert not sim.fallen(roll, pitch), (scale, d.time)
+            assert (n_rec > 0) == want_rec and yaw_dev < 15.0 and d.qpos[0] - x0 > 1.2, (scale, n_rec, yaw_dev, d.qpos[0] - x0)
+        finally:
+            sim.close()
 
 if __name__ == "__main__":
     for name, fn in list(globals().items()):

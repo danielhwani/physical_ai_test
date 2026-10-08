@@ -21,11 +21,17 @@ from .onnx_policy import OnnxPolicyController
 from .terrain_map import TerrainPerception
 from .trot import TrotController
 
-# 일어서기 (링크 두절 뒤): 로봇 상태가 RECOVER_GAP_S 넘게 오지 않다가 다시 오면, 보행을 멈추고 지금 관절 각도에서
-# 서 있는 자세(기본 자세)까지 천천히 옮긴 뒤(관절 최대 RECOVER_RATE rad/s, 최소 RECOVER_MIN_S) RECOVER_HOLD_S 동안 서 있다가
-# 보행을 처음 위상부터 다시 시작한다. 두절 중 로봇이 주저앉았는데(감쇠 모드) 그 자세에서 곧바로 트롯을 이으면 큰 PD 오차가
-# 한꺼번에 걸려 고꾸라졌다 (확인함). 정상 실행에서는 상태가 매 주기 오므로 동작하지 않는다
-RECOVER_GAP_S, RECOVER_RATE, RECOVER_MIN_S, RECOVER_HOLD_S = 0.1, 1.0, 0.3, 0.5
+# 일어서기: 보행을 멈추고 지금 관절 각도에서 서 있는 자세(기본 자세)까지 천천히 옮긴 뒤(관절 최대 RECOVER_RATE rad/s,
+# 최소 RECOVER_MIN_S) RECOVER_HOLD_S 동안 서 있다가 보행을 처음 위상부터 다시 시작한다. 관절이 따라오는 만큼만 진행한다
+# (명령과 측정 각도 차이가 RECOVER_TRACK rad를 넘으면 멈춤): 토크가 모자라 못 따라가는 동안 명령이 실제 자세에서 멀어지지 않게.
+# 들어가는 조건 (모두 로봇이 아는 값):
+#   - 로봇 상태가 RECOVER_GAP_S 넘게 오지 않다가 다시 옴 (링크 두절). 두절 중 주저앉았는데 그 자세에서 곧바로 트롯을 이으면
+#     큰 PD 오차가 한꺼번에 걸려 고꾸라졌다 (확인함)
+#   - 디딘 다리가 명령보다 SAG_M 넘게 눌린 상태가 SAG_S 동안 이어짐 (토크 부족, 예: 배터리 저하). 그대로 걸으려 하면
+#     토크가 돌아오는 순간 다리가 튕겨 몸이 떠서 돌았다 (-73°). 정상 보행은 0.5초 지속 처짐이 최대 0.9 cm (시나리오 5종 측정)
+# 정상 실행에서는 동작하지 않는다
+RECOVER_GAP_S, RECOVER_RATE, RECOVER_MIN_S, RECOVER_HOLD_S, RECOVER_TRACK = 0.1, 1.0, 0.3, 0.5, 0.15
+SAG_M, SAG_S, CONTACT_N = 0.02, 0.5, 20.0
 
 
 class ControllerNode:
@@ -79,7 +85,9 @@ class ControllerNode:
         self.pending = deque([np.zeros(12)] * self.delay_steps)
         self.last_t, self.est = None, None
         self.q_des = self.iface.targets_from_action(self.action)
-        self.recovery = None          # 일어서기 중: (시작 시각, 옮기는 시간, 시작 관절 각도)
+        self.recovery = None          # 일어서기 중: {"q0": 시작 관절 각도, "T": 옮기는 시간, "u": 진행 0~1, "hold": 서 있은 시간}
+        self.sag_time = 0.0           # 디딘 다리가 눌린 상태가 이어진 시간
+        self.last_q_des = None        # 지난 주기에 보낸 목표 관절 각도 (처짐 판단용)
         if self.terrain is not None:
             self.terrain.reset()
         self.scan_buf, self.pose_hist = [], {}
@@ -120,15 +128,35 @@ class ControllerNode:
         for k in [k for k in self.pose_hist if k < t - 1.0]:          # 1초 넘은 자세 기록은 버린다
             del self.pose_hist[k]
 
-    def _recover_action(self, t):
-        t0, T, q0 = self.recovery
-        s = (t - t0) / T
-        if s >= 1.0 + RECOVER_HOLD_S / T:                 # 다 일어섰다: 다음 주기부터 보행
-            self.recovery = None
-        u = min(s, 1.0)
-        u = u * u * (3 - 2 * u)                            # 부드럽게 시작하고 멈춤
+    def _start_recovery(self, q):
+        q0 = np.asarray(q, dtype=float)
         stand = self.iface.targets_from_action(np.zeros(12))
-        return self.iface.action_from_targets(q0 + u * (stand - q0))
+        self.recovery = {"q0": q0, "T": float(np.clip(np.abs(stand - q0).max() / RECOVER_RATE, RECOVER_MIN_S, 2.0)),
+                         "u": 0.0, "hold": 0.0}
+        self.ctrl.reset()
+        self.clock.cmd_f[:], self.clock.phase = 0.0, 0.0     # 명령 목표는 두고, 속도는 0에서 다시 가속
+        self.sag_time = 0.0
+
+    def _stance_sag(self, ls):
+        """디딘 다리가 명령보다 눌린 정도 (m, 몸통 좌표 발 높이 차의 평균). 디딘 다리가 없으면 0."""
+        q, q_cmd, kin = np.asarray(ls["q"], dtype=float), self.q_des, self.estimator.kin
+        st = np.asarray(ls["foot_force"]) > CONTACT_N
+        v = [kin.foot(i, q[3 * i:3 * i + 3])[2] - kin.foot(i, q_cmd[3 * i:3 * i + 3])[2] for i in range(4) if st[i]]
+        return float(np.mean(v)) if v else 0.0
+
+    def _recover_action(self, q, dt):
+        r = self.recovery
+        tracking = np.abs(self.q_des - np.asarray(q, dtype=float)).max() < RECOVER_TRACK
+        if tracking:                                       # 따라오는 만큼만 진행
+            if r["u"] < 1.0:
+                r["u"] = min(1.0, r["u"] + dt / r["T"])
+            else:
+                r["hold"] += dt
+        if r["hold"] >= RECOVER_HOLD_S:                    # 다 일어섰다: 다음 주기부터 보행
+            self.recovery = None
+        u = r["u"] * r["u"] * (3 - 2 * r["u"])            # 부드럽게 시작하고 멈춤
+        stand = self.iface.targets_from_action(np.zeros(12))
+        return self.iface.action_from_targets(r["q0"] + u * (stand - r["q0"]))
 
     def set_command(self, vx, yaw_rate):
         self.clock.set_command(vx, yaw_rate)
@@ -138,11 +166,7 @@ class ControllerNode:
         t = ls["t"]
         dt = self.iface.control_dt if self.last_t is None else t - self.last_t
         if self.last_t is not None and dt > RECOVER_GAP_S:      # 상태가 끊겼다가 다시 옴 (링크 두절): 일어서기부터
-            q0 = np.asarray(ls["q"], dtype=float)
-            stand = self.iface.targets_from_action(np.zeros(12))
-            self.recovery = (t, float(np.clip(np.abs(stand - q0).max() / RECOVER_RATE, RECOVER_MIN_S, 2.0)), q0)
-            self.ctrl.reset()
-            self.clock.cmd_f[:], self.clock.phase = 0.0, 0.0     # 명령 목표는 두고, 속도는 0에서 다시 가속
+            self._start_recovery(ls["q"])
             # 공백 동안의 움직임은 모른다: 끊기기 전 속도로 공백을 적분하면 추정 위치가 튄다 (3초 두절에 0.7 m,
             # 지형 인지 보행의 지도·디딜 곳이 그만큼 어긋나 잘 걷지 못했다). 제자리에 있었다고 보고 속도 0에서 다시 시작
             self.estimator.restart_after_gap()
@@ -165,8 +189,14 @@ class ControllerNode:
             aux = self.aux_obs_spec.compute(*inputs, height_scan=ahs)
         ctx = StepContext(dt=dt, est=est, roll=est.roll, pitch=est.pitch, yaw=est.yaw, v_body_x=float(est.v_body[0]),
                           wz_world=est.wz_world, clock=self.clock, obs=self.obs, terrain=self.terrain, aux_obs=aux)
+        if self.recovery is None and self.last_q_des is not None:   # 다리가 몸을 못 받침 (토크 부족): 일어서기부터
+            # 처진 시간은 쌓고 괜찮은 시간만큼 뺀다 (띄엄띄엄 처지는 경우도 잡는다: 배터리 30%에서 처짐이 끊겨 감지 못하고
+            # 토크가 돌아오는 순간 튕겨 돌았다)
+            self.sag_time = max(0.0, self.sag_time + (dt if self._stance_sag(ls) > SAG_M else -dt))
+            if self.sag_time >= SAG_S:
+                self._start_recovery(ls["q"])
         if self.recovery is not None:
-            action = self._recover_action(t)
+            action = self._recover_action(ls["q"], dt)
         else:
             action = self.ctrl.act(ctx)
         if self.on_action:
@@ -177,7 +207,7 @@ class ControllerNode:
             applied = self.pending.popleft()
         else:
             applied = self.action
-        self.q_des = self.iface.targets_from_action(applied)
+        self.q_des = self.last_q_des = self.iface.targets_from_action(applied)
         zeros = [0.0] * 12
         return {"t": t, "q_des": self.q_des.tolist(), "dq_des": zeros, "kp": self.iface.kp.tolist(),
                 "kd": self.iface.kd.tolist(), "tau_ff": zeros}
