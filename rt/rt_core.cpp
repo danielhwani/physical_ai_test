@@ -1,10 +1,11 @@
 // Go2 실시간 코어 (문서 §11): 물리(MuJoCo) + 로봇 쪽 경계(센서 모델, PD 모터)를 고정 주기로 돈다.
 //
-//   rt_core <model.mjb> <공유 메모리 이름>      실행 (관리 프로세스 sim/rt_link.py가 띄운다)
+//   rt_core <model.mjb> <공유 메모리 이름> [<지형 공유 메모리 이름>]   실행 (관리 프로세스 sim/rt_link.py가 띄운다)
 //   rt_core --layout                           공유 메모리 규약의 크기와 위치 (Python 정의와 대조)
 //
 // 실시간 루프 규칙: 시작 전에 모든 메모리를 잡고(mlockall), 루프 안에서는 할당·입출력·잠금을 하지 않는다.
 // 제어 주기마다
+//   0. 지형이 바뀌었으면 반영 (heightfield 값, 지형 창 위치. 관리 프로세스가 sim.runner와 같은 규칙으로 계산)
 //   1. 로봇 상태 측정 (참값 + 센서 모델 + 관리 프로세스가 미리 만든 잡음) -> 공유 메모리 LowState
 //   2. 실행할 관절 명령 고르기: 직전 주기까지의 상태로 계산된 최신 명령 (연결 지연 한 주기, Python 실행과 같다).
 //      없으면 마지막 명령 유지 (처음이면 기본 자세). 링크 두절이면 마지막 명령 유지 또는 감쇠
@@ -82,7 +83,7 @@ void quat_mul(const double a[4], const double b[4], double o[4]) {
 void print_layout() {
 #define F(field) std::printf("  \"%s\": [%zu, %zu],\n", #field, offsetof(Shm, field), sizeof(((Shm*)0)->field))
   std::printf("{\n");
-  F(cfg); F(ctl); F(stats); F(state); F(cmd); F(noise_head); F(noise); F(truth_head); F(truth);
+  F(cfg); F(ctl); F(stats); F(state); F(cmd); F(op_head); F(op); F(noise_head); F(noise); F(truth_head); F(truth);
   F(cfg.qpos0); F(cfg.torque_limit); F(ctl.torque_scale); F(state.foot_force); F(cmd.tau_ff); F(truth[0].wake_us);
   std::printf("  \"total\": [0, %zu]\n}\n", sizeof(Shm));
 #undef F
@@ -111,6 +112,17 @@ int main(int argc, char** argv) {
   }
   Config cfg;
   std::memcpy(&cfg, (const void*)&shm->cfg, sizeof(cfg));
+  volatile TerrainHeader* terr = nullptr;                 // 지형 공유 메모리 (선택)
+  if (argc >= 4) {
+    int tfd = shm_open(argv[3], O_RDWR, 0);
+    if (tfd < 0) { std::perror("shm_open terrain"); return 1; }
+    TerrainHeader th;
+    if (pread(tfd, &th, sizeof(th), 0) != (ssize_t)sizeof(th)) { std::perror("read terrain"); return 1; }
+    size_t tsize = sizeof(TerrainHeader) + sizeof(float) * (size_t)th.nrow * th.ncol;
+    terr = (volatile TerrainHeader*)mmap(nullptr, tsize, PROT_READ | PROT_WRITE, MAP_SHARED, tfd, 0);
+    close(tfd);
+    if (terr == MAP_FAILED) { std::perror("mmap terrain"); return 1; }
+  }
 
   char err[1000] = "";
   mjModel* m = mj_loadModel(argv[1], nullptr);
@@ -122,6 +134,14 @@ int main(int argc, char** argv) {
   for (int i = 0; i < NV; i++) d->qvel[i] = cfg.qvel0[i];
   mj_forward(m, d);
   (void)err;
+  if (terr && (terr->nrow != m->hfield_nrow[cfg.hfield_id] || terr->ncol != m->hfield_ncol[cfg.hfield_id])) {
+    std::fprintf(stderr, "지형 공유 메모리 크기가 모델 heightfield와 다르다\n");
+    return 1;
+  }
+  uint64_t terrain_seq = 0;
+  const int hf_n = m->hfield_nrow[cfg.hfield_id] * m->hfield_ncol[cfg.hfield_id];
+  float* hf_dst = m->hfield_data + m->hfield_adr[cfg.hfield_id];
+  const float* hf_src = terr ? (const float*)((const char*)terr + sizeof(TerrainHeader)) : nullptr;
 
   // 실시간 준비: 메모리 잠금, CPU 고정, 우선순위 (실패해도 돌되 기록한다)
   shm->stats.locked = mlockall(MCL_CURRENT | MCL_FUTURE) == 0;
@@ -138,6 +158,7 @@ int main(int argc, char** argv) {
   while (!shm->ctl.start && !shm->ctl.stop) usleep(1000);
 
   const double ts = m->opt.timestep;
+  const int base_body = cfg.base_body;
   const long period_ns = std::lround(cfg.control_dt * 1e9);
   LowCmd hold{}, applied{}, incoming{};
   for (int j = 0; j < NJ; j++) { hold.q_des[j] = cfg.hold_q[j]; hold.kp[j] = cfg.hold_kp[j]; hold.kd[j] = cfg.hold_kd[j]; }
@@ -145,12 +166,19 @@ int main(int argc, char** argv) {
   applied = hold;
   bool have_cmd = false;
   double prev_state_t = -1.0, foot_force[4] = {0, 0, 0, 0};
+  double min_cmd_t = -1e300;                              // 링크 두절 뒤에는 그 뒤 상태로 계산된 명령만 받는다
   timespec next;
   clock_gettime(CLOCK_MONOTONIC, &next);
   double next_ns = now_ns();
 
   for (int64_t k = 0; k < cfg.max_steps && !shm->ctl.stop; k++) {
     double wake_us = 0.0;
+    if (cfg.mode == 0 && shm->ctl.freeze) {               // 일시정지 (DIS 콘솔): 풀릴 때까지 기다렸다가 지금부터 다시 주기를 센다
+      while (shm->ctl.freeze && !shm->ctl.stop) usleep(1000);
+      clock_gettime(CLOCK_MONOTONIC, &next);
+      next_ns = now_ns();
+    }
+    if (shm->ctl.stop) break;
     if (cfg.mode == 0) {                                  // 실시간: 절대 시각까지 잔다
       next.tv_nsec += period_ns;
       while (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
@@ -166,6 +194,22 @@ int main(int argc, char** argv) {
     }
     double t0 = now_ns();
     const double t = d->time;
+
+    // 0. 지형 반영 (seqlock: 복사 중 바뀌면 다음 주기에 다시)
+    if (terr) {
+      uint64_t s1 = terr->seq;
+      if (!(s1 & 1) && s1 != terrain_seq && terr->apply_step <= k) {
+        barrier();
+        std::memcpy(hf_dst, hf_src, sizeof(float) * hf_n);
+        double mp[3] = {terr->mocap_pos[0], terr->mocap_pos[1], terr->mocap_pos[2]};
+        barrier();
+        if (terr->seq == s1) {
+          terrain_seq = s1;
+          if (cfg.terrain_mocap >= 0)
+            for (int a = 0; a < 3; a++) d->mocap_pos[3 * cfg.terrain_mocap + a] = mp[a];
+        }
+      }
+    }
 
     // 1. 로봇 상태 측정
     const volatile NoiseEntry& ne = shm->noise[k % NOISE_RING];
@@ -192,18 +236,21 @@ int main(int argc, char** argv) {
       ls.accel[i] = d->sensordata[cfg.accel_adr + i] + cfg.accel_bias[i] + z[29 + i];
     }
     for (int i = 0; i < 4; i++) ls.foot_force[i] = std::max(foot_force[i] + z[32 + i], 0.0);
-    write_slot(&shm->state, ls);
+    const uint64_t link = shm->ctl.link_mode;
+    if (link == 0) write_slot(&shm->state, ls);           // 링크 두절이면 상태가 보행 알고리즘에 가지 않는다
 
     // 2. 실행할 명령
-    const uint64_t link = shm->ctl.link_mode;
     LowCmd cmd;
     if (link == 2) {                                      // 링크 두절 + 감쇠: 위치 게인 0, 속도 게인만
       cmd = LowCmd{};
       for (int j = 0; j < NJ; j++) { cmd.q_des[j] = d->qpos[7 + j]; cmd.kd[j] = 5.0; }
       cmd.t = -2.0;
+      applied = cmd;                                      // 복구 직후 새 명령이 오기 전에는 직전에 실행한 것을 유지 (sim/runner.py와 같다)
+      min_cmd_t = t;
     } else {
+      if (link != 0) min_cmd_t = t;                       // 두절 중: 두절 전에 계산된 명령이 복구 뒤 실행되지 않게
       if (link == 0 && read_slot(&shm->cmd, &incoming) && incoming.seq > 0 && incoming.t <= prev_state_t + 1e-9 &&
-          (!have_cmd || incoming.t > applied.t)) {
+          incoming.t > min_cmd_t && (!have_cmd || incoming.t > applied.t)) {
         applied = incoming;
         have_cmd = true;
       }
@@ -244,11 +291,23 @@ int main(int argc, char** argv) {
     te.t = d->time;
     for (int i = 0; i < NQ; i++) te.qpos[i] = d->qpos[i];
     for (int i = 0; i < NV; i++) te.qvel[i] = d->qvel[i];
-    for (int j = 0; j < NJ; j++) te.ctrl[j] = d->ctrl[j];
+    for (int j = 0; j < NJ; j++) { te.ctrl[j] = d->ctrl[j]; te.q_des[j] = cmd.q_des[j]; }
     te.energy = energy;
     for (int i = 0; i < 4; i++) te.foot_force[i] = foot_force[i];
     te.cmd_t = cmd.t;
     te.wake_us = wake_us;
+    for (int i = 0; i < 9; i++) te.base_xmat[i] = d->xmat[9 * base_body + i];
+    uint32_t bits = 0;
+    for (int i = 0; i < 4; i++) {
+      for (int a = 0; a < 3; a++) te.foot_pos[3 * i + a] = d->geom_xpos[3 * cfg.foot_geom[i] + a];
+      for (int c = 0; c < d->ncon; c++)
+        if (d->contact[c].geom1 == cfg.foot_geom[i] || d->contact[c].geom2 == cfg.foot_geom[i]) { bits |= 1u << i; break; }
+    }
+    te.contact_bits = bits;
+    for (int b = 0; b < std::min((int)m->nbody, NBODY_MAX); b++) {
+      for (int a = 0; a < 3; a++) te.body_xpos[3 * b + a] = d->xpos[3 * b + a];
+      for (int a = 0; a < 4; a++) te.body_xquat[4 * b + a] = d->xquat[4 * b + a];
+    }
     te.compute_us = compute_us;
     barrier();
     shm->truth_head = k + 1;

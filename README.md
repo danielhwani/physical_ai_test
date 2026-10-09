@@ -708,8 +708,41 @@ python3 -m siman_r.player recordings/sim_session.jsonl --target 127.0.0.1:3000 -
 python -m sim.rt_link --build                                  # 코어 빌드 (cmake, mj_ros의 libmujoco 사용)
 python -m sim.rt_link scenarios/flat_trot.yaml                 # 실시간: SCHED_FIFO 80, CPU 5 고정, 메모리 잠금
 python -m sim.rt_link scenarios/flat_trot.yaml --lockstep      # 한 스텝씩 (Python 실행과 비교)
-python conformance/test_rt_core.py                             # 규약 일치, 물리 비트 동일, 닫힌 고리 동일, 실시간 실행
+python -m sim.rt_link scenarios/flat_trot.yaml --brain shm     # 두뇌를 같은 PC의 별도 프로세스로 (공유 메모리)
+python -m sim.rt_link scenarios/flat_trot.yaml --brain ros     # 두뇌를 ROS2 노드로 (같은 PC 또는 다른 PC)
+python -m sim.rt_link scenarios/flat_trot.yaml --rviz          # RViz로 보기 (--mjviz: MuJoCo 렌더러). 두뇌 옵션과 함께 쓸 수 있다
+python -m sim.rt_link scenarios/rough_rut.yaml --rviz          # 지형이 바뀌는 시나리오 (자국 이벤트, 지형 창)
+python -m sim.rt_link scenarios/flat_trot.yaml --variant mjx   # 모델 설정 (sim.runner --variant와 같다)
+python -m sim.rt_link scenarios/dis_console.yaml --dis-port 3000 --dis-wait --brain shm --rviz   # DIS 콘솔 (콘솔은 그대로)
+python -m sim.rt_link scenarios/rut_crossing.yaml --brain shm --rviz --set controller.perception.sensor=front_lidar   # LiDAR 지형 인지 보행
+python conformance/test_rt_core.py                             # 규약 일치, 물리 비트 동일, 닫힌 고리 동일, 두뇌 연결 방식·고장, 실시간
 ```
+
+**상위 제어기(두뇌)와 하위 제어기(몸)의 연결** (2026-10-09 결정: 같은 PC와 다른 PC 모두 지원)
+```
+[하위 제어기 PC]                                                         [상위 제어기 PC]
+ C++ 코어 (PD 모터 + 물리 + 센서) ─공유 메모리─┬─ inproc: sim.rt_link 안의 두뇌 (함수 호출)
+                                                ├─ shm:    같은 PC의 별도 프로세스 control/rt_brain.py
+                                                └─ ros:    sim.rt_link가 중계 ──ROS2──▶ control/ros_node.py (같은 PC 또는 다른 PC)
+```
+- 코어는 어느 방식이든 공유 메모리만 본다. 네트워크 입출력은 실시간 루프 밖(관리 프로세스)에서 하므로 네트워크가 늦거나 끊겨도
+  코어의 20 ms 주기는 흔들리지 않고, "마지막 명령 유지 + 명령 지연 MOP"로 드러난다.
+- 두뇌 코드(`control/node.py`의 `ControllerNode`)는 세 방식이 같다. 운용자 이동 명령은 적용 시각을 붙여 미리 보낸다
+  (shm: 공유 메모리 명령 링, ros: `/cmd_vel_stamped`). 고장(배터리, IMU, 링크 두절)은 코어가 처리한다.
+- 명령에 "어느 시각의 상태로 계산했는지"(시뮬레이션 시각)가 실려 있어, 두 PC의 시계를 맞추지 않아도 지연을 잰다.
+- 다른 PC: `python -m sim.rt_link <시나리오> --brain ros --remote-brain`으로 띄우면 노드를 기다린다. 두뇌 PC에서 같은
+  `ROS_DOMAIN_ID`로 `python -m control.ros_node --scenario <같은 시나리오 파일>`. (이 PC 안에서만 시험했다)
+- lockstep: 세 방식이 Python 시뮬레이터와 비트 단위로 같다. 링크 두절(감쇠·유지), 배터리 저하가 섞여도 같다 (복구 뒤 일어서기 포함).
+  링크 두절이 풀린 직후에는 두절 전에 계산된 명령을 실행하지 않고 직전에 실행한 명령을 유지한다 (Python과 같게 맞춤).
+- 실시간 15초 (750주기): 명령 지연 평균/최대, 한 주기보다 늦게 실행된 주기 수
+
+| 두뇌 | 지연 평균 / 최대 | 늦은 주기 |
+|---|---|---|
+| inproc (관리 작업과 한 프로세스) | 20.0 / 40 ms | 1 |
+| shm (별도 프로세스) | 20.0 / 20 ms | 0 |
+| ros (ROS2, JSON 메시지) | 20.1 / 60 ms | 2 |
+
+- 아직: ROS2 메시지는 기존 노드와 같은 JSON 문자열이다. 다른 PC 사이 실시간에는 바이너리 메시지(ROS2 정해진 형식 또는 Unitree와 같은 구조체)가 낫다.
 
 **나눈 일**
 ```
@@ -745,8 +778,75 @@ C++ 코어 rt/rt_core (실시간 루프)                     Python 관리 프�
   그래서 시간 보장의 다음 단계는 시스템 설정이다 (루트 권한): CPU 주파수 `performance`, `/dev/cpu_dma_latency`로 깊은 대기 상태 금지,
   커널 인자 `isolcpus=4,5 nohz_full=4,5 rcu_nocbs=4,5 irqaffinity=0-3`로 실시간 코어 격리.
 
-**아직 이 경로에 없는 것**: 지형 패치 이벤트·지형 창(코어로 높이 갱신 보내기), Chrono, LiDAR, ROS2 보행 알고리즘 노드(지금은 같은 프로세스의
-Python 알고리즘), DIS 콘솔, 기록(Parquet)·가시화. 이 기능들은 `python -m sim.runner`로 실행한다.
+**가시화** (`--rviz`, `--mjviz`): 관리 프로세스가 코어의 참값으로 자기 쪽 MuJoCo 데이터를 맞추고(`mj_forward`) `sim.runner`와 같은
+렌더 스트림(`/tf`, `/clock`, 지형, 정보판)을 25 Hz로 발행한다. RViz 설정과 어댑터는 그대로다. 실시간 루프 밖이라 화면이 느려도 코어 주기에는
+영향이 없다 (확인: 10초 발행 중 주기 초과 0, 별도 프로세스 두뇌의 늦은 주기 0). 창을 닫으면 끝나고, 끝나면 최종 MOP를 정보판에 남긴다.
+실행 폴더 `runs/<시나리오>_rt_<시각>/`에 로그와 `summary.json`(MOP, 코어·두뇌 종류)이 남는다.
+
+**기록** (`timeseries.parquet`, `sim.runner`와 같은 형식): 관리 프로세스가 코어의 참값 링을 읽어 같은 열을 남기고, 실시간 열
+(`wake_us`, `compute_us`, `cmd_state_t`)을 더한다. 발 접촉, 몸통 회전, 발 위치는 코어가 물리 스텝 직후 mjData 값을 그대로 넘긴다
+(`sim.runner`가 기록하는 값과 같게: 위치를 다시 계산하면 접촉과 몸통 속도가 조금 달랐다). 스텝 수도 `sim.runner`와 같이
+"시각 < duration"인 동안으로 센다 (20초 시나리오는 부동소수점 누적으로 1001스텝).
+
+**지형 변경**: 관리 프로세스가 `sim.runner`와 같은 규칙(지형 패치 이벤트, 5 Hz 반영, 발 근처 갱신 보류, 지형 창 이동)으로 지형을 계산하고,
+바뀌면 지형 공유 메모리(`<이름>_terrain`: heightfield 값 + 지형 창 위치)로 보낸다. 코어는 다음 제어 주기 시작에 반영한다.
+RViz 지형 표시는 관리 프로세스의 지형을 그대로 쓴다.
+
+**lockstep 같은 결과** (`test_recording_matches_runner`): `timeseries.parquet`의 모든 공통 열(80개)과 MOP가 `sim.runner`와 비트 단위로 같다.
+flat_trot (cpu, mjx 모델), rough_rut (자국 이벤트), 지형 창 + 실행 중 자국 추가 (dis_console 지형, 10초 이동).
+
+**DIS 콘솔** (`--dis-port`, `--dis-wait`, `--dis-key`, `--dis-host`, `--dis-comm-lost`, 실시간 전용): `sim/dis_server.py`를 그대로 쓴다
+(제어권, 인증, 통신 두절, 원본 PDU 기록, 시험 종료 알림). 관리 프로세스가 서버가 넣은 이벤트를 같은 이벤트 목록에서 꺼내 적용하고 적용 시각을
+기록하므로 접수 -> 적용 완료 응답과 `scenario_replay.yaml`이 그대로 나온다. 일시정지는 코어의 멈춤 칸으로 처리하고(풀리면 코어가 시계를
+다시 맞춤), 종료는 `sim.runner`처럼 그 주기를 마친 뒤 멈춘다. 별도 프로세스 두뇌에 미리 보낸 이동 명령은 실제로 적용되는 시각에 완료로 표시한다.
+확인 (`test_dis_console_on_rt_core`, 별도 프로세스 두뇌): 콘솔로 이동·자국·감쇠 링크 두절·예약 종료 -> 남은 `scenario_replay.yaml`을
+Python 시뮬레이터(`sim.runner`)로 다시 돌리면 같은 결과 (실시간 실행에서 늦은 명령이 없을 때. 인증·일시정지·배터리까지 넣은 세션도 같았다).
+
+**LiDAR·지형 인지 보행** (`controller.perception.sensor`가 있는 시나리오):
+```
+C++ 코어 ──참값 링(스텝 직후 바디 위치)──▶ 관리 프로세스: 스캔 차례 판단 (10 Hz) ──렌더 스트림(지형 패치, 바디 포즈)──▶ LiDAR 작업 프로세스
+                                                                                                    (sim/rt_sensor.py, CPU 레이캐스트)
+두뇌 ◀── 스캔 (inproc: 함수, shm: 스캔 공유 메모리 <이름>_scan, ros: /sensors/<이름>/points) ◀── 관리 프로세스 ◀── 스캔
+```
+- 스캔 한 번이 이 PC에서 약 98 ms(최대 107 ms)다. 관리 프로세스 안에서 계산하면 10 Hz만으로 실시간을 넘쳐 같은 프로세스 두뇌가 밀렸고
+  (12초에 0 m), 작업 프로세스 하나로는 스캔이 쌓였다 (두뇌 도착까지 평균 0.4~0.56초). 그래서 실시간에서는 작업 프로세스 2개가 번갈아
+  계산한다. 둘 다 밀려 있으면 그 스캔은 건너뛴다 (실제 LiDAR 드라이버의 프레임 버림과 같다, MOP `scan_dropped`).
+  잡음은 스캔 번호로 정해지므로 어느 작업 프로세스가 계산해도 같은 점군이다.
+- 실시간에서 스캔은 계산 시간만큼 늦게 두뇌에 도착한다 (MOP `scan_delay_ms_mean/max`). 두뇌는 스캔 시각의 자기 추정 위치로 지도에
+  넣으므로 늦게 와도 위치는 맞다 (lockstep에서 스캔을 0/100/200 ms 늦게 넣어도 전진 3.71/3.64/3.68 m, 넘어짐 없음).
+- LiDAR 끊김 고장(`lidar_blackout`)은 관리 프로세스가 스캔을 보낼 때 거른다. 원시 점군은 `sim.runner`처럼 `<센서>.npz`로 남는다.
+- 상태 추정 기록: 별도 프로세스 두뇌(shm)는 추정값과 가속 제한 뒤 명령을 공유 메모리 추정 칸으로, ROS2 노드는 `/controller/estimate`로
+  넘긴다. lockstep에서는 이것까지 받은 뒤 기록한다.
+- 화면: 알고리즘 지형 지도와 디딜 곳 표시는 inproc(관리 프로세스가 발행)과 ros(노드가 발행)에서 나온다. shm은 로봇·지형·점군·odom 정렬만 나온다.
+- lockstep 같은 결과 (`test_perception_matches_runner`): rut_crossing + 4~5초 LiDAR 끊김, 세 두뇌 모두 `timeseries.parquet` 모든 열과
+  스캔 점이 `sim.runner`와 비트 단위로 같다.
+- 실시간 12초 (rut_crossing, lockstep 전진 3.71 m)
+
+| 두뇌 | 전진 | 늦은 주기 | 명령 지연 최대 | 스캔 지연 평균 / 최대 | 건너뛴 스캔 |
+|---|---|---|---|---|---|
+| shm (3번) | 3.70 / 3.74 / 3.74 m | 0 / 600 | 20 ms | 93~96 / ~460 ms | 4~5 / 120 |
+| inproc | 3.65 m | 28 / 600 | 580 ms | 99 / 660 ms | 5 / 120 |
+
+  inproc은 두뇌와 관리 작업(기록, 스캔 전달, 화면)이 한 프로세스라 가끔 밀린다. 지형 인지 보행은 shm 또는 ros를 쓴다.
+
+**아직 이 경로에 없는 것**: Chrono(차량, 토양). `python -m sim.runner`로 실행한다.
+
+## 검토 중인 아이디어 (결정 전)
+
+**lockstep의 명령 지연을 통계적으로 흉내 내기** (2026-10-09 논의, 진행 여부 미정)
+- 지금 lockstep(같은 프로세스) 시험의 명령 지연은 한 주기(20 ms) 고정이다. 실시간에서는 가끔 더 늦는다
+  (실시간 코어 30초 측정: 1500주기 중 0~1번 40 ms). 학습은 이미 에피소드마다 0~2주기 무작위 지연을 쓴다.
+- 안: 시나리오 `control_link`에 주기마다 명령이 더 늦을 확률, 최대 추가 지연, 손실 확률을 넣는다. 늦은 주기에는 실제 로봇처럼
+  직전 명령을 한 번 더 쓴다.
+  ```yaml
+  control_link:
+    latency_steps: 1          # 기본 지연 (지금과 같음)
+    late_probability: 0.001   # 주기마다 한 주기 더 늦을 확률
+    max_extra_steps: 2
+    drop_probability: 0.0     # 명령이 사라질 확률 (무선 손실)
+  ```
+- 조건: 난수는 시나리오 시드로 정해 재현 가능해야 하고(같은 시드 = 같은 지연 순서), 분포는 실제 장비에서 잰 값을 넣는다.
+- 기대 효과: 실시간에서만 보이던 "가끔 늦는" 상황을 lockstep에서 재현 가능하게, 시드 여러 개로 통계 비교한다.
 
 ## 저사양을 고려해 의도적으로 뺀 것
 
@@ -758,5 +858,5 @@ Python 알고리즘), DIS 콘솔, 기록(Parquet)·가시화. 이 기능들은 `
 
 - 트롯 보행기는 규칙 기반이라 요철에서 방위가 최대 약 18° 흔들리고 측방 이동이 남는다 (측방 위치 제어 없음).
 - 지형 인지 트롯도 자국 안을 따라 걷기(hmmwv_follow)와 15 cm 자국에서는 자주 넘어진다 (위 지형 인지 보행 절).
-- `sim.runner`의 실시간 루프는 Python이라 지터 보장이 없다. C++ 실시간 코어(`sim.rt_link`)는 아직 일부 기능만 지원하고, 시간 보장에는 시스템 설정이 더 필요하다 (위 실시간 코어 절).
+- `sim.runner`의 실시간 루프는 Python이라 지터 보장이 없다. C++ 실시간 코어(`sim.rt_link`)는 아직 Chrono를 지원하지 않고, 시간 보장에는 시스템 설정이 더 필요하다 (위 실시간 코어 절).
 - 지형 갱신은 발 근처 셀을 보류하므로 로봇이 홈 위에 서 있으면 반영이 늦어진다 (의도된 동작).
