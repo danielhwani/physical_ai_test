@@ -497,6 +497,14 @@ def test_control_auth_and_pdu_log():
         st, body = _drive(sim, con, con.request(*parse_command("stop")))
         assert st == "DENIED" and body["reason_code"] == "NOT_IN_CONTROL"
         assert _drive(sim, obs, obs.request(*parse_command("stop")))[0] == "COMPLETED" and sim.command == (0.0, 0.0)
+        # 시험 종료 알림: 제어·관찰 콘솔 모두 받는다 (이후 링크 감시를 멈춰 통신 두절로 보이지 않게)
+        sim.dis.announce_end({"reason": "stopped", "run": "runs/x", "sim_time_s": 1.0, "forward_x_m": 0.1, "fell": False})
+        for c in (con, obs):
+            for _ in range(100):
+                if c.ended:
+                    break
+                time.sleep(0.01)
+            assert c.ended and c.ended["reason"] == "stopped", c.ended
     finally:
         probe.close(); con.close(); obs.close(); sim.dis.close(); sim.close()
     # 원본 기록: DIS_test 형식 (dir, raw hex), 버린 패킷 표시, pcap

@@ -59,6 +59,7 @@ class Console:
         self.signer = auth.Signer(key) if key else None
         self.verifier = auth.Verifier(key) if key else None
         self.has_control, self.auth_drops = False, 0
+        self.ended = None             # 시뮬레이터가 알린 시험 종료 정보
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.connect(sim_addr)          # 시뮬레이터에서 온 패킷만 받는다
         self.sock.settimeout(0.1)
@@ -113,8 +114,8 @@ class Console:
             self._link()
 
     def _link(self):
-        """heartbeat 송신 (1 s)과 시뮬레이터 보고 끊김 판정 (STALE 3 s, LOST 5 s)."""
-        if not self.connected:
+        """heartbeat 송신 (1 s)과 시뮬레이터 보고 끊김 판정 (STALE 3 s, LOST 5 s). 시험이 끝났으면 하지 않는다."""
+        if not self.connected or self.ended is not None:
             return
         now = time.monotonic()
         if now >= self.next_hb:
@@ -145,6 +146,14 @@ class Console:
         if pdu is None or pdu.exercise_id != self.exercise_id or not pdu.receiving.matches(self.entity):
             return
         if isinstance(pdu, E.DataPdu):
+            if pdu.payload.type == P.REPORT and pdu.payload.body.get("ended"):
+                if self.ended is None:
+                    self.ended = e = pdu.payload.body["ended"]
+                    why = {"stopped": "end 명령", "fell": "넘어짐", "interrupted": "시뮬레이터에서 중단",
+                           "duration": "시나리오 시간 끝"}.get(e["reason"], e["reason"])
+                    self.out(f"  시험이 끝났다 ({why}, t={e['sim_time_s']:.2f} s, 전진 {e['forward_x_m']:.2f} m). "
+                             f"기록: {e['run']}. quit로 콘솔을 끝낸다")
+                return
             if pdu.payload.type == P.REPORT:
                 self.report, self.report_rx = pdu.payload.body, time.monotonic()
                 owner = self.report.get("control_owner", str(self.entity))
@@ -432,6 +441,8 @@ def main():
             elif kind == "watch":
                 con.watch = not con.watch
                 print(f"  주기 보고 표시 {'켬' if con.watch else '끔'}")
+            elif con.ended is not None:
+                print("  시험이 이미 끝났다. 새로 하려면 시뮬레이터를 다시 띄운다")
             elif lines is not None:
                 con.call(kind, body)               # 스크립트: 완료까지 기다린다
             else:
@@ -439,7 +450,7 @@ def main():
     except KeyboardInterrupt:
         print()
     finally:
-        if con.has_control:                          # 끝낼 때 제어권을 내놓는다 (다른 콘솔이 바로 받을 수 있게)
+        if con.has_control and con.ended is None:    # 끝낼 때 제어권을 내놓는다 (다른 콘솔이 바로 받을 수 있게)
             con.call(P.RELEASE_CONTROL, timeout=3.0)
         con.close()
 

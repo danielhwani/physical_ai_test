@@ -286,6 +286,14 @@ class DisScenarioServer:
                 self.sim.events.insert(bisect.bisect_right([e["t"] for e in self.sim.events], event["t"]), event)
                 h["event"] = event
 
+    def announce_end(self, info):
+        """시험이 끝났음을 접속한 콘솔에 알린다 (마지막 주기 보고, ended). 콘솔은 이후 링크 감시를 멈춘다."""
+        self.sim.last_event = (self.sim.data.time, f"end {info['reason']}")
+        body = {"t_sim": round(self.sim.data.time, 3), "duration": self.sim.scn["duration"], "ended": info}
+        for ent, addr in self.consoles.items():
+            for _ in range(3):                        # 확인 없는 Data PDU라 몇 번 보낸다 (콘솔은 처음 것만 쓴다)
+                self._send(E.encode(E.DataPdu(self.exercise_id, P.SIM_ENTITY, ent, P.payload(P.REPORT, body))), addr)
+
     def robot_pose(self):
         """로봇 몸통 위치와 방향 (시험 판정자 쪽 참값): x, y, yaw(rad)."""
         d = self.sim.data

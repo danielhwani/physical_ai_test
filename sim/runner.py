@@ -716,6 +716,10 @@ def run(args):
     }
     rec.save(mop)
     if sim.dis is not None:                  # 콘솔 이벤트를 적용 시각으로 넣은 시나리오: python -m sim.runner <이 파일> 로 같은 결과
+        reason = ("stopped" if sim.stop_requested else "fell" if fell_at is not None else
+                  "interrupted" if interrupted else "duration")
+        sim.dis.announce_end({"reason": reason, "run": str(out.relative_to(ROOT)), "sim_time_s": mop["sim_time_s"],
+                              "forward_x_m": mop["forward_x_m"], "fell": mop["fell"]})
         sim.dis.close()
         (out / "scenario_replay.yaml").write_text(yaml.safe_dump(sim.replay_scenario(), allow_unicode=True, sort_keys=False))
     for name, scans in scan_log.items():      # LiDAR 원시 출력: 프레임별 센서 좌표 점군 + 센서 월드 자세

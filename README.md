@@ -540,7 +540,9 @@ RViz 정보판에 `FAULT:이름(남은 초)`가 빨간 글씨로 나온다. 센�
 
 **실행 제어**: `freeze`(일시정지)와 `end`(종료)는 예약할 수 있고, 적용된 제어 주기를 마친 뒤 멈춘다. 일시정지 동안에도 콘솔 요청과
 주기 보고, heartbeat는 계속된다. 일시정지 중에 접수된 명령은 재개해야 적용되므로 콘솔이 `※ 일시정지 중: resume 하면 적용`으로 알린다
-(재개는 제어권을 가진 콘솔만 할 수 있다). 일시정지·종료는 물리에 영향이 없으므로 `scenario_replay.yaml`에서 빠지고, 콘솔로 종료했으면 그 시각이 `duration`이 된다.
+(재개는 제어권을 가진 콘솔만 할 수 있다).
+시험이 끝나면(`end`, 넘어짐, 시나리오 시간 끝, 시뮬레이터 Ctrl+C) 시뮬레이터가 접속한 콘솔에 알리고, 콘솔은 `시험이 끝났다 (이유, 기록 폴더)`를 띄운 뒤
+링크 감시를 멈춘다 (전에는 끝난 시뮬레이터를 통신 두절로 표시했다). 이후 명령은 보내지 않는다. 일시정지·종료는 물리에 영향이 없으므로 `scenario_replay.yaml`에서 빠지고, 콘솔로 종료했으면 그 시각이 `duration`이 된다.
 
 **링크 감시** (DIS_test와 같은 양방향 heartbeat)
 - 콘솔 -> 시뮬레이터 `Report_ConsoleHeartbeat` 1 s, 시뮬레이터 -> 콘솔 주기 보고 0.2 s. 상대에게서 온 어떤 PDU든 생존 신호로 본다.
@@ -632,6 +634,38 @@ python -m dis_console.console --sim 127.0.0.1:3000 --key ~/.config/physics_ai_te
   ```
 - `dis_events.jsonl`(해석된 요청·결과)과 `scenario_replay.yaml`(적용된 이벤트)은 그대로 남는다. 원본 기록은 무엇이 오갔는지(인증 실패 포함),
   replay 시나리오는 시뮬레이션에 무엇이 적용됐는지를 보여 준다.
+
+**DIS_test 기록 중계기·재생기 연결** (도구는 `~/DIS_test`에 있고 이 저장소에 복사하지 않았다)
+
+```bash
+# 터미널 1: 시뮬레이터 (3000)
+python -m sim.runner scenarios/dis_console.yaml --dis-port 3000 --dis-wait --rviz --dis-key ~/.config/physics_ai_test/dis.key
+# 터미널 2: 기록 중계기 (콘솔 -> 3001 -> 시뮬레이터 3000). Enter로 링크 차단/복구, Ctrl+C로 저장하고 끝
+cd ~/DIS_test && python3 -m siman_r.recorder --listen 3001 --vehicle 127.0.0.1:3000 --out recordings/sim_session
+# 터미널 3: 콘솔은 중계기로 보낸다
+cd ~/physics_ai_test && python -m dis_console.console --sim 127.0.0.1:3001 --key ~/.config/physics_ai_test/dis.key
+# 재생 (출력만 / 수신기로 / 시뮬레이터로)
+cd ~/DIS_test
+python3 -m siman_r.player recordings/sim_session.jsonl --print --speed 0
+python3 -m siman_r.monitor --port 4000 &  python3 -m siman_r.player recordings/sim_session.jsonl --target 127.0.0.1:4000
+python3 -m siman_r.player recordings/sim_session.jsonl --target 127.0.0.1:3000 --from console
+```
+- 중계기는 바이트를 바꾸지 않고 전달하므로 인증 서명이 그대로 통과한다. 중계기 기록은 양 끝 사이(콘솔이 실제로 보낸 것)이고,
+  시뮬레이터의 `dis_pdus.*`는 시뮬레이터가 실제로 받은 것이라, 둘을 비교하면 망에서 잃은 패킷을 알 수 있다 (문서 §11.2).
+- 확인 (2026-10-09): 콘솔 -> 중계기 -> 시뮬레이터로 명령, 중계기에서 링크 8초 차단 -> 시뮬레이터 5초 뒤 통신 두절(로봇 정지, 제어권 해제)
+  -> 복구 후 콘솔이 "제어권이 풀렸다" -> `take` -> 명령 -> `end`. 패킷 125개 기록.
+- 재생기로 시뮬레이터에 다시 보낸 결과:
+
+| 대상 | 재생 방법 | 결과 |
+|---|---|---|
+| 인증 쓰는 시뮬레이터 | 기본 (Exercise ID를 99로 바꿈) | 모두 버림 (MAC 불일치. 인증 없이도 Exercise ID가 달라 버려진다) |
+| 인증 쓰는 시뮬레이터 | `--keep-exercise` (바이트 그대로) | 모두 버림 (30초 지난 캡처) |
+| 인증 없는 시뮬레이터 | `--keep-exercise` | 명령이 다시 실행된다 (접속, 이동 명령, 종료) |
+
+- 원본 PDU 재생은 벽시계 기준으로 보내므로 원래와 다른 시뮬레이션 시각에 적용된다. 똑같이 재현하려면 `scenario_replay.yaml`을 쓴다
+  (적용 시각으로 기록되어 비트 단위로 같다). 원본 재생은 연동 시험(다른 체계가 같은 PDU를 받는지, 부하)용이다.
+- 한계: 인증을 써도 새로 띄운 시뮬레이터는 30초 이내의 캡처를 처음 보는 카운터로 받아들인다 (같은 시뮬레이터 안에서는 카운터로 막힌다).
+  시뮬레이터 `dis_pdus.jsonl`의 방향은 `console->sim` / `sim->console`이라 재생기의 `--from console`은 되고 `--from vehicle`은 맞지 않는다.
 
 **아직 없는 것** (문서 §10.2의 나머지)
 - 임의 위치·여러 대 개체 투입 (지금은 시나리오에 선언한 HMMWV 한 대), 표준 Entity State PDU, 임무 명령 (C-BML Order),
