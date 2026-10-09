@@ -962,6 +962,101 @@ Python만 (sim.runner)                       C++ 실시간 코어 (sim.rt_link)
 - 대가: 상태가 두 곳(진짜와 거울)에 있고, 규약을 C++·Python 양쪽에 맞춰 두어야 하며, 같은 결과를 내려면 순서·계산 방식을 하나씩 맞춰야
   한다 (그렇게 찾은 차이: 발 수직력 덧셈 순서, 마지막 스텝 뒤 처리, 두뇌 종료 경쟁 상태).
 
+**빌드** (mj_ros 환경)
+```bash
+python -m sim.rt_link --build          # = 아래 두 줄 (실행 파일이 없으면 sim.rt_link가 처음 실행 때 알아서 빌드)
+cmake -S rt -B build/rt -DMUJOCO_DIR=$(python -c "import mujoco, os; print(os.path.dirname(mujoco.__file__))")
+cmake --build build/rt                 # rt_core.cpp, shm_layout.h를 고친 뒤에는 이것만
+./build/rt/rt_core --layout            # C++ 쪽 공유 메모리 규약. python -m sim.rt_link --layout과 같아야 함
+```
+- MuJoCo는 mj_ros pip 패키지의 `libmujoco.so`와 헤더에 링크한다 (Python 시뮬레이터와 같은 라이브러리 = 같은 물리).
+  `-O2 -ffp-contract=off`: FMA 축약을 막아 numpy와 같은 부동소수점 계산 순서. 필요: cmake 3.16 이상, C++17 컴파일러.
+- `rt/shm_layout.h`를 고치면 `rt/shm.py`도 같이 고친다 (`test_layout_matches_cpp`가 대조).
+
+**코드 구성**
+
+| 파일 | 역할 | 줄 수 |
+|---|---|---|
+| `rt/rt_core.cpp` | 몸 (C++, 유일한 C++ 코드): 20 ms 주기 보장, 물리, PD 모터, 센서 모델, 고장 적용 | 328 |
+| `rt/shm_layout.h` | 공유 메모리 규약 (C++ 쪽) | 149 |
+| `rt/shm.py` | 같은 규약의 Python 쪽 (ctypes 구조체) | 289 |
+| `sim/rt_link.py` | 관리 프로세스: 코어 실행·설정, 이벤트, 지형, 판정, 기록, 화면, DIS, Chrono, 두뇌 연결 | 826 |
+| `sim/rt_sensor.py` | LiDAR 작업 프로세스 | 96 |
+| `control/rt_brain.py` | shm 두뇌 프로세스 | 63 |
+
+`rt_core.cpp` 안: 시작(모델·공유 메모리 열기, 메모리 잠금, CPU 고정, SCHED_FIFO) → 루프마다 [멈춤 확인·대기 → 0. 지형 반영 →
+1. 로봇 상태 측정 (잡음, 편향, IMU 고장) → 2. 실행할 명령 (지연 한 주기, 마지막 명령 유지, 링크 두절) → 3. 물리 (PD, 배터리 저하,
+`mj_step` 10번, 에너지, 발 수직력) → 4. 참값·타이밍 기록]. 몸 계산은 Python 몸(`sim/robot_io.py`, `sensors/proprio.py`)을 옮긴 것이라
+한쪽을 고치면 다른 쪽도 같이 고쳐야 lockstep 결과가 같다 (어긋나면 `test_rt_core.py` 비트 동일 시험에서 드러남).
+
+**Python과 C++ 코어의 연결**: Python이 C++를 라이브러리로 부르지 않는다 (함수 호출, pybind11 없음). `rt_core`는 독립 실행 파일이고,
+`sim/rt_link.py`가 별도 프로세스로 띄운 뒤 공유 메모리(`/dev/shm`)로만 주고받는다. ctypes는 C++ 함수 호출이 아니라 메모리 모양을 맞추는 데만 쓴다.
+```
+sim/rt_link.py (Python)                                   build/rt/rt_core (C++)
+  ① 모델 저장 build/rt/model_<pid>.mjb ───────────────────▶ mj_loadModel
+  ② 공유 메모리 생성 (/dev/shm/go2_rt_<pid>, _terrain, _scan),
+     설정 칸 채움 (발 geom, 제어 주기, 스텝 수, 토크 한계, 센서 편향, 시작 자세, CPU, 우선순위), 잡음 링 채움
+  ③ subprocess.Popen([rt_core, 모델, 이름, 이름_terrain]) ─▶ shm_open + mmap (magic·version·크기가 다르면 종료)
+  ④ ctl.start = 1 ─────────────────────────────────────────▶ 루프 시작
+     주기마다: state 읽기 ◀── / cmd 쓰기 ──▶ / ctl 쓰기 (고장, 일시정지, lockstep 허락) ──▶ /
+               지형 shm 쓰기 ──▶ (다음 주기 반영) / 참값 링 읽기 ◀── (판정, 기록, 화면)
+  ⑤ ctl.stop = 1 ──────────────────────────────────────────▶ 루프 끝, stats.done = 1, 종료
+     공유 메모리 삭제, 모델 파일 정리
+```
+- 프로세스를 나눈 이유: Python(GIL, 가비지 컬렉션)의 멈춤이 C++ 루프로 번지지 않게, 코어만 SCHED_FIFO·메모리 잠금·CPU 고정.
+  코어는 공유 메모리만 보므로 두뇌가 어디 있든 (inproc / shm / ros) 코어 쪽은 바뀌지 않는다.
+
+**두뇌 연결: 로봇 상태와 관절 명령의 길**
+```
+inproc:  C++ 코어 ──shm──▶ rt_link (안에서 두뇌 함수 호출) ──shm──▶ C++ 코어
+shm:     C++ 코어 ──shm──▶ rt_brain.py ──shm──▶ C++ 코어          (rt_link는 이 길에 없다)
+ros:     C++ 코어 ──shm──▶ rt_link ──ROS2──▶ ros_node.py ──ROS2──▶ rt_link ──shm──▶ C++ 코어   (rt_link가 중계 = proxy)
+```
+`rt_link`는 코어를 띄우고 설정·감독하는 관리자다. 제어 고리의 중계자(proxy)는 ros 방식에서만이고, inproc은 두뇌를 품고, shm은 옆에서 거든다.
+
+| 단계 (shm 방식) | `rt_link` (`ShmBrain`) | `control/rt_brain.py` |
+|---|---|---|
+| 시작 | `python -m control.rt_brain --shm <이름> --scenario <복사본>` 실행 | 같은 공유 메모리를 엶, 시나리오 controller 절로 `ControllerNode` 생성 |
+| 준비 | `ctl.brain_ready`를 기다린 뒤 코어 시작 | 준비되면 `ctl.brain_ready = 1` |
+| 주기마다 | 하지 않음 (`on_state`가 비어 있음) | `state` 읽기 → 두뇌 계산 → `cmd` 쓰기 |
+| 이동 명령 | 적용 시각을 붙여 명령 링에 1초 앞서 넣음 | 링에서 꺼내 두었다가 그 시각 상태부터 적용 |
+| LiDAR | 스캔을 스캔 shm에 씀 | 상태보다 먼저 읽어 두뇌에 넣음 |
+| 기록용 | `est` 칸을 읽음 (상태 추정, 가속 제한 뒤 명령) | 명령을 쓰기 직전 `est` 칸에 씀 |
+| lockstep | 코어를 한 스텝 진행, `cmd` 시각이 그 상태 시각이 될 때까지 기다림 | 똑같이 동작 (lockstep인지 모름) |
+| 끝 | 두뇌 종료를 기다림 (3초 뒤 강제 종료), 로그 `rt_brain.log` | `stats.done`이고 남은 상태가 없으면 끝 |
+
+| 공유 메모리 칸 | 쓰는 쪽 | 읽는 쪽 |
+|---|---|---|
+| `state` (로봇 상태) | 코어 | 두뇌 |
+| `cmd` (관절 명령) | 두뇌 | 코어, `rt_link` (lockstep 대기) |
+| `est` (상태 추정) | 두뇌 | `rt_link` |
+| 명령 링 (이동 명령) | `rt_link` | 두뇌 |
+| 스캔 shm | `rt_link` | 두뇌 |
+| `ctl` (고장, 일시정지, lockstep 허락) | `rt_link` | 코어 |
+| 참값 링 | 코어 | `rt_link` |
+
+칸마다 쓰는 쪽이 하나라 잠금 없이 seqlock만 쓴다. shm 두뇌가 `rt_link`를 거치지 않는 이유: `rt_link`는 기록·화면·DIS·지형·Chrono로 가끔
+밀리는데, 그 사이를 지나가면 명령도 같이 늦어진다 (LiDAR 실시간 12초: 늦은 주기 inproc 28/600, shm 0/600). `rt_brain.py`는 `sim/`를
+import하지 않는다 (공유 메모리 규약 + 두뇌 코드만): 실제 로봇의 상위 제어기와 같은 자리다.
+
+**inproc의 두뇌 코드**: `rt_brain.py`를 복사하지 않고, 두 쪽 모두 같은 두뇌 객체 `ControllerNode`(`control/node.py`)를 부른다. 부르는 껍데기만
+다르다. `run()`은 두뇌 방식마다 같은 이름의 메서드(`ready`, `command`, `on_state`, `on_scan`, `poll`, `cmd_t`)를 가진 클래스
+(`InprocBrain`, `ShmBrain`, `RosBrain`)를 부르고, inproc은 직접 계산, shm은 공유 메모리에 넣기만, ros는 ROS2로 중계한다.
+
+| 하는 일 | `rt_brain.py` (shm) | `rt_link.py` (inproc) |
+|---|---|---|
+| 두뇌 만들기 | `ControllerNode(spec, cfg, policy, lidars)` | `Simulation`이 만든 `sim.controller` |
+| 새 상태 확인 | 자기 루프에서 `read_state()`, 스텝 번호 비교 | 주 루프에서 같게, 바뀌면 `br.on_state(ls)` |
+| 계산 → 명령 | `node.step(ls)` → `view.write_cmd()` | `InprocBrain.on_state`: `node.step(ls)` → `link.write_cmd()` |
+| 이동 명령 | 명령 링 → 그 시각 상태에서 `node.set_command()` | 이벤트 적용(`apply_events`) 때 바로 `node.set_command()` (그 시각 상태보다 먼저, `sim.runner`와 같은 순서) |
+| LiDAR | 스캔 shm → `node.on_scan()` | 스캔 받는 곳(`deliver_scans`)에서 바로 `node.on_scan()` |
+| 상태 추정 | `est` 칸에 씀 | 필요 없음 (기록 때 `node.est`를 직접 읽음) |
+| 준비 신호 | `brain_ready = 1` | 필요 없음 |
+| lockstep 대기 | 두뇌는 모름 | 같은 프로세스라 `on_state`가 끝나면 명령이 이미 있음 |
+
+`rt_brain.py`는 두뇌만 도는 전용 루프이고, inproc은 그 루프를 `rt_link` 주 루프(기록, LiDAR 전달, 화면, DIS 사이사이)에 끼워 넣은 형태다.
+그래서 inproc은 관리 작업이 밀리면 명령도 늦어진다. 결과는 lockstep 세 방식이 비트 단위로 같다.
+
 ## 검토 중인 아이디어 (결정 전)
 
 **lockstep의 명령 지연을 통계적으로 흉내 내기** (2026-10-09 논의, 진행 여부 미정)
