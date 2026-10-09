@@ -780,6 +780,47 @@ C++ 코어 rt/rt_core (실시간 루프)                     Python 관리 프�
   그래서 시간 보장의 다음 단계는 시스템 설정이다 (루트 권한): CPU 주파수 `performance`, `/dev/cpu_dma_latency`로 깊은 대기 상태 금지,
   커널 인자 `isolcpus=4,5 nohz_full=4,5 rcu_nocbs=4,5 irqaffinity=0-3`로 실시간 코어 격리.
 
+**RT 커널과 시스템 설정** (2026-10-09 확인, 이 PC: i5-9400 6코어)
+
+RT 커널은 부팅된 순간부터 항상 켜져 있다 (`PREEMPT_RT`는 컴파일 단계 기능이라 실행 중 켜고 끄는 스위치가 없다). 따로 "활성화"할 것은 없고,
+좋아질 여지는 커널 위의 시스템 설정(절전)에 있다.
+
+| 확인 항목 | 이 PC 값 | 뜻 |
+|---|---|---|
+| `uname -v` | `PREEMPT_RT` | 완전 선점형 실시간 커널로 부팅됨 |
+| `/boot/config-$(uname -r)` | `CONFIG_PREEMPT_RT=y` | 실시간 커널 설정 |
+| `cat /sys/kernel/realtime` | 1 | 실시간 커널로 동작 중 |
+| `ulimit -r` | 99 | 일반 사용자도 SCHED_FIFO 사용 가능 |
+| `ulimit -l` | 약 1 GB | 코어의 `mlockall` 가능 |
+| CPU 주파수 정책 | `powersave` (800 MHz~4.1 GHz) | 절전: 낮은 클럭 유지 |
+| 깊은 대기 상태 | C10까지 (깨어남 최대 890 µs) | 절전: 깨어날 때 늦음 |
+| 코어 격리 | 없음 | CPU 5에 다른 작업·인터럽트도 옴 |
+
+부팅할 때마다 확인: `cat /sys/kernel/realtime` (1이면 RT 커널), `uname -v` (`PREEMPT_RT`). 일반 커널(generic, 예: GPU 시험용)로
+부팅하면 RT 기능이 없다 (일반 커널의 부팅 옵션 `preempt=full` 등은 선점 정도만 바꾸며 PREEMPT_RT와 다르다).
+
+RT 커널이어도 자동이 아닌 것:
+1. **프로그램이 직접 요청해야 실시간으로 돈다.** 보통 프로그램은 RT 커널에서도 일반 스케줄링이다. C++ 코어는 스스로 SCHED_FIFO 80,
+   메모리 잠금, CPU 고정을 요청하고 결과를 MOP(`sched_fifo`, `mlockall`)에 남긴다 (지금까지 모두 True). `sim.runner`는 `--rt`일 때만
+   (우선순위 50). 두뇌, 관리 프로세스, Chrono, LiDAR 작업 프로세스는 일반 스케줄링이다.
+2. **실시간 작업에도 시간 제한이 있다.** 1초 중 0.95초까지만 (`/proc/sys/kernel/sched_rt_runtime_us` 950000). 코어는 주기마다 잠들어
+   해당하지 않는다 (잠들지 않고 기다리는 방식을 시험했을 때 여기에 걸려 매초 멈췄다).
+3. **절전 설정은 RT 커널과 별개다.** 주파수 정책과 깊은 대기 상태는 그대로라, 남은 계산 시간 튐(최대 19~24 ms)과 가끔의 주기 초과 원인이다.
+
+시스템 설정 (sudo, 직접 실행. 앞의 두 가지는 재부팅하면 원래대로):
+
+| 설정 | 명령 | 되돌리기 | 기대 효과 |
+|---|---|---|---|
+| 주파수 고정 | `echo performance \| sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor` | `powersave`로 같은 명령 | 계산 시간 튐 감소 (물리 10스텝: 쉬지 않으면 0.8 ms, 쉬다 깨면 3.4 ms). Chrono·LiDAR도 빨라질 가능성 |
+| 깊은 대기 상태 끄기 (C3~C10) | `for s in /sys/devices/system/cpu/cpu*/cpuidle/state[3-8]/disable; do echo 1 \| sudo tee $s; done` | `echo 0`으로 같은 명령 | 깨어남 지연·계산 최대값 감소 → 주기 초과 감소 |
+| 코어 격리 | GRUB `GRUB_CMDLINE_LINUX`에 `isolcpus=4,5 nohz_full=4,5 rcu_nocbs=4,5 irqaffinity=0-3` 추가, `sudo update-grub`, 재부팅 | 지우고 다시 `update-grub` | CPU 5(코어)에 다른 작업·인터럽트가 오지 않음. 가장 확실하지만 부팅 설정 변경 |
+
+- 좋아지지 않는 것: 두뇌·LiDAR·Chrono의 계산량 자체 (최고 클럭 유지로 빨라질 수는 있다. HMMWV 멈춤이 얼마나 줄지는 재 봐야 안다).
+  shm 두뇌의 명령 지연은 이미 항상 20 ms.
+- 대가: 소비 전력과 발열 증가. 시험할 때만 켜고 끝나면 되돌리거나 재부팅한다.
+- 권하는 순서: 재부팅 없는 두 가지를 먼저 켜고 같은 측정(flat_trot 30초의 주기 초과·깨어남·계산 시간, vehicle_crossing 실시간의 Chrono
+  멈춤)으로 전후를 비교한 뒤, 부족하면 코어 격리를 검토한다.
+
 **가시화** (`--rviz`, `--mjviz`): 관리 프로세스가 코어의 참값으로 자기 쪽 MuJoCo 데이터를 맞추고(`mj_forward`) `sim.runner`와 같은
 렌더 스트림(`/tf`, `/clock`, 지형, 정보판)을 25 Hz로 발행한다. RViz 설정과 어댑터는 그대로다. 실시간 루프 밖이라 화면이 느려도 코어 주기에는
 영향이 없다 (확인: 10초 발행 중 주기 초과 0, 별도 프로세스 두뇌의 늦은 주기 0). 창을 닫으면 끝나고, 끝나면 최종 MOP를 정보판에 남긴다.
