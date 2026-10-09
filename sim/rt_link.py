@@ -702,7 +702,7 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
             "cmd_late_steps": int((lat_ms > 1000 * link.control_dt + 1e-3).sum()),   # 명령이 한 주기보다 늦게 실행된 주기 수
             "noise_underruns": int(st.noise_underruns), "mlockall": bool(st.locked), "sched_fifo": bool(st.rt_ok),
         }
-        mop["min_vehicle_distance_m"] = round(sim.cosim.min_dist, 3) if sim.cosim is not None and sim.cosim.has_vehicle else None
+        mop["min_vehicle_distance_m"] = round(sim.cosim.min_dist, 3) if sim.cosim is not None and np.isfinite(sim.cosim.min_dist) else None   # 차가 한 번도 안 나왔으면 None
         mop.update(terrain_deformation(terrain0, sim.terrain.applied))
         if rec is not None:
             mop.update({"touchdowns": touchdowns, "edge_touchdowns": edge_touchdowns,

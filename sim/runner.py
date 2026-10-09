@@ -702,7 +702,7 @@ def run(args):
         "lateral_drift_m": round(float(d.qpos[1] - start_xy[1]), 3),
         "mean_speed_mps": round(dist / max(d.time - 1.0, 1e-6), 3),
         "cost_of_transport": round(energy_total / (sim.total_mass * 9.81 * max(dist, 1e-6)), 3),
-        "min_vehicle_distance_m": round(sim.cosim.min_dist, 3) if sim.cosim is not None and sim.cosim.has_vehicle else None,
+        "min_vehicle_distance_m": round(sim.cosim.min_dist, 3) if sim.cosim is not None and np.isfinite(sim.cosim.min_dist) else None,   # 차가 한 번도 안 나왔으면 None
         **terrain_deformation(terrain0, sim.terrain.applied),
         # 보행 알고리즘의 상태 추정 오차 (알고리즘은 참값을 모른다. 여기서 판정만 한다)
         "est_speed_rmse_mps": round(float(np.sqrt(np.mean(np.square(est_err_v[25:])))), 4) if len(est_err_v) > 25 else None,
