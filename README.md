@@ -1035,13 +1035,23 @@ ros:     C++ 코어 ──shm──▶ rt_link ──ROS2──▶ ros_node.py �
 | `ctl` (고장, 일시정지, lockstep 허락) | `rt_link` | 코어 |
 | 참값 링 | 코어 | `rt_link` |
 
-칸마다 쓰는 쪽이 하나라 잠금 없이 seqlock만 쓴다. shm 두뇌가 `rt_link`를 거치지 않는 이유: `rt_link`는 기록·화면·DIS·지형·Chrono로 가끔
-밀리는데, 그 사이를 지나가면 명령도 같이 늦어진다 (LiDAR 실시간 12초: 늦은 주기 inproc 28/600, shm 0/600). `rt_brain.py`는 `sim/`를
-import하지 않는다 (공유 메모리 규약 + 두뇌 코드만): 실제 로봇의 상위 제어기와 같은 자리다.
+칸마다 쓰는 쪽이 하나라 잠금 없이 seqlock만 쓴다.
 
-**inproc의 두뇌 코드**: `rt_brain.py`를 복사하지 않고, 두 쪽 모두 같은 두뇌 객체 `ControllerNode`(`control/node.py`)를 부른다. 부르는 껍데기만
-다르다. `run()`은 두뇌 방식마다 같은 이름의 메서드(`ready`, `command`, `on_state`, `on_scan`, `poll`, `cmd_t`)를 가진 클래스
-(`InprocBrain`, `ShmBrain`, `RosBrain`)를 부르고, inproc은 직접 계산, shm은 공유 메모리에 넣기만, ros는 ROS2로 중계한다.
+**왜 shm 두뇌는 `rt_link`를 거치지 않게 했나**
+- `rt_link`는 기록, 화면, DIS, 지형, Chrono 같은 무거운 일을 하는 Python 프로세스라 가끔 밀린다. 상태와 명령이 그 사이를 지나가면
+  `rt_link`가 밀릴 때 명령도 같이 늦어진다. inproc에서 실제로 그랬다: LiDAR 실시간 12초 실행에서 늦은 주기가 inproc 28/600, shm 0/600.
+  shm 두뇌는 코어와 직접 이어져 있어 `rt_link`가 밀려도 제어 고리에 영향이 없다.
+- `rt_brain.py`는 `sim/`를 import하지 않는다. 시뮬레이터 코드 없이 공유 메모리 규약(`rt/shm.py`)과 두뇌 코드(`control/`)만 쓰므로,
+  실제 로봇의 상위 제어기와 같은 자리에 있다.
+
+**inproc 방식에도 `rt_brain.py`와 같은 일을 하는 코드가 있나**: 있다. 다만 `rt_brain.py`를 복사한 것이 아니고, 두 쪽 모두 같은 두뇌 객체
+`ControllerNode`(`control/node.py`)를 부른다. 다른 것은 그 객체를 부르는 "껍데기"뿐이고, inproc에서는 그 껍데기가 `rt_link`의
+`InprocBrain` 클래스와 주 루프에 나뉘어 들어 있다.
+- 이것이 가능한 이유: `run()`은 두뇌 방식마다 같은 이름의 메서드(`ready`, `command`, `on_state`, `on_scan`, `poll`, `cmd_t`)를 가진
+  클래스(`InprocBrain`, `ShmBrain`, `RosBrain`)를 쓴다. 어느 방식이든 같은 메서드를 부르고, inproc은 두뇌를 직접 부르고, shm은 공유
+  메모리에 넣기만 하고 계산은 `rt_brain.py`에 맡기며, ros는 ROS2로 중계한다.
+
+대응 관계:
 
 | 하는 일 | `rt_brain.py` (shm) | `rt_link.py` (inproc) |
 |---|---|---|
