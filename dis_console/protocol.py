@@ -6,7 +6,9 @@ Action Response-R(57) Pending -> Complete, 응답이 없으면 같은 Request ID
 페이로드 언어는 시나리오 관리(PAYLOAD_LANG 4). 아래 값은 모두 설명용 예시값이며 인터페이스 규약에서 확정한다.
 
 메시지 (body의 t_apply: 적용할 시뮬레이션 시각. 없으면 받은 다음 제어 주기에 적용)
-  Request_Connection                      -> 시나리오 이름, 시뮬레이션 시각, 지원 메시지
+  Request_Connection {role}               -> 시나리오 이름, 시뮬레이션 시각, 지원 메시지. role: control(기본, 명령 가능, 한 콘솔만)
+                                             또는 observe(주기 보고만). 제어권이 다른 콘솔에 있으면 CONTROL_BUSY
+  Request_ReleaseControl                  -> 제어권 내놓기 (관찰 콘솔이 됨)
   Event_SetCommand    {vx, yaw_rate}      -> 로봇(Go2) 운용자 이동 명령 (가상 모드 전용)
   Event_AddTerrainPatch {patch}           -> 지형 변경 (bump / rough / ramp / rut, 시나리오 patches와 같은 형식)
   Event_InjectFault {fault, duration, params} -> 고장 주입 (로봇 쪽 경계). duration 없으면 Event_ClearFault까지
@@ -27,8 +29,9 @@ Action Response-R(57) Pending -> Complete, 응답이 없으면 같은 Request ID
   Report_SimStatus (Data PDU, 0.2 s)      <- 시뮬레이션 시각, 로봇 위치·방향(판정자 참값), 명령, 마지막 이벤트, 고장, 일시정지,
                                              링크 상태
   Report_ConsoleHeartbeat (Data PDU, 1 s) -> 콘솔 생존 신호 (DIS_test와 같음)
-링크 감시: 접속한 콘솔 모두에게서 COMM_LOST_S 동안 아무것도 오지 않으면 통신 두절. 시뮬레이터는 단절 시 동작
-(STOP: 로봇 이동 명령 0을 이벤트로 넣음, CONTINUE: 그대로)을 실행하고 기록한다. 콘솔은 STALE 3 s, LOST 5 s로 표시.
+링크 감시: 제어 콘솔에게서 COMM_LOST_S 동안 아무것도 오지 않으면 통신 두절. 시뮬레이터는 단절 시 동작
+(STOP: 로봇 이동 명령 0을 이벤트로 넣음, CONTINUE: 그대로)을 실행하고 기록하며 제어권을 푼다. 콘솔은 STALE 3 s, LOST 5 s로 표시.
+인증: 공유 키가 있으면 모든 PDU 끝에 HMAC 서명 datum (dis_console/auth.py). 맞지 않는 PDU는 응답 없이 버린다.
 좌표는 시뮬레이터 세계 좌표 (원점 = 로봇 출발점, +x = 처음 바라본 방향, +y = 왼쪽). 지형 패치의 Complete 응답에는
 적용 순간의 로봇 기준 위치 robot_rel [앞, 왼쪽]이 들어간다 (로봇이 이미 지나간 곳인지 알 수 있게)
 """
@@ -40,6 +43,7 @@ CONSOLE_ENTITY = E.EntityId(2, 1, 1)
 DEFAULT_PORT = 3000
 
 CONNECT = "Request_Connection"
+RELEASE_CONTROL = "Request_ReleaseControl"
 SET_COMMAND = "Event_SetCommand"
 ADD_PATCH = "Event_AddTerrainPatch"
 INJECT_FAULT = "Event_InjectFault"
@@ -48,7 +52,7 @@ FREEZE, RESUME, STOP = "Event_Freeze", "Event_Resume", "Event_Stop"
 CREATE_ENTITY, REMOVE_ENTITY, SET_SOIL = "Event_CreateEntity", "Event_RemoveEntity", "Event_SetSoil"
 REPORT = "Report_SimStatus"
 HEARTBEAT = "Report_ConsoleHeartbeat"
-SUPPORTED = [CONNECT, SET_COMMAND, ADD_PATCH, INJECT_FAULT, CLEAR_FAULT, CREATE_ENTITY, REMOVE_ENTITY, SET_SOIL,
+SUPPORTED = [CONNECT, RELEASE_CONTROL, SET_COMMAND, ADD_PATCH, INJECT_FAULT, CLEAR_FAULT, CREATE_ENTITY, REMOVE_ENTITY, SET_SOIL,
              FREEZE, RESUME, STOP]
 ENTITY_TYPES = ("HMMWV",)
 # 흙 (Bekker-Wong + Janosi, Chrono SCM). 자국 깊이는 HMMWV 기준 이 PC 측정값 (scenarios/vehicle_crossing*.yaml)

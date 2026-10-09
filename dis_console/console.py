@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 
+from . import auth
 from . import envelope as E
 from . import protocol as P
 
@@ -45,14 +46,19 @@ HELP = """명령 (좌표는 세계 좌표 m: 원점 = 로봇 출발점, +x = 처
   soil <hard|firm|soft|mud>      흙 상태 (Chrono SCM)
   freeze / resume                일시정지 / 재개 (freeze는 @T 가능)
   end                            시험 종료 (기록·MOP 저장, @T 가능)
+  release / take                 제어권 내놓기 (관찰 콘솔이 됨) / 다시 받기
   status                         마지막 주기 보고
   watch                          주기 보고 계속 표시 켜기/끄기
   help / quit"""
 
 
 class Console:
-    def __init__(self, sim_addr, entity=P.CONSOLE_ENTITY, exercise_id=P.EXERCISE_ID, out=print):
+    def __init__(self, sim_addr, entity=P.CONSOLE_ENTITY, exercise_id=P.EXERCISE_ID, out=print, key=None):
+        """key: 인증 공유 키 (bytes). 있으면 보내는 PDU에 서명하고 받은 PDU의 서명을 확인한다 (아니면 버림)."""
         self.entity, self.exercise_id, self.out = entity, exercise_id, out
+        self.signer = auth.Signer(key) if key else None
+        self.verifier = auth.Verifier(key) if key else None
+        self.has_control, self.auth_drops = False, 0
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.connect(sim_addr)          # 시뮬레이터에서 온 패킷만 받는다
         self.sock.settimeout(0.1)
@@ -75,6 +81,8 @@ class Console:
             req_id, self.next_id = self.next_id, self.next_id + 1
             pdu = E.ActionRequestR(self.exercise_id, self.entity, P.SIM_ENTITY, req_id, P.payload(type_, body))
             raw = E.encode(pdu)
+            if self.signer:                              # 서명한 바이트를 그대로 재전송한다 (시뮬레이터가 같은 패킷으로 알아봄)
+                raw = self.signer.sign(raw)
             now = time.monotonic()
             self.reqs[req_id] = {"type": type_, "raw": raw, "sent": now, "tries": 1, "last_rx": None, "created": now,
                                  "status": None, "body": None, "final": threading.Event(), "deadline": now + FINAL_TIMEOUT}
@@ -111,10 +119,10 @@ class Console:
         now = time.monotonic()
         if now >= self.next_hb:
             self.next_hb, self.hb_seq = now + P.HEARTBEAT_S, self.hb_seq + 1
-            hb = E.DataPdu(self.exercise_id, self.entity, P.SIM_ENTITY,
-                           P.payload(P.HEARTBEAT, {"seq": self.hb_seq, "link_state": self.link_state}))
+            hb = E.encode(E.DataPdu(self.exercise_id, self.entity, P.SIM_ENTITY,
+                                    P.payload(P.HEARTBEAT, {"seq": self.hb_seq, "link_state": self.link_state})))
             try:
-                self.sock.send(E.encode(hb))
+                self.sock.send(self.signer.sign(hb) if self.signer else hb)
             except ConnectionRefusedError:
                 pass
         silent = now - (self.report_rx or now)
@@ -125,12 +133,24 @@ class Console:
                       "LOST": f"  통신 두절 ({silent:.0f} s): 시뮬레이터가 단절 시 동작을 실행했을 수 있음"}[state])
 
     def _handle(self, data):
+        if self.verifier:
+            try:
+                data = self.verifier.verify(data)
+            except auth.AuthError as e:
+                self.auth_drops += 1
+                if self.auth_drops in (1, 10, 100):
+                    self.out(f"  인증 실패로 버림 ({self.auth_drops}번째): {e}")
+                return
         pdu = E.decode(data)
         if pdu is None or pdu.exercise_id != self.exercise_id or not pdu.receiving.matches(self.entity):
             return
         if isinstance(pdu, E.DataPdu):
             if pdu.payload.type == P.REPORT:
                 self.report, self.report_rx = pdu.payload.body, time.monotonic()
+                owner = self.report.get("control_owner", str(self.entity))
+                if self.has_control and owner != str(self.entity):
+                    self.has_control = False
+                    self.out(f"  제어권이 풀렸다 (지금 제어: {owner or '없음'}). 다시 받으려면 take")
                 if self.watch and self.report_rx >= self.next_watch:      # 보고는 0.2 s마다, 표시는 1 s마다
                     self.next_watch = self.report_rx + 1.0
                     self.out(self.format_report())
@@ -152,6 +172,9 @@ class Console:
             final = pdu.request_status in E.FINAL_STATUSES
             if r["type"] == P.CONNECT and result == "COMPLETED":
                 self.connected, self.report_rx = True, time.monotonic()
+                self.has_control = body.get("role") == "control"
+            if r["type"] == P.RELEASE_CONTROL and result == "COMPLETED":
+                self.has_control = False
         self.out(f"  [{pdu.request_id}] {r['type']}: {self.format_result(result, body)}")
         if final:
             r["final"].set()
@@ -206,7 +229,8 @@ class Console:
         if result == "ACCEPTED" and body.get("timing") == "cross_ahead":
             return f"접수, 로봇 앞을 지나가도록 t={body['scheduled_t']:.2f}쯤 출발 예정 ({body.get('detail', '')})"
         if result == "ACCEPTED":
-            return f"접수, t={body['scheduled_t']:.2f}에 적용 예정 (지금 t={body['t_sim']:.2f})"
+            note = "  ※ 일시정지 중: resume 하면 적용" if body.get("frozen") else ""
+            return f"접수, t={body['scheduled_t']:.2f}에 적용 예정 (지금 t={body['t_sim']:.2f}){note}"
         if result == "COMPLETED":
             if "applied_t" in body:
                 text = f"적용 완료 t={body['applied_t']:.2f}"
@@ -218,8 +242,11 @@ class Console:
                         text += "  ※ 로봇이 이미 지나간 곳"
                 return text
             if "scenario" in body:
-                return (f"접속 완료: 시나리오 {body['scenario']}, t={body['t_sim']:.2f}/{body['duration']} s, "
-                        f"지원 {', '.join(body['supported'])}")
+                role = {"control": "제어", "observe": "관찰"}.get(body.get("role"), body.get("role"))
+                return (f"접속 완료 ({role}{', 인증' if body.get('auth') else ''}): 시나리오 {body['scenario']}, "
+                        f"t={body['t_sim']:.2f}/{body['duration']} s, 지금 제어: {body.get('control_owner') or '없음'}")
+            if body.get("role") == "observe":
+                return "제어권을 내놓았다 (관찰)"
         return f"{result} {body.get('reason_code', '')} {body.get('detail', '')}".rstrip()
 
     def format_report(self):
@@ -236,6 +263,8 @@ class Console:
             text += f"  {v['type']} x={v['x']:.1f} y={v['y']:.1f} {v['speed']:.1f} m/s"
         if r.get("frozen"):
             text += "  [일시정지]"
+        if r.get("control_owner") is None:
+            text += "  [제어 콘솔 없음]"
         if r.get("comm_state", "OK") != "OK":
             text += f"  [시뮬레이터 쪽 링크 {r['comm_state']}]"
         return text
@@ -257,6 +286,10 @@ def parse_command(line, pose=None):
     a = rest.split()
     if op in ("status", "watch", "help", "quit", "exit"):
         return op, None
+    if op == "release":
+        return P.RELEASE_CONTROL, {}
+    if op == "take":
+        return P.CONNECT, {"role": "control"}
     if op == "cmd":
         body = {"vx": float(a[0]), "yaw_rate": float(a[1]) if len(a) > 1 else 0.0}
         kind = P.SET_COMMAND
@@ -352,13 +385,18 @@ def main():
     ap.add_argument("--entity", default=str(P.CONSOLE_ENTITY), help="콘솔 Entity ID site/app/entity")
     ap.add_argument("--exercise", type=int, default=P.EXERCISE_ID)
     ap.add_argument("--send", action="append", metavar="CMD", help="이 명령들을 차례로 보내고(각각 완료까지) 끝낸다")
+    ap.add_argument("--observe", action="store_true", help="관찰만 (주기 보고를 받고 명령은 못 함). 제어권은 다른 콘솔에")
+    ap.add_argument("--key", metavar="FILE", help="인증 공유 키 파일 (시뮬레이터 --dis-key와 같은 파일)")
     args = ap.parse_args()
     host, port = args.sim.rsplit(":", 1)
-    con = Console((host, int(port)), E.EntityId.parse(args.entity), args.exercise)
+    con = Console((host, int(port)), E.EntityId.parse(args.entity), args.exercise,
+                  key=auth.load_key(args.key) if args.key else None)
     try:
         print(f"시뮬레이터 {args.sim}에 접속...")
-        status, _ = con.call(P.CONNECT)
+        status, _ = con.call(P.CONNECT, {"role": "observe" if args.observe else "control"})
         if status != "COMPLETED":
+            if status is None and not args.key:
+                print("  응답 없음: 시뮬레이터가 꺼져 있거나 인증을 쓰는 중일 수 있다 (--key)")
             sys.exit(1)
         lines = args.send
         if lines is None:
@@ -401,6 +439,8 @@ def main():
     except KeyboardInterrupt:
         print()
     finally:
+        if con.has_control:                          # 끝낼 때 제어권을 내놓는다 (다른 콘솔이 바로 받을 수 있게)
+            con.call(P.RELEASE_CONTROL, timeout=3.0)
         con.close()
 
 

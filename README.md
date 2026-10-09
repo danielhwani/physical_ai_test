@@ -36,7 +36,7 @@ python conformance/test_control.py                       # 로봇 경계: 알고
 python conformance/test_lidar.py                         # LiDAR: 스트림만으로 재현, 지형 표면, 자기 몸 제외
 python conformance/test_perception.py                    # 지형 인지: 높이 지도, 디딜 곳, LiDAR 지도 정확도, 점군만으로 재현, height_scan 규약
 python conformance/test_ros_equivalence.py               # ROS 노드 = 같은 프로세스(20 ms 지연 흉내) (ROS2 필요)
-python conformance/test_dis_console.py                   # DIS 콘솔: 핸드셰이크, 고장 주입, 실행 제어, 링크 감시, HMMWV 투입·흙(Chrono), 기록으로 비트 단위 재실행
+python conformance/test_dis_console.py                   # DIS 콘솔: 핸드셰이크, 고장 주입, 실행 제어, 링크 감시, 제어권·인증·원본 기록, HMMWV 투입·흙(Chrono), 기록으로 비트 단위 재실행
 python conformance/test_render_stream.py                 # 렌더 스트림 계약 (스트림만으로 장면 재구성 = 시뮬레이터)
 python conformance/compare_variants.py [--policy card.yaml]   # cpu vs mjx 설정의 MOP 분포 비교
 python conformance/make_obs_reference.py                 # (관측 명세를 바꾼 경우) 기준 벡터 재생성
@@ -461,7 +461,8 @@ python -m dis_console.console --send "cmd 0.35" --send "rut 3.0 @12"
 
 | 메시지 | body | 동작 |
 |---|---|---|
-| `Request_Connection` | – | 접속. 주기 보고를 받기 시작 |
+| `Request_Connection` | `role`(control / observe) | 접속. 주기 보고를 받기 시작. control은 한 콘솔만 (다른 콘솔이 갖고 있으면 `CONTROL_BUSY`) |
+| `Request_ReleaseControl` | – | 제어권 내놓기 (관찰 콘솔이 됨) |
 | `Event_SetCommand` | `vx`, `yaw_rate`, (`t_apply`) | 로봇 운용자 이동 명령 (가상 모드 전용. 범위 \|vx\| ≤ 1, \|yaw_rate\| ≤ 1.5) |
 | `Event_AddTerrainPatch` | `patch`, (`t_apply`) | 지형 변경: bump / rough / ramp / rut (시나리오 `patches`와 같은 형식). Complete에 `robot_rel` |
 | `Event_InjectFault` | `fault`, `duration`(없으면 해제까지), `params`, (`t_apply`) | 고장 주입 (아래 표) |
@@ -538,7 +539,8 @@ dis> watch          # 1초마다 상태 표시 (고장 이름과 남은 시간)
 RViz 정보판에 `FAULT:이름(남은 초)`가 빨간 글씨로 나온다. 센서를 별도 노드로 돌리는 `--sensor-node`에서는 `lidar_blackout`이 적용되지 않는다.
 
 **실행 제어**: `freeze`(일시정지)와 `end`(종료)는 예약할 수 있고, 적용된 제어 주기를 마친 뒤 멈춘다. 일시정지 동안에도 콘솔 요청과
-주기 보고, heartbeat는 계속된다. 일시정지·종료는 물리에 영향이 없으므로 `scenario_replay.yaml`에서 빠지고, 콘솔로 종료했으면 그 시각이 `duration`이 된다.
+주기 보고, heartbeat는 계속된다. 일시정지 중에 접수된 명령은 재개해야 적용되므로 콘솔이 `※ 일시정지 중: resume 하면 적용`으로 알린다
+(재개는 제어권을 가진 콘솔만 할 수 있다). 일시정지·종료는 물리에 영향이 없으므로 `scenario_replay.yaml`에서 빠지고, 콘솔로 종료했으면 그 시각이 `duration`이 된다.
 
 **링크 감시** (DIS_test와 같은 양방향 heartbeat)
 - 콘솔 -> 시뮬레이터 `Report_ConsoleHeartbeat` 1 s, 시뮬레이터 -> 콘솔 주기 보고 0.2 s. 상대에게서 온 어떤 PDU든 생존 신호로 본다.
@@ -594,14 +596,48 @@ RViz 정보판에 `FAULT:이름(남은 초)`가 빨간 글씨로 나온다. 센�
     로봇 궤적이 비트 단위로 같다 (`test_console_events_replay_bit_identical`, 고장 주입 포함). 실제 실행에서도
     링크 두절·일시정지·예약 종료가 들어간 세션의 종료 시각, 전진 거리, 옆 표류가 같았다.
   - 이벤트는 제어 주기 시작에서 적용한다. 같은 프로세스 실행이 결정적이므로, 언제 도착했든 적용 시각만 같으면 결과가 같다.
-- **이 PC 안에서만**: 시뮬레이터는 127.0.0.1에서만 받는다. 다른 장비의 콘솔을 붙이려면 받는 주소를 바꾸고
-  메시지 인증(아래 "아직 없는 것")을 먼저 갖춰야 한다. 지금은 같은 네트워크의 누구나 명령을 보낼 수 있는 구조이기 때문이다.
+**제어권** (DIS_test와 같은 방식)
+- 명령할 수 있는 콘솔은 하나다. 콘솔은 기본으로 제어권을 요청하고(`role: control`), 이미 다른 콘솔에 있으면 `CONTROL_BUSY`로 거부된다.
+  `--observe`로 접속하면 관찰 콘솔이 되어 주기 보고만 받고, 명령하면 `NOT_IN_CONTROL`로 거부된다.
+- 콘솔 명령 `release`(내놓기), `take`(받기). 콘솔을 `quit`으로 끝내면 제어권을 내놓는다.
+- 제어 콘솔이 통신 두절되면 단절 시 동작을 실행하고 제어권을 푼다. 그 콘솔이 돌아와도 링크만 OK가 되고, 제어권은 `take`로 다시 받아야 한다
+  (그 사이 다른 콘솔이 받았을 수 있음). 콘솔은 주기 보고의 `control_owner`로 제어권이 풀린 것을 알린다.
+
+**메시지 인증** (`dis_console/auth.py`, HMAC-SHA256 공유 키)
+```bash
+python -m dis_console.auth keygen ~/.config/physics_ai_test/dis.key       # 키 만들기 (권한 600, 저장소 밖에 둔다)
+python -m sim.runner scenarios/dis_console.yaml --dis-port 3000 --dis-wait --rviz --dis-key ~/.config/physics_ai_test/dis.key
+python -m dis_console.console --sim 127.0.0.1:3000 --key ~/.config/physics_ai_test/dis.key
+```
+- 키가 있으면 모든 PDU 끝에 Variable Datum 하나(카운터 8 B + HMAC 32 B)를 붙이고, 받은 PDU는 확인해서 맞지 않으면 **응답 없이 버린다**
+  (공격자에게 단서를 주지 않음). 시뮬레이터 터미널에 `DIS 인증 실패로 버림`이 나오고 원본 기록에 `"dropped": "auth"`로 남는다.
+- MAC은 헤더(Exercise ID, PDU 종류, 타임스탬프)와 페이로드를 모두 덮는다. 한 바이트라도 바뀌면 거부된다 (예: DIS_test 재생기가 Exercise ID를 99로 바꾼 명령).
+- 재전송 공격: 카운터 = 보낸 시각(마이크로초). 30초 넘게 어긋나면(오래된 캡처) 거부하고, 보낸 쪽별로 카운터가 줄면 거부한다.
+  응답이 없어 같은 요청을 그대로 다시 보내는 핸드셰이크 재전송은 최근 받은 패킷과 바이트까지 같으면 받는다 (다시 실행하지 않고 응답만).
+  다른 장비끼리 쓰려면 시계를 맞춰야 한다 (NTP/PTP).
+- 인증 datum을 모르는 체계(DIS_test, Wireshark)도 Variable Datum이 하나 더 있는 것으로 읽는다.
+- 키 없는 콘솔로 접속하면 응답이 없어 콘솔이 "인증을 쓰는 중일 수 있다 (`--key`)"고 알린다.
+
+**받는 주소**: 기본은 이 PC 안(127.0.0.1)에서만 받는다. `--dis-host <주소>`로 다른 장비의 콘솔을 받을 수 있지만, **`--dis-key`가 없으면
+실행을 거부한다** (인증 없이 열면 같은 네트워크의 누구나 로봇에 명령할 수 있다). 다른 장비의 콘솔은 `--sim <시뮬레이터 주소>:3000 --key <같은 키>`.
+이 기능은 이 PC 안에서만 시험했다.
+
+**원본 PDU 기록** (`dis_pdus.jsonl`, `dis_pdus.pcap`, 문서 §11 원본 층)
+- 시뮬레이터가 받고 보낸 PDU를 그대로 남긴다. 형식은 DIS_test 기록 중계기와 같아 그쪽 도구로 바로 읽힌다:
+  ```bash
+  cd ~/DIS_test
+  python3 -m siman_r.player ~/physics_ai_test/runs/<실행>/dis_pdus.jsonl --print --speed 0      # 타임라인
+  python3 -m siman_r.player ~/physics_ai_test/runs/<실행>/dis_pdus.pcap --print --vehicle-port 3000
+  wireshark ~/physics_ai_test/runs/<실행>/dis_pdus.pcap                                          # UDP 3000 = DIS
+  ```
+- `dis_events.jsonl`(해석된 요청·결과)과 `scenario_replay.yaml`(적용된 이벤트)은 그대로 남는다. 원본 기록은 무엇이 오갔는지(인증 실패 포함),
+  replay 시나리오는 시뮬레이션에 무엇이 적용됐는지를 보여 준다.
 
 **아직 없는 것** (문서 §10.2의 나머지)
 - 임의 위치·여러 대 개체 투입 (지금은 시나리오에 선언한 HMMWV 한 대), 표준 Entity State PDU, 임무 명령 (C-BML Order),
   기상(날씨, 시정 -> 센서 영향), 교전 효과, 장애물·지뢰, 전자전 (GNSS 재밍, 통신 열화. 링크 두절은 고장 주입으로 가능)
-- 초기 구성 MSDL (지금은 시나리오 YAML), 기록 중계기·재생기 연결
-- 메시지 인증(HMAC)·암호화, 콘솔 제어권 (지금은 접속한 콘솔이 모두 명령 가능)
+- 초기 구성 MSDL (지금은 시나리오 YAML)
+- 암호화 (인증만 있고 내용은 보인다), 키 교체·여러 키, 다른 장비 사이 시험
 - Live 로봇 권한 분리: 실제 로봇에는 이동 명령이 아니라 임무만 보내야 한다 (§10.1). 지금의 `Event_SetCommand`는 가상 모드 전용이다.
 
 ## 강화학습 준비 (GPU 장비에서)

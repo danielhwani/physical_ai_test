@@ -18,6 +18,9 @@
    Chrono 없는 시나리오는 거부. 이 세션도 기록으로 다시 돌리면 로봇과 차량이 비트 단위로 같다.
    spawn ahead: 차가 로봇 앞을 먼저 지나가도록 출발 시각을 맞춘다 (늦으면 TOO_LATE). 시점이 어긋나면 차가 로봇에게 양보한다.
    dis_footprints: 흙을 무르게 하면 로봇 발자국이 깊어진다
+8. 제어권·인증·원본 기록: 두 번째 콘솔은 CONTROL_BUSY 또는 관찰, 관찰 콘솔의 명령은 NOT_IN_CONTROL, 제어권 넘기기.
+   키가 있으면 서명 없음·다른 키·바꾼 패킷·오래된 패킷은 응답 없이 버리고, 같은 패킷 재전송은 다시 실행하지 않고 응답만.
+   원본 PDU가 DIS_test 형식 jsonl과 pcap으로 남는다
 시뮬레이터 서버는 이 PC 안(127.0.0.1)의 빈 포트를 쓴다.
 """
 import contextlib
@@ -432,6 +435,76 @@ def test_battery_low_recovery():
             assert (n_rec > 0) == want_rec and yaw_dev < 15.0 and d.qpos[0] - x0 > 1.2, (scale, n_rec, yaw_dev, d.qpos[0] - x0)
         finally:
             sim.close()
+
+def test_control_auth_and_pdu_log():
+    import json
+    import tempfile
+    from unittest import mock
+    from dis_console import auth
+    key = bytes(range(32))
+    tmp = Path(tempfile.mkdtemp())
+    sim = _sim(key=key, pdu_dir=tmp)
+    con = _console(sim, key=key)
+    obs = _console(sim, key=key, entity=E.EntityId(2, 1, 2))
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    probe.connect(("127.0.0.1", sim.dis.port)); probe.settimeout(0.3)
+
+    def silent(raw):                                  # 응답이 없어야 한다 (버림)
+        drops = sim.dis.auth_drops
+        probe.send(raw)
+        _step(sim)
+        try:
+            probe.recv(E.MAX_PDU_SIZE)
+            raise AssertionError("인증 안 된 패킷에 응답함")
+        except socket.timeout:
+            pass
+        assert sim.dis.auth_drops == drops + 1
+    try:
+        st, body = _drive(sim, con, con.request(P.CONNECT, {"role": "control"}))
+        assert st == "COMPLETED" and body["role"] == "control" and body["auth"] and con.has_control
+        # 제어권: 두 번째 콘솔
+        st, body = _drive(sim, obs, obs.request(P.CONNECT, {"role": "control"}))
+        assert st == "DENIED" and body["reason_code"] == "CONTROL_BUSY", body
+        st, body = _drive(sim, obs, obs.request(P.CONNECT, {"role": "observe"}))
+        assert st == "COMPLETED" and body["role"] == "observe" and body["control_owner"] == str(P.CONSOLE_ENTITY)
+        st, body = _drive(sim, obs, obs.request(*parse_command("cmd 0.3")))
+        assert st == "DENIED" and body["reason_code"] == "NOT_IN_CONTROL"
+        _step(sim, 15)
+        assert obs.report is not None and obs.report["control_owner"] == str(P.CONSOLE_ENTITY)   # 관찰 콘솔도 보고를 받는다
+        req = con.request(*parse_command("cmd 0.3"))
+        assert _drive(sim, con, req)[0] == "COMPLETED" and sim.command == (0.3, 0.0)
+        # 인증: 서명 없음, 다른 키, 바꾼 패킷, 오래된 패킷 -> 버림
+        plain = E.encode(E.ActionRequestR(P.EXERCISE_ID, P.CONSOLE_ENTITY, P.SIM_ENTITY, 1, P.payload(P.SET_COMMAND, {"vx": 1.0})))
+        silent(plain)
+        silent(auth.Signer(bytes(32)).sign(plain))
+        signed = con.reqs[req]["raw"]
+        silent(signed[:1] + bytes([P.EXERCISE_ID + 1]) + signed[2:])
+        with mock.patch("time.time", return_value=time.time() - 100):
+            old = auth.Signer(key).sign(plain)
+        silent(old)
+        # 같은 패킷 재전송: 다시 실행하지 않고 마지막 응답 (서명까지 같은 바이트)
+        n_events = len(sim.event_log)
+        probe.send(signed)
+        _step(sim)
+        resp = probe.recv(E.MAX_PDU_SIZE)
+        assert E.decode(auth.Verifier(key).verify(resp)).request_status == E.STATUS_COMPLETE
+        _step(sim, 3)
+        assert len(sim.event_log) == n_events and sim.command == (0.3, 0.0)
+        # 제어권 넘기기
+        assert _drive(sim, con, con.request(P.RELEASE_CONTROL))[0] == "COMPLETED" and not con.has_control
+        st, body = _drive(sim, obs, obs.request(*parse_command("take")))
+        assert st == "COMPLETED" and body["role"] == "control" and obs.has_control
+        st, body = _drive(sim, con, con.request(*parse_command("stop")))
+        assert st == "DENIED" and body["reason_code"] == "NOT_IN_CONTROL"
+        assert _drive(sim, obs, obs.request(*parse_command("stop")))[0] == "COMPLETED" and sim.command == (0.0, 0.0)
+    finally:
+        probe.close(); con.close(); obs.close(); sim.dis.close(); sim.close()
+    # 원본 기록: DIS_test 형식 (dir, raw hex), 버린 패킷 표시, pcap
+    recs = [json.loads(line) for line in (tmp / "dis_pdus.jsonl").read_text().splitlines()]
+    assert {r["dir"] for r in recs} == {"console->sim", "sim->console"}
+    assert sum(r.get("dropped") == "auth" for r in recs) == 4
+    assert any(r.get("payload_type") == P.REPORT for r in recs) and all(bytes.fromhex(r["raw"]) for r in recs)
+    assert (tmp / "dis_pdus.pcap").read_bytes()[:4] == bytes.fromhex("d4c3b2a1")
 
 if __name__ == "__main__":
     for name, fn in list(globals().items()):

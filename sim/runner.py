@@ -466,15 +466,23 @@ def run(args):
     rec = Recorder(out, meta)
     dis_port = getattr(args, "dis_port", None)
     if dis_port is not None:                 # DIS 시나리오 콘솔 (문서 §10): 콘솔 요청을 시나리오 이벤트로 받는다 (이 PC 안에서만)
+        from dis_console.auth import load_key
         from .dis_server import DisScenarioServer
+        host, key_path = getattr(args, "dis_host", "127.0.0.1"), getattr(args, "dis_key", None)
+        if host not in ("127.0.0.1", "localhost") and not key_path:
+            raise SystemExit("이 PC 밖에서 콘솔 요청을 받으려면 인증 키가 필요하다 (--dis-key, python -m dis_console.auth keygen)")
         out.mkdir(parents=True, exist_ok=True)
-        sim.dis = DisScenarioServer(sim, port=dis_port, log_path=out / "dis_events.jsonl",
-                                    comm_lost_behavior=getattr(args, "dis_comm_lost", "STOP"))
+        sim.dis = DisScenarioServer(sim, port=dis_port, host=host, log_path=out / "dis_events.jsonl",
+                                    comm_lost_behavior=getattr(args, "dis_comm_lost", "STOP"),
+                                    key=load_key(key_path) if key_path else None, pdu_dir=out)
+        meta["dis"] = {"host": host, "port": sim.dis.port, "auth": bool(key_path)}
         if not (args.realtime or args.view):
             args.realtime = True
             meta["mode"] = "realtime"
             print("DIS 콘솔: 사람이 명령을 넣을 수 있게 실시간으로 실행한다 (--realtime)")
-        print(f"DIS 시나리오 콘솔 대기: UDP 127.0.0.1:{sim.dis.port}  (python -m dis_console.console --sim 127.0.0.1:{sim.dis.port})")
+        key_opt = f" --key {key_path}" if key_path else ""
+        print(f"DIS 시나리오 콘솔 대기: UDP {host}:{sim.dis.port}{' (인증)' if key_path else ''}  "
+              f"(python -m dis_console.console --sim 127.0.0.1:{sim.dis.port}{key_opt})")
         if getattr(args, "dis_wait", False):
             print("콘솔 접속을 기다린다 (Ctrl+C로 중단)...")
             while not sim.dis.consoles:
@@ -772,6 +780,9 @@ def main():
     ap.add_argument("--dis-port", type=int, metavar="PORT",
                     help="DIS 시나리오 콘솔 요청을 받는다 (UDP 127.0.0.1, 보통 3000). 실시간으로 실행. 끝나면 scenario_replay.yaml")
     ap.add_argument("--dis-wait", action="store_true", help="--dis-port와 함께: 콘솔이 접속할 때까지 시작하지 않는다")
+    ap.add_argument("--dis-key", metavar="FILE", help="DIS 인증 공유 키 (python -m dis_console.auth keygen FILE). 콘솔에도 같은 파일")
+    ap.add_argument("--dis-host", default="127.0.0.1",
+                    help="콘솔 요청을 받을 주소 (기본: 이 PC 안). 다른 주소는 --dis-key가 있어야 한다")
     ap.add_argument("--dis-comm-lost", choices=["STOP", "CONTINUE"], default="STOP",
                     help="콘솔이 모두 5초 넘게 조용하면(통신 두절): STOP = 로봇 이동 명령 0 (기본), CONTINUE = 그대로")
     ap.add_argument("--set", action="append", metavar="KEY=VALUE",

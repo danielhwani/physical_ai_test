@@ -8,9 +8,14 @@
   - (콘솔 Entity ID, Request ID)로 처리한 요청을 기억해 중복이면 다시 넣지 않고 마지막 응답만 다시 보낸다
   - 받으면 ACCEPTED(Pending, 적용 예정 시각), 적용되면 COMPLETED(Complete, 적용 시각)
   - 고장 주입·해제, 시험 종료, 일시정지는 이벤트로 넣는다 (일시정지·종료는 다시 실행할 시나리오에서 빠진다). 재개는 바로 처리한다
-  - 링크 감시: 접속한 콘솔 모두에게서 comm_lost_s 동안 아무것도 오지 않으면 통신 두절. 단절 시 동작 STOP이면
-    로봇 이동 명령 0을 이벤트로 넣는다 (source: dis_comm_lost, 기록되므로 다시 실행해도 같다). 다시 받으면 OK로 되돌린다
-  - 기록: <실행 폴더>/dis_events.jsonl (요청과 결과, 링크 상태 변화)
+  - 제어권: 명령할 수 있는 콘솔은 하나 (Request_Connection role=control). 다른 콘솔은 관찰(role=observe, 주기 보고만)하거나
+    거부된다 (CONTROL_BUSY). Request_ReleaseControl로 내놓는다
+  - 링크 감시: 제어권을 가진 콘솔에게서 comm_lost_s 동안 아무것도 오지 않으면 통신 두절. 단절 시 동작 STOP이면
+    로봇 이동 명령 0을 이벤트로 넣는다 (source: dis_comm_lost, 기록되므로 다시 실행해도 같다). 제어권은 풀린다 (다른 콘솔이 받을 수 있게).
+    그 콘솔에게서 다시 받으면 링크는 OK로 되돌리지만 제어권은 다시 접속해야 받는다
+  - 인증 (key가 있으면): 모든 PDU에 HMAC 서명을 붙이고, 받은 PDU는 서명과 카운터(재전송 공격)를 확인해 아니면 응답 없이 버린다
+    (dis_console/auth.py)
+  - 기록: <실행 폴더>/dis_events.jsonl (요청과 결과, 링크 상태 변화), dis_pdus.jsonl·dis_pdus.pcap (원본 PDU, DIS_test 형식)
 """
 import bisect
 import json
@@ -19,8 +24,10 @@ import time
 
 import numpy as np
 
+from dis_console import auth
 from dis_console import envelope as E
 from dis_console import protocol as P
+from dis_console.pdulog import PduRecorder
 
 REPORT_DT = 0.2          # 주기 보고 (벽시계 s). 콘솔이 로봇 기준 위치(ahead)를 계산할 수 있게 짧게
 RETAIN_S = 60.0          # 끝난 요청 기억 시간 (벽시계 s)
@@ -28,8 +35,13 @@ RETAIN_S = 60.0          # 끝난 요청 기억 시간 (벽시계 s)
 
 class DisScenarioServer:
     def __init__(self, sim, port=P.DEFAULT_PORT, host="127.0.0.1", exercise_id=P.EXERCISE_ID, log_path=None,
-                 comm_lost_s=P.COMM_LOST_S, comm_lost_behavior="STOP"):
+                 comm_lost_s=P.COMM_LOST_S, comm_lost_behavior="STOP", key=None, pdu_dir=None):
+        """key: 인증 공유 키 (bytes, 없으면 인증 안 함). pdu_dir: 원본 PDU 기록 폴더."""
         assert comm_lost_behavior in ("STOP", "CONTINUE")
+        self.signer = auth.Signer(key) if key else None
+        self.verifier = auth.Verifier(key) if key else None
+        self.owner, self.lost_owner = None, None     # 제어권을 가진 콘솔, 통신 두절로 제어권을 잃은 콘솔
+        self.auth_drops = 0
         self.sim, self.exercise_id = sim, exercise_id
         self.comm_lost_s, self.comm_lost_behavior = comm_lost_s, comm_lost_behavior
         self.last_rx = {}        # 콘솔 -> 마지막으로 무엇이든 받은 벽시계 시각
@@ -39,6 +51,7 @@ class DisScenarioServer:
         self.sock.bind((host, port))
         self.sock.setblocking(False)
         self.port = self.sock.getsockname()[1]
+        self.pdus = PduRecorder(pdu_dir, (host, self.port)) if pdu_dir else None
         self.consoles = {}       # EntityId -> 주소 (접속한 콘솔. 주기 보고를 받는다)
         self.handled = {}        # (콘솔, Request ID) -> {addr, resp(bytes), event, done(벽시계)}
         self.log = open(log_path, "a", encoding="utf-8") if log_path else None
@@ -48,6 +61,20 @@ class DisScenarioServer:
         self.sock.close()
         if self.log:
             self.log.close()
+        if self.pdus:
+            self.pdus.close()
+
+    def _send(self, raw, addr):
+        """서명(키가 있으면)하고 보낸다. 보낸 바이트를 돌려준다 (그대로 다시 보낼 수 있게)."""
+        if self.signer:
+            raw = self.signer.sign(raw)
+        self._sendraw(raw, addr)
+        return raw
+
+    def _sendraw(self, raw, addr):
+        self.sock.sendto(raw, addr)
+        if self.pdus:
+            self.pdus.record(False, addr, raw)
 
     # ---- 시뮬레이션 루프에서 부른다 ----
     def poll(self):
@@ -78,25 +105,45 @@ class DisScenarioServer:
             self._report()
 
     def _check_link(self):
-        if not self.consoles:
-            return
-        silent = time.monotonic() - max(self.last_rx.get(c, 0.0) for c in self.consoles)
-        if self.comm_state == "OK" and silent > self.comm_lost_s:
+        now = time.monotonic()
+        for c in [c for c in self.consoles if c != self.owner and now - self.last_rx.get(c, 0.0) > 3 * self.comm_lost_s]:
+            del self.consoles[c]                      # 오래 조용한 관찰 콘솔에는 주기 보고를 그만 보낸다
+        if self.comm_state == "OK" and self.owner is not None and now - self.last_rx.get(self.owner, 0.0) > self.comm_lost_s:
+            silent = now - self.last_rx.get(self.owner, 0.0)
             self.comm_state = "LOST"
+            self.lost_owner, self.owner = self.owner, None
             sim = self.sim
             stop = self.comm_lost_behavior == "STOP"
-            print(f"[t={sim.data.time:6.2f}] DIS 통신 두절 ({silent:.1f} s 무응답) -> 단절 시 동작 {self.comm_lost_behavior}")
-            self._write({"comm_state": "LOST", "silent_s": round(silent, 2), "behavior": self.comm_lost_behavior})
+            print(f"[t={sim.data.time:6.2f}] DIS 통신 두절 (제어 콘솔 {self.lost_owner} {silent:.1f} s 무응답) -> "
+                  f"단절 시 동작 {self.comm_lost_behavior}, 제어권 해제")
+            self._write({"comm_state": "LOST", "silent_s": round(silent, 2), "behavior": self.comm_lost_behavior,
+                         "released": str(self.lost_owner)})
             if stop and sim.command != (0.0, 0.0):          # 로봇을 세운다: 다른 이벤트처럼 넣어 기록·재현되게
                 event = {"action": "set_command", "vx": 0.0, "yaw_rate": 0.0, "t": sim.data.time, "source": "dis_comm_lost"}
                 sim.events.insert(bisect.bisect_right([e["t"] for e in sim.events], event["t"]), event)
-        elif self.comm_state == "LOST" and silent <= self.comm_lost_s:
+        elif self.comm_state == "LOST" and (self.owner is not None or now - self.last_rx.get(self.lost_owner, 0.0) <= self.comm_lost_s):
             self.comm_state = "OK"
-            print(f"[t={self.sim.data.time:6.2f}] DIS 링크 복구 (명령은 자동으로 되돌리지 않는다)")
+            print(f"[t={self.sim.data.time:6.2f}] DIS 링크 복구 (명령은 자동으로 되돌리지 않는다. 제어권은 다시 접속해야 받는다)")
             self._write({"comm_state": "OK"})
 
     # ---- 요청 처리 ----
     def _handle(self, data, addr):
+        if self.verifier:                             # 인증: 서명·카운터가 맞지 않으면 응답 없이 버린다
+            try:
+                unsigned = self.verifier.verify(data)
+            except (auth.AuthError, E.DecodeError) as e:
+                self.auth_drops += 1
+                if self.pdus:
+                    self.pdus.record(True, addr, data, dropped="auth", reason=str(e))
+                self._write({"from": f"{addr[0]}:{addr[1]}", "dropped": "auth", "reason": str(e)})
+                if self.auth_drops in (1, 10, 100):
+                    print(f"[t={self.sim.data.time:6.2f}] DIS 인증 실패로 버림 ({self.auth_drops}번째): {e}")
+                return
+        else:
+            unsigned = data
+        if self.pdus:
+            self.pdus.record(True, addr, data)
+        data = unsigned
         try:
             pdu = E.decode(data)
         except E.DecodeError as e:
@@ -112,23 +159,43 @@ class DisScenarioServer:
         if key in self.handled:                      # 중복 (재전송, 상태 재질의): 다시 실행하지 않고 마지막 응답
             h = self.handled[key]
             h["addr"] = addr
-            self.sock.sendto(h["resp"], addr)
+            self._sendraw(h["resp"], addr)                # 서명까지 같은 바이트 (콘솔이 재전송으로 알아본다)
             return
         h = self.handled[key] = {"addr": addr, "resp": b"", "event": None, "done": None}
         p = pdu.payload
         self._write({"from": str(pdu.originating), "request_id": pdu.request_id, "type": p.type, "body": p.body})
         if p.lang != E.LANG_SCENARIO or p.type not in P.SUPPORTED:
             return self._reject(h, key, "UNSUPPORTED", "UNSUPPORTED_MESSAGE")
+        orig = pdu.originating
         if p.type == P.CONNECT:
-            self.consoles[pdu.originating] = addr
-            self.last_rx[pdu.originating] = time.monotonic()
+            role = p.body.get("role", "control")
+            if role not in ("control", "observe"):
+                return self._reject(h, key, "FAILED", "INVALID_VALUE", "role: control 또는 observe")
+            if role == "control" and self.owner not in (None, orig):
+                return self._reject(h, key, "DENIED", "CONTROL_BUSY", f"제어권은 {self.owner}에게 있다 (관찰만 하려면 role=observe)")
+            if role == "control":
+                self.owner = orig
+            elif self.owner == orig:
+                self.owner = None                     # 제어 콘솔이 관찰로 다시 접속: 제어권을 내놓는다
+            self.consoles[orig] = addr
+            self.last_rx[orig] = time.monotonic()
             self.next_report = 0.0
             info = {"scenario": self.sim.scn["name"], "t_sim": round(self.sim.data.time, 6),
                     "duration": self.sim.scn["duration"], "mode": "virtual", "supported": P.SUPPORTED,
-                    "comm_lost_s": self.comm_lost_s, "comm_lost_behavior": self.comm_lost_behavior}
+                    "comm_lost_s": self.comm_lost_s, "comm_lost_behavior": self.comm_lost_behavior,
+                    "role": role, "control_owner": None if self.owner is None else str(self.owner),
+                    "auth": self.verifier is not None}
             return self._respond(h, *key, "COMPLETED", info, final=True)
-        if pdu.originating not in self.consoles:
+        if orig not in self.consoles:
             return self._reject(h, key, "DENIED", "NOT_CONNECTED")
+        if p.type == P.RELEASE_CONTROL:
+            if orig != self.owner:
+                return self._reject(h, key, "DENIED", "NOT_IN_CONTROL")
+            self.owner = None
+            return self._respond(h, *key, "COMPLETED", {"role": "observe", "control_owner": None}, final=True)
+        if orig != self.owner:                        # 관찰 콘솔은 명령할 수 없다
+            return self._reject(h, key, "DENIED", "NOT_IN_CONTROL",
+                                f"제어권은 {self.owner}에게 있다" if self.owner else "제어권이 비어 있다 (control로 다시 접속)")
         if p.type == P.RESUME:                       # 재개는 바로 (일시정지 중에는 시뮬레이션 시각이 멈춰 이벤트로 넣을 수 없다)
             if not self.sim.frozen:
                 return self._reject(h, key, "DENIED", "NOT_FROZEN")
@@ -162,7 +229,7 @@ class DisScenarioServer:
         events = self.sim.events                     # 같은 시각이면 먼저 있던 이벤트 뒤에
         events.insert(bisect.bisect_right([e["t"] for e in events], t), event)
         h["event"] = event
-        self._respond(h, *key, "ACCEPTED", {"scheduled_t": round(t, 6)})
+        self._respond(h, *key, "ACCEPTED", {"scheduled_t": round(t, 6), **({"frozen": True} if self.sim.frozen else {})})
 
     # ---- 개체 투입 시각 맞추기 (cross_ahead): 차가 로봇 진행선의 로봇 앞 gap m 지점을 로봇보다 먼저 지나가게 ----
     LEAD = 0.3            # 차 꼬리가 지나간 뒤 로봇이 그 지점에 오기까지 여유 (s)
@@ -312,10 +379,9 @@ class DisScenarioServer:
     def _respond(self, h, orig, req_id, result, body, final=False):
         resp = E.ActionResponseR(self.exercise_id, P.SIM_ENTITY, orig, req_id, E.RESULT_TO_STATUS[result],
                                  P.payload("Response_Result", {"result": result, "t_sim": round(self.sim.data.time, 6), **body}))
-        h["resp"] = E.encode(resp)
         if final:
             h["done"] = time.monotonic()
-        self.sock.sendto(h["resp"], h["addr"])
+        h["resp"] = self._send(E.encode(resp), h["addr"])
         self._write({"to": str(orig), "request_id": req_id, "result": result, **body})
 
     def _report(self):
@@ -327,12 +393,13 @@ class DisScenarioServer:
                 "last_event": sim.last_event[1] if sim.last_event else None,
                 "faults": {n: (None if f["until"] is None else round(f["until"] - d.time, 2)) for n, f in sim.faults.items()},
                 "frozen": sim.frozen, "comm_state": self.comm_state,
+                "control_owner": None if self.owner is None else str(self.owner),
                 "vehicles": [] if sim.cosim is None or not sim.cosim.vehicle_visible else [
                     {"type": "HMMWV", "x": round(sim.cosim.vehicle["pos"][0], 2), "y": round(sim.cosim.vehicle["pos"][1], 2),
                      "speed": round(sim.cosim.vehicle["speed"], 2)}]}
         for ent, addr in self.consoles.items():
             pdu = E.DataPdu(self.exercise_id, P.SIM_ENTITY, ent, P.payload(P.REPORT, body))
-            self.sock.sendto(E.encode(pdu), addr)
+            self._send(E.encode(pdu), addr)
 
     def _write(self, rec):
         if self.log:
