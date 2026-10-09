@@ -715,6 +715,8 @@ python -m sim.rt_link scenarios/rough_rut.yaml --rviz          # 지형이 바�
 python -m sim.rt_link scenarios/flat_trot.yaml --variant mjx   # 모델 설정 (sim.runner --variant와 같다)
 python -m sim.rt_link scenarios/dis_console.yaml --dis-port 3000 --dis-wait --brain shm --rviz   # DIS 콘솔 (콘솔은 그대로)
 python -m sim.rt_link scenarios/rut_crossing.yaml --brain shm --rviz --set controller.perception.sensor=front_lidar   # LiDAR 지형 인지 보행
+python -m sim.rt_link scenarios/footprints.yaml --rviz         # Chrono (HMMWV, 변형 지면, 발자국). --lockstep이면 sim.runner와 같은 결과
+python -m sim.rt_link scenarios/dis_chrono.yaml --dis-port 3000 --dis-wait --brain shm --rviz   # DIS 콘솔 + Chrono (spawn, soil)
 python conformance/test_rt_core.py                             # 규약 일치, 물리 비트 동일, 닫힌 고리 동일, 두뇌 연결 방식·고장, 실시간
 ```
 
@@ -829,7 +831,136 @@ C++ 코어 ──참값 링(스텝 직후 바디 위치)──▶ 관리 프로�
 
   inproc은 두뇌와 관리 작업(기록, 스캔 전달, 화면)이 한 프로세스라 가끔 밀린다. 지형 인지 보행은 shm 또는 ros를 쓴다.
 
-**아직 이 경로에 없는 것**: Chrono(차량, 토양). `python -m sim.runner`로 실행한다.
+**Chrono** (HMMWV, SCM 변형 지면, 발자국):
+- 관리 프로세스가 `sim.runner`와 같은 자리(다음 스텝의 이벤트 뒤, 지형 갱신 전)에서 Chrono와 교환한다: 로봇 위치(차량 양보 판단)와
+  스텝마다 코어가 넘긴 발 위치·평균 수직력(발자국)을 보내고, 차량 포즈와 흙 높이를 받는다. 흙 높이는 지형 원천에 들어가 지형 공유 메모리로
+  코어에 간다. 개체 투입·제거(`create_entity`, `remove_entity`), 흙 바꾸기(`set_soil`) 이벤트, 차량 근접 이벤트, 차량 최소 거리와
+  지형 변형 MOP, 기록의 차량 열, 화면·LiDAR의 차량도 같다.
+- 화면(`--rviz`, `--mjviz`)을 띄우면 lockstep도 벽시계보다 앞서지 않게 맞춘다 (`sim.runner --rviz`와 같은 속도. 없으면 최대 속도로
+  돌아 빨리 감기처럼 보였다). 계산 결과는 같다.
+- lockstep: 교환마다 Chrono 결과를 기다린다. `sim.runner`와 비트 단위로 같다.
+- 실시간 (2026-10-09 결정: 기다리지 않는 교환 + 뒤처짐 상한): 몸은 20 ms마다 돌고, Chrono 결과가 아직 없으면 직전 지형·차량 포즈를 쓴다.
+  Chrono가 0.2 s(`--chrono-max-lag`) 넘게 뒤처지면 몸(코어)을 일시정지 칸으로 잠깐 멈추고, 절반까지 따라잡으면 다시 돈다. 그동안 두뇌도
+  새 상태가 없어 같이 멈춘다. 세계 시간이 Chrono 속도로 느려지는 대신 차와 로봇이 0.2 s 안의 같은 시각에 있다. 멈춘 횟수·시간은 MOP
+  `chrono_holds`, `chrono_hold_s`, 뒤처짐은 `chrono_lag_s_max`, `chrono_lag_s_end`. 결과는 실행마다 조금 다르다 (결과 도착 시각에 따라).
+- 상한이 없으면(`--chrono-max-lag 0`, 처음 구현) 이 PC에서 HMMWV가 10초에 3~5초 뒤처져 늦게 왔고, 로봇이 이미 차 진로에 들어선 뒤라
+  차가 로봇을 뚫고 지나갔다 (차와 로봇에는 물리 작용이 없다. vehicle_crossing 16초에 로봇이 차체 범위 안에 있던 주기 490).
+  HMMWV 시나리오(vehicle_crossing, vehicle_crossing_soft, hmmwv_follow)에는 양보(`yield_to_robot`)도 켰다 (lockstep 결과는 그대로).
+
+| 이 PC 실시간 (shm 두뇌) | Chrono 뒤처짐 최대 | 멈춤 | 차체와 겹친 주기 | 차량 최소 거리 (lockstep) |
+|---|---|---|---|---|
+| footprints 10초 | 0 s (Chrono가 실시간의 약 4.5배 빠름) | 0 | – | – |
+| vehicle_crossing 16초 | 0.22 s | 43번, 7.1 s | 0 | 1.94 m (2.02 m) |
+| vehicle_crossing, 상한 없음 | 5.3 s | – | **490** | 1.52 m |
+| vehicle_crossing_soft 16초 | 0.22 s | 25번, 4.2 s | 0 | 1.88 m (1.97 m) |
+
+  멈춤은 한 번에 약 0.17 s라 화면이 1초에 2~3번 살짝 멈칫한다. 성능 좋은 PC나 시스템 실시간 설정에서는 멈춤이 줄어든다.
+- DIS 콘솔 + Chrono (dis_chrono, dis_footprints)도 이 경로에서 실시간으로 돈다 (`test_dis_chrono_realtime_on_rt_core`: 콘솔로 흙 soft,
+  차량 투입, 예약 종료, 뒤처짐 0.3 s 미만). 실시간 Chrono라 `scenario_replay.yaml`을 `sim.runner`로 다시 돌린 결과와는 조금 다르다.
+- 맞추다 찾은 것: 발 하나에 접촉점이 여럿이면(패인 발자국) 코어의 발 수직력 덧셈 순서가 Python과 달라 마지막 자리가 달랐다
+  (2.6초부터 갈라짐) -> 스텝마다 발별 합을 먼저 내고 누적하게 고쳤다. 마지막 스텝 뒤에 다음 스텝 준비(이벤트, Chrono 교환, 지형)를
+  하던 것도 `sim.runner`처럼 하지 않게 했다 (지형 변형 MOP가 달랐다).
+- lockstep 같은 결과 (`test_chrono_matches_runner`): footprints, dis_chrono + 흙 soft·차량 투입·제거·LiDAR 지형 인지 보행
+  (inproc, shm)에서 `timeseries.parquet` 모든 열, 차량·변형 MOP, 스캔 점이 `sim.runner`와 비트 단위로 같다.
+
+**Python만 실행(`sim.runner`)과 비교** (2026-10-09)
+
+| | Python만 (`sim.runner`) | C++ 실시간 코어 (`sim.rt_link`) |
+|---|---|---|
+| 몸 (물리, PD 모터, 센서 모델) | Python 루프 안 | C++ 별도 프로세스 (SCHED_FIFO, CPU 고정, 메모리 잠금) |
+| 두뇌 (보행 알고리즘) | 같은 루프 안, 또는 ROS2 노드 (`--controller-node`) | inproc / shm 별도 프로세스 / ros 노드 (다른 PC 가능) |
+| 관리 (이벤트, 지형, 판정, 기록, 화면, DIS) | 같은 루프 안 | Python 관리 프로세스 |
+| LiDAR | 같은 루프 안에서 계산 (또는 `--sensor-node`) | 작업 프로세스 2개 |
+| Chrono | 별도 프로세스, 매번 기다림 | 별도 프로세스. lockstep은 기다림, 실시간은 기다리지 않음 |
+
+| | Python `--realtime` | C++ lockstep | C++ 실시간 |
+|---|---|---|---|
+| 시간 | 벽시계에 맞추려 하지만 늦으면 세계 전체가 같이 늦어짐 | 시뮬레이션 시간 (화면이 있으면 벽시계보다 앞서지 않게만) | 몸은 20 ms마다 반드시 돎 |
+| 두뇌가 늦으면 | 몸도 기다림 | 몸도 기다림 | 몸은 마지막 명령 유지, 늦은 만큼 명령 지연 MOP |
+| 결과 | 결정적 (lockstep과 같음) | `sim.runner`와 비트 단위로 같음 | 실행마다 조금 다름 (실제 로봇과 같은 성격) |
+
+Python의 "실시간"은 화면 속도만 맞춘 lockstep에 가깝다: 결과는 같지만 로봇이 실제 시간에 쫓기는 상황은 재현하지 못한다.
+
+| 이 PC 실시간 | Python `--realtime` | C++ 실시간 (shm 두뇌) |
+|---|---|---|
+| flat_trot | 실시간 속도, 늦음 0 (30초 루프 측정: 주기 초과 25번, 깨어남 지연 최대 5.4 ms) | 주기 초과 0, 깨어남 지연 최대 0.74 ms, 명령 지연 항상 20 ms |
+| rut_crossing + LiDAR 12초 | 0.8배, 600주기 모두 늦음, 끝에 3.0 s 뒤처짐, 전진 3.708 m (lockstep과 같음) | 실시간 유지, 늦은 명령 0, 스캔 약 95 ms 늦게 도착·120개 중 4~5개 건너뜀, 전진 3.70~3.74 m |
+| vehicle_crossing 16초 | 0.76배, 끝에 5.2 s 뒤처짐 (벽시계 약 21 s), 차량 최소 2.02 m | Chrono 뒤처짐 0.22 s 안, 대신 43번 합계 7.1 s 멈춤 (벽시계 약 23 s), 늦은 명령 0, 차량 최소 1.94 m |
+
+HMMWV는 이 PC에서 Chrono가 실시간보다 느려 어느 쪽도 진짜 실시간은 아니다. Python은 계속 조금씩 늦어지고, C++는 도는 동안 몸·두뇌가
+20 ms 주기를 지키는 대신 가끔 통째로 멈춘다.
+
+| 기능 | 어디에 |
+|---|---|
+| `--view` (MuJoCo 뷰어 일시정지·한 스텝), `--start-paused`, `--sensor-node` (센서 ROS2 노드), `--sensor` (C++는 `--set sensors=...`) | Python에만 |
+| shm 두뇌, 다른 PC 두뇌 (`--remote-brain`), 실시간 타이밍 MOP (깨어남·계산 시간, 주기 초과, 명령·스캔 지연, Chrono 뒤처짐), LiDAR 프레임 버림, Chrono 뒤처짐 상한 | C++에만 |
+| 시나리오 파일, 기록 형식 (`timeseries.parquet`, MOP), RViz 화면, DIS 콘솔, 고장, 지형 변경, `--variant` | 같음 |
+
+| 쓰임 | 권장 |
+|---|---|
+| 알고리즘 비교, 회귀 시험, 학습 데이터, 재현 | `sim.runner` 또는 `sim.rt_link --lockstep` (같은 결과. 뷰어 일시정지가 필요하면 `sim.runner`) |
+| 실제 로봇처럼 시간에 쫓기는 시험 (두뇌·센서·통신 지연, 다른 PC 두뇌, DIS 콘솔 개입) | C++ 실시간 |
+| 이 PC에서 HMMWV 결과 비교 | `--lockstep` |
+
+**내부 구조 비교**
+```
+Python만 (sim.runner)                       C++ 실시간 코어 (sim.rt_link)
+┌────────────────────────────┐              ┌──────────────┐  /dev/shm   ┌──────────────────────────────┐
+│ 한 프로세스, MjData 1개      │              │ rt/rt_core   │◀──────────▶│ 관리 프로세스 (Python)          │
+│  물리 + PD 모터 + 센서 모델  │              │  MjData (진짜)│            │  MjData (거울: 참값을 복사)     │
+│  보행 알고리즘              │              │  물리, PD,    │            │  이벤트, 지형, 판정, 기록, 화면, │
+│  이벤트, 지형, 판정, 기록    │              │  센서 모델    │            │  DIS, Chrono 교환              │
+│  화면, DIS, LiDAR           │              └──────────────┘            └──────────────────────────────┘
+└────────────────────────────┘                                              ▲ 함수 / shm / ROS2
+                                   두뇌 (inproc: 관리 안, shm: control/rt_brain.py, ros: control/ros_node.py)
+                                   LiDAR 작업 프로세스 2개 (sim/rt_sensor.py), Chrono 서버
+```
+- MuJoCo 데이터: Python은 하나를 모두가 직접 읽고 쓴다. C++는 진짜 물리가 코어에만 있고, 관리 프로세스의 것은 참값을 복사한 거울이다
+  (화면, DIS, LiDAR용. 물리 진행 안 함). 기록·판정은 거울에서 다시 계산하지 않고 코어가 스텝 직후 넘긴 값(접촉, 몸통 회전, 발 위치,
+  바디 포즈)을 쓴다 (다시 계산하면 접촉과 속도가 조금 달랐다).
+- 한 제어 주기(20 ms)의 순서:
+
+| 순서 | Python `Simulation.step_control` | C++ 코어 | C++ 관리 프로세스 (`drain_truth`, 참값 한 개마다) |
+|---|---|---|---|
+| 1 | DIS 요청, 이벤트 적용 | 멈춤 칸 확인, 시각까지 대기 | 기록 |
+| 2 | Chrono 교환 | 지형 공유 메모리 반영 | 발 하중을 Chrono로 |
+| 3 | 지형 갱신 (5 Hz) | 센서 측정 → LowState 쓰기 | LiDAR 차례면 작업 프로세스로 |
+| 4 | 센서 측정 → 두뇌 → 관절 명령 | 명령 고르기 (조건에 맞는 최신 것) | 다음 스텝 이벤트 적용 |
+| 5 | 물리 10스텝 | PD + 물리 10스텝 | Chrono 교환 |
+| 6 | 발 하중을 Chrono로 | 참값 링에 쓰기 | 지형 갱신 → 지형 공유 메모리 |
+| 7 | LiDAR | | DIS 보고, 화면 |
+| 8 | 기록, 판정 | | |
+
+  관리 프로세스는 "스텝 k 결과 처리"와 "k+1 준비"를 함께 하며, Python과 같은 순서라 lockstep이 같다. 두뇌는 몸 루프 밖에서 계산하고,
+  실시간에서는 몸이 기다리지 않는다.
+
+| 정보 | Python | C++ |
+|---|---|---|
+| 로봇 상태 → 두뇌 / 관절 명령 → 몸 | 함수 반환값 / 인자 | shm `state` / `cmd` 칸 (seqlock) |
+| 운용자 이동 명령 | `controller.set_command()` | inproc 함수, shm 명령 링(적용 시각), ros `/cmd_vel_stamped` |
+| 고장 | `faults` 딕셔너리를 `robot_io`가 읽음 | shm `ctl` 칸 (`torque_scale`, `fault_gyro`/`fault_att`, `link_mode`) |
+| 센서 잡음 | 루프 안 난수 | 미리 만든 잡음 링 (`draw_noise`, 같은 값) |
+| 지형 | heightfield에 직접 씀 | 지형 shm, 코어가 다음 주기 시작에 복사 |
+| 참값 (판정·기록) | 자기 MjData | 참값 링 1024칸 |
+| LiDAR 점군 → 두뇌 | 함수 | inproc 함수, shm 스캔 shm, ros 토픽 |
+| 상태 추정 → 기록 | 객체 속성 | shm `est` 칸, ros `/controller/estimate` |
+| 일시정지 | 루프가 멈춤 | shm `freeze` 칸 (풀리면 코어가 시계를 다시 맞춤) |
+
+- 같은 뜻, 다른 구현:
+
+| 항목 | Python | C++ |
+|---|---|---|
+| 명령 지연 한 주기 | 명령 큐 (`link_queue`) | 코어가 "직전 상태 시각 이하로 계산된 명령"만 받고, 없으면 마지막 명령 유지 |
+| 링크 두절 뒤 | 큐를 비움 | 두절 이후 계산된 명령만 받음 (`min_cmd_t`) |
+| 시간 맞추기 | 루프 끝 `time.sleep` | `clock_nanosleep` 절대 시각 + 메모리 잠금·CPU 고정·SCHED_FIFO, 루프 안 할당·입출력·잠금 없음 |
+| LiDAR | 루프 안 `sense()` (한 번 98 ms 막음) | 작업 프로세스 (lockstep은 기다리고, 실시간은 도착하는 대로) |
+| Chrono | 매 교환 기다림 | lockstep은 기다림, 실시간은 기다리지 않고 0.2 s 넘게 뒤처지면 코어를 멈춤 |
+| 발 수직력 합 | 스텝마다 발별 합 → 누적 | 같은 순서로 맞춤 |
+- 함께 쓰는 코드: C++ 경로도 `Simulation`을 만들지만 물리는 돌리지 않는다 (모델·지형·설정·기록기용). 두뇌(`ControllerNode`), `Terrain`,
+  `Recorder`, DIS 서버, `ChronoLink`, `SensorRenderer`, ROS2 발행, 시나리오 형식이 같은 코드다. C++로 새로 쓴 것은 `rt/rt_core.cpp`의
+  몸(물리, PD 모터, 센서 모델, 고장 적용)뿐이다.
+- 대가: 상태가 두 곳(진짜와 거울)에 있고, 규약을 C++·Python 양쪽에 맞춰 두어야 하며, 같은 결과를 내려면 순서·계산 방식을 하나씩 맞춰야
+  한다 (그렇게 찾은 차이: 발 수직력 덧셈 순서, 마지막 스텝 뒤 처리, 두뇌 종료 경쟁 상태).
 
 ## 검토 중인 아이디어 (결정 전)
 
@@ -858,5 +989,5 @@ C++ 코어 ──참값 링(스텝 직후 바디 위치)──▶ 관리 프로�
 
 - 트롯 보행기는 규칙 기반이라 요철에서 방위가 최대 약 18° 흔들리고 측방 이동이 남는다 (측방 위치 제어 없음).
 - 지형 인지 트롯도 자국 안을 따라 걷기(hmmwv_follow)와 15 cm 자국에서는 자주 넘어진다 (위 지형 인지 보행 절).
-- `sim.runner`의 실시간 루프는 Python이라 지터 보장이 없다. C++ 실시간 코어(`sim.rt_link`)는 아직 Chrono를 지원하지 않고, 시간 보장에는 시스템 설정이 더 필요하다 (위 실시간 코어 절).
+- `sim.runner`의 실시간 루프는 Python이라 지터 보장이 없다. C++ 실시간 코어(`sim.rt_link`)도 시간 보장에는 시스템 설정이 더 필요하고, 이 PC에서는 실시간 HMMWV(Chrono)가 느려 세계를 자주 잠깐 멈춘다 (위 실시간 코어 절).
 - 지형 갱신은 발 근처 셀을 보류하므로 로봇이 홈 위에 서 있으면 반영이 늦어진다 (의도된 동작).

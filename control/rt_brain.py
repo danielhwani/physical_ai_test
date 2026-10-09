@@ -36,12 +36,14 @@ def main():
     view.shm.ctl.brain_ready = 1
     pending, last_step = [], -1
     try:
-        while not view.done and not view.shm.ctl.stop:
+        while not view.shm.ctl.stop:
             pending = sorted(pending + view.new_ops())
             if scans is not None and (sc := scans.read_new()) is not None:
                 node.on_scan(node.sensor, *sc)
             ls = view.read_state()
             if ls is None or ls["step"] == last_step:
+                if view.done:                  # 코어가 끝났고 남은 상태도 없다 (마지막 상태에 답하기 전에 끝나지 않게: lockstep이 기다린다)
+                    break
                 time.sleep(0.0002)
                 continue
             last_step = ls["step"]

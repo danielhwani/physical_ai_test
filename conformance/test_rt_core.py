@@ -9,7 +9,9 @@
    (같은 프로세스 / 같은 PC 별도 프로세스·공유 메모리 / ROS2 노드)과 고장(링크 두절 감쇠·유지, 배터리 저하)이 섞여도 같다
 4. 기록: lockstep 실행의 timeseries.parquet가 sim.runner와 모든 공통 열에서 비트 단위로 같다 (MOP도 같다). 모델 설정 mjx도 같다.
    지형이 바뀌는 시나리오(자국 이벤트, 지형 창 이동 + 실행 중 자국 추가)도 같다.
-   LiDAR·지형 인지 보행 (LiDAR 끊김 고장 포함): 세 두뇌 연결 방식 모두 기록과 스캔 점이 비트 단위로 같다
+   LiDAR·지형 인지 보행 (LiDAR 끊김 고장 포함): 세 두뇌 연결 방식 모두 기록과 스캔 점이 비트 단위로 같다.
+   Chrono (lockstep): 발자국, HMMWV 투입·제거, 흙 바꾸기, LiDAR가 차량을 보는 지형 인지 보행도 같다.
+   Chrono 실시간 (기다리지 않는 교환, 뒤처짐 상한): DIS 콘솔로 흙·차량 투입
 5. DIS 콘솔 (실시간, 별도 프로세스 두뇌): 콘솔 명령(이동, 자국, 링크 두절, 종료)이 접수·적용되고, 남은 scenario_replay.yaml을
    Python 시뮬레이터(sim.runner)로 다시 돌리면 같은 결과다 (실시간 실행에서 늦은 명령이 없었을 때)
 6. 실시간: 몇 초 돌려 잡음이 모자라지 않고, 모든 스텝을 돌고, 타이밍이 기록된다 (주기 초과 수는 시스템 설정에 달려 판정하지 않음)
@@ -203,6 +205,39 @@ def test_dis_console_on_rt_core():
         for d in dirs:
             shutil.rmtree(d, ignore_errors=True)
 
+def test_dis_chrono_realtime_on_rt_core():
+    """실시간 Chrono (기다리지 않는 교환): 콘솔로 흙·차량 투입이 되고, Chrono 뒤처짐은 상한(0.2 s) 근처로 묶인다."""
+    import re
+    import shutil
+    import socket
+    from dis_console import protocol as P
+    from dis_console.console import Console, parse_command
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sk:
+        sk.bind(("127.0.0.1", 0)); port = sk.getsockname()[1]
+    proc = subprocess.Popen([sys.executable, "-m", "sim.rt_link", "scenarios/dis_chrono.yaml", "--dis-port", str(port),
+                             "--dis-wait", "--brain", "shm"], cwd=ROOT, stdout=subprocess.PIPE, text=True)
+    con = Console(("127.0.0.1", port), out=lambda *_: None)
+    run_dir = None
+    try:
+        assert con.call(P.CONNECT, {"role": "control"}, timeout=60)[0] == "COMPLETED"
+        for line in ("cmd 0.35", "soil soft @1", "spawn @1.5", "end @8"):
+            st, body = con.call(*parse_command(line), timeout=60)
+            assert st == "COMPLETED", (line, st, body)
+        out, _ = proc.communicate(timeout=120)
+        run_dir = ROOT / re.search(r"기록: (\S+)", out).group(1)
+        mop = json.loads((run_dir / "summary.json").read_text())["mop"]
+        assert mop["stopped_by_console"] and not mop["fell"] and mop["cmd_late_steps"] == 0, mop   # 주기 초과는 절전 상태에 따라 가끔 (README 실시간 측정)
+        assert mop["min_vehicle_distance_m"] is not None and mop["deformed_cells"] > 0 and mop["chrono_lag_s_max"] < 0.3, mop
+        print(f"    DIS + Chrono (실시간): 전진 {mop['forward_x_m']} m, 차량 최소 {mop['min_vehicle_distance_m']} m, "
+              f"Chrono 뒤처짐 최대 {mop['chrono_lag_s_max']} s (멈춤 {mop['chrono_holds']}번 {mop['chrono_hold_s']} s), 주기 초과 {mop['overruns']}")
+    finally:
+        con.close()
+        if proc.poll() is None:
+            proc.kill()
+        if run_dir is not None:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+
 def test_perception_matches_runner():
     import pyarrow.parquet as pq
     import re
@@ -232,6 +267,54 @@ def test_perception_matches_runner():
         assert not np.any((la["t"] > 4.0) & (la["t"] < 5.0 - 1e-9))     # LiDAR 끊김 동안 스캔 없음
     finally:
         shutil.rmtree(py_dir, ignore_errors=True)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+def _runner_vs_rt(scn, brains, tmp, extra_npz=()):
+    import pyarrow.parquet as pq
+    import re
+    import shutil
+    tmp.mkdir(parents=True, exist_ok=True)
+    (tmp / "scenario.yaml").write_text(yaml.safe_dump(scn, allow_unicode=True))
+    out = subprocess.run([sys.executable, "-m", "sim.runner", str(tmp / "scenario.yaml")], cwd=ROOT,
+                         capture_output=True, text=True, check=True).stdout
+    py_dir = ROOT / re.search(r"기록: (\S+)", out).group(1)
+    try:
+        a = pq.read_table(py_dir / "timeseries.parquet").to_pandas()
+        ma = json.loads((py_dir / "summary.json").read_text())["mop"]
+        for brain in brains:
+            with contextlib.redirect_stdout(io.StringIO()):
+                mb, _ = rt_link.run(dict(scn), lockstep=True, verbose=False, brain=brain, out_dir=tmp / brain)
+            b = pq.read_table(tmp / brain / "timeseries.parquet").to_pandas()
+            diff = [c for c in a.columns if len(a) != len(b) or not np.array_equal(a[c].to_numpy(), b[c].to_numpy(), equal_nan=True)]
+            assert not diff, (brain, diff)
+            for k in ("min_vehicle_distance_m", "deformed_cells", "deform_mean_m", "deform_max_m", "forward_x_m"):
+                assert ma[k] == mb[k], (brain, k, ma[k], mb[k])
+            for name in extra_npz:
+                la, lb = np.load(py_dir / f"{name}.npz"), np.load(tmp / brain / f"{name}.npz")
+                assert np.array_equal(la["points"], lb["points"]) and np.array_equal(la["label"], lb["label"]), brain
+        return ma
+    finally:
+        shutil.rmtree(py_dir, ignore_errors=True)
+
+
+def test_chrono_matches_runner():
+    import shutil
+    import tempfile
+    from dis_console import protocol as P
+    from sim.runner import apply_overrides
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        fp = apply_overrides(yaml.safe_load((ROOT / "scenarios/footprints.yaml").read_text()), ["duration=4"])
+        assert _runner_vs_rt(fp, ("inproc",), tmp / "fp")["deformed_cells"] > 0          # 발자국 (발 하중 -> 흙)
+        ev = apply_overrides(yaml.safe_load((ROOT / "scenarios/dis_chrono.yaml").read_text()),
+                             ["duration=8", "controller.perception.sensor=front_lidar"])
+        ev["events"] = [{"t": 0.5, "action": "set_command", "vx": 0.35, "yaw_rate": 0.0},
+                        {"t": 1.0, "action": "set_soil", "soil": dict(P.SOIL_PRESETS["soft"])},
+                        {"t": 1.5, "action": "create_entity", "entity_type": "HMMWV", "speed": 4.0},
+                        {"t": 6.5, "action": "remove_entity", "entity_type": "HMMWV"}]
+        m = _runner_vs_rt(ev, ("inproc", "shm"), tmp / "ev", extra_npz=("front_lidar",))
+        assert m["min_vehicle_distance_m"] is not None and m["deformed_cells"] > 0
+    finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 if __name__ == "__main__":

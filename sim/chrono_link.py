@@ -9,9 +9,12 @@
 Chrono는 별도 프로세스(chrono conda 환경, Python 3.12)로 돌고 socketpair로 연결한다 (cosim/wire.py).
 동기는 파이프라인 방식: 시각 T_k에 T_k 결과를 반영하고 곧바로 T_k+1을 요청하므로, 두 엔진이 같은 구간을
 동시에 계산한다. 교환 시각이 시뮬레이션 시간으로 고정돼 있어 결과는 결정적이다.
+기다리지 않는 교환(sync(t, block=False), C++ 실시간 코어의 실시간 모드): 결과가 아직 없으면 직전 지형·차량 포즈를 그대로 쓰고
+다음 제어 주기에 다시 본다. Chrono가 실시간보다 느리면 Chrono 시각이 로봇 시각보다 뒤처진다 (lag으로 잰다. 결정적이지 않다).
 """
 import atexit
 import os
+import select
 import socket
 import subprocess
 from pathlib import Path
@@ -108,12 +111,21 @@ class ChronoLink:
         self._fn_sum += normal_forces
         self._n_obs += 1
 
-    def sync(self, t):
-        """제어 주기 시작마다 호출. 교환 시각에 도달했으면 결과를 반영하고 다음 구간을 요청."""
+    def sync(self, t, block=True):
+        """제어 주기 시작마다 호출. 교환 시각에 도달했으면 결과를 반영하고 다음 구간을 요청.
+        block=False: 결과가 아직 오지 않았으면 기다리지 않는다 (한 번에 한 구간만 반영)."""
         while t >= self.pending_t - 1e-9:
+            if not block and not select.select([self.sock], [], [], 0)[0]:
+                break
             self._apply(wire.recv(self.sock))
             self.k += 1
             self._request(self.k + 1)
+            if not block:
+                break
+
+    def lag(self, t):
+        """로봇 시각 t에 대해 Chrono 결과가 뒤처진 시간 (s). 기다리는 교환이면 항상 0 근처."""
+        return max(0.0, t - self.sync_dt - self.t)
 
     def _apply(self, r):
         self.t = r["t"]

@@ -23,7 +23,13 @@
 지금 지원하는 이벤트: set_command, add_patch, inject_fault, clear_fault (+ DIS 콘솔의 freeze, stop).
 DIS 콘솔 (--dis-port): sim/dis_server.py를 그대로 쓴다 (제어권, 인증, 통신 두절, 원본 PDU 기록, scenario_replay.yaml).
 LiDAR·지형 인지 보행: 이 프로세스가 코어가 넘긴 스텝 직후 바디 위치로 센서를 계산하고(sim.runner와 같은 순서와 값), 스캔을 두뇌로
-보낸다 (inproc: 함수, shm: 스캔 공유 메모리, ros: /sensors/<이름>/points). Chrono는 아직 이 경로에 없다.
+보낸다 (inproc: 함수, shm: 스캔 공유 메모리, ros: /sensors/<이름>/points).
+Chrono (HMMWV, 변형 지면, 발자국): 이 프로세스가 sim.runner와 같은 시각에 Chrono와 교환하고(로봇 위치, 발 하중 -> 차량 포즈,
+흙 높이), 바뀐 지형을 지형 공유 메모리로 코어에 보낸다. lockstep은 결과를 기다린다 (sim.runner와 비트 단위로 같음).
+실시간은 기다리지 않는다: 결과가 아직 없으면 직전 지형·차량을 쓴다. Chrono가 실시간보다 느려 chrono_max_lag(기본 0.2 s)보다
+뒤처지면 몸(코어)을 잠깐 멈춰(일시정지 칸) 따라잡게 한다: 세계 시간이 Chrono 속도로 느려지는 대신 차와 로봇이 같은 시각에 있다
+(뒤처짐을 그냥 두면 HMMWV가 몇 초 늦게 와 로봇을 뚫고 지나갔다). 0이면 상한 없음 (뒤처진 시간만 MOP로).
+(이 PC: 발자국은 실시간의 약 4.5배 빠르고, HMMWV는 약 0.75배.)
 """
 import argparse
 import datetime as dt
@@ -45,13 +51,16 @@ from rt import shm as R
 from .adapters import quat_to_roll_pitch
 from .adapters import quat_to_yaw
 from .recorder import Recorder
-from .runner import FALL_HEIGHT, FALL_TILT, SIM_VERSION, TERRAIN_COMMIT_HZ, Simulation, apply_overrides, load_yaml
+from .runner import (FALL_HEIGHT, FALL_TILT, SIM_VERSION, TERRAIN_COMMIT_HZ, Simulation, apply_overrides, load_yaml,
+                     terrain_deformation)
 from .stream import build_status
 
 ROOT = Path(__file__).resolve().parent.parent
 CORE = ROOT / "build/rt/rt_core"
 EVENT_LEAD_S = 1.0          # 별도 프로세스 두뇌에 이동 명령을 미리 보내는 시간 (명령에 적용 시각이 붙어 있어 결과는 같다)
 VIZ_DT = 0.04               # 가시화 발행 주기 (시뮬레이션 시간 s, 25 Hz)
+CHRONO_LAG_WARN = 0.5      # 실시간, 상한 없음: Chrono가 이만큼(s) 뒤처지면 한 번 경고한다
+CHRONO_MAX_LAG = 0.2       # 실시간: Chrono가 이만큼(s) 뒤처지면 코어를 멈추고 절반까지 따라잡으면 다시 돈다
 SENSOR_WORKERS = 2          # 실시간 LiDAR 작업 프로세스 수 (스캔 한 번 약 98 ms라 10 Hz에 하나로는 모자람, sim/rt_sensor.py)
 
 
@@ -237,7 +246,7 @@ class RosBrain(InprocBrain):
     def __init__(self, sim, link, scn_path, policy=None, remote=False, log_dir=None, bridge=None, viz=False):
         from .ros2_bridge import Ros2StreamPublisher, launch_controller_node
         self.link, self.remote = link, remote
-        self.bridge = bridge or Ros2StreamPublisher(sim.model, sim.terrain)
+        self.bridge = bridge or Ros2StreamPublisher(sim.model, sim.terrain, sim.cosim)
         self.bridge.enable_robot_io()
         self.proc = None if remote else launch_controller_node(log_dir or ROOT / "build/rt", scn_path, policy, viz=viz)
         self.forwarded = None
@@ -275,16 +284,18 @@ class RosBrain(InprocBrain):
 
 
 def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inproc", policy=None, remote=False,
-        viz=(), out_dir=None, variant="cpu", overrides=(), dis=None):
+        viz=(), out_dir=None, variant="cpu", overrides=(), dis=None, chrono_max_lag=CHRONO_MAX_LAG):
     """시나리오를 C++ 코어로 실행하고 (MOP, 끝 qpos)를 돌려준다.
     viz: ("rviz", "mjviz") 중 고른 것. out_dir: 기록 폴더 (timeseries.parquet, summary.json, 로그. 없으면 남기지 않음).
     variant: 모델 설정 (cpu / mjx, sim.runner --variant와 같다).
-    dis: DIS 콘솔 설정 {port, host, key(bytes), wait, comm_lost} (실시간 전용)."""
+    dis: DIS 콘솔 설정 {port, host, key(bytes), wait, comm_lost} (실시간 전용).
+    chrono_max_lag: 실시간에서 Chrono가 이보다(s) 뒤처지면 코어를 멈춰 기다린다 (0: 상한 없음)."""
     sim = Simulation(scenario, policy=policy, variant=variant)
-    unsupported = [e for e in sim.events if e["action"] not in ("set_command", "add_patch", "inject_fault", "clear_fault")]
-    if unsupported or sim.cosim is not None:
+    supported = ("set_command", "add_patch", "inject_fault", "clear_fault", "create_entity", "remove_entity", "set_soil")
+    unsupported = [e["action"] for e in sim.events if e["action"] not in supported]
+    if unsupported:
         sim.close()
-        raise SystemExit("실시간 코어 경로는 아직 Chrono를 지원하지 않는다 (python -m sim.runner)")
+        raise SystemExit(f"실시간 코어 경로가 지원하지 않는 이벤트: {unsupported}")
     link = RtLink(sim, lockstep, cpu, priority)
     scn_path = ROOT / f"build/rt/scenario_{os.getpid()}.yaml"
     scn_path.write_text(yaml.safe_dump(sim.scn, allow_unicode=True, sort_keys=False))
@@ -311,6 +322,7 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
     d0 = sim.data                                                  # 시작 상태의 참값 (첫 상태 추정과 비교, sim.runner와 같게)
     true_by_t[round(d0.time, 6)] = (d0.xmat[sim.base_id].reshape(3, 3).T @ d0.qvel[:3], quat_to_yaw(d0.qpos[3:7]))
     start_xy = sim.data.qpos[:2].copy()
+    terrain0 = sim.terrain.applied.copy()                          # 지형 변형 MOP (Chrono 흙, sim.runner와 같은 계산)
     energy, fell_at, k_truth, last_step = 0.0, None, 0, -1
     wake, comp, lat, qpos = [], [], [], None
 
@@ -340,6 +352,13 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
                 faults[e["fault"]] = (None if e.get("duration") is None else e["t"] + e["duration"], e.get("params") or {})
             elif e["action"] == "clear_fault":
                 faults.pop(e["fault"], None)
+            elif e["action"] == "create_entity":                  # 개체 투입 (Chrono 차량 슬롯)
+                sim.cosim.spawn_vehicle(e.get("speed"))
+                sim.cosim.near_event_sent = False
+            elif e["action"] == "remove_entity":
+                sim.cosim.remove_vehicle()
+            elif e["action"] == "set_soil":
+                sim.cosim.set_soil(e["soil"])
             if verbose:
                 print(f"[t={t_next:6.2f}] event: {e['action']}" + (f" {e.get('fault', '')}" if "fault" in e else "")
                       + (f"  (DIS {e['request']})" if e.get("source") == "dis" else ""))
@@ -366,6 +385,39 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
         ctl.link_mode = 0 if lf is None else 2 if lf[1].get("robot_behavior") == "damp" else 1
 
     next_commit = [0.0]
+
+    chrono_lag = [0.0, False]                  # 실시간: Chrono가 로봇 시각보다 뒤처진 최대 시간 (s), 경고 했는지
+    chrono_hold = {"on": False, "since": 0.0, "count": 0, "wall": 0.0}   # 실시간: Chrono를 기다리느라 코어를 멈춘 상태·횟수·시간
+
+    def cosim_step(t_now, base_xy):
+        """Chrono 교환 (sim.runner Simulation.step_control과 같은 자리: 이벤트 뒤, 지형 갱신 전).
+        실시간이면 기다리지 않는다 (결과가 없으면 직전 지형·차량 그대로)."""
+        if sim.cosim is None:
+            return
+        c = sim.cosim
+        c.robot_xy = np.array(base_xy[:2], float)                  # 다음 Chrono 요청에 실림 (차량 양보 판단)
+        c.sync(t_now, block=lockstep)                              # 결과 반영 (지형 원천 갱신 + 차량 포즈)
+        if not lockstep:
+            lag = c.lag(t_now)
+            chrono_lag[0] = max(chrono_lag[0], lag)
+            if chrono_max_lag and lag > chrono_max_lag and not chrono_hold["on"]:   # 코어를 멈추고 Chrono를 기다린다
+                chrono_hold.update(on=True, since=time.monotonic(), count=chrono_hold["count"] + 1)
+                link.shm.ctl.freeze = 1
+                if chrono_hold["count"] == 1:
+                    sim.last_event = (t_now, "chrono_slow")
+                    if verbose:
+                        print(f"[t={t_now:6.2f}] Chrono가 실시간보다 느려 {chrono_max_lag:.1f} s 넘게 뒤처지면 세계를 잠깐 멈춰 기다린다")
+            if not chrono_max_lag and lag > CHRONO_LAG_WARN and not chrono_lag[1]:
+                chrono_lag[1] = True
+                sim.last_event = (t_now, f"chrono_lag {lag:.1f}s")
+                if verbose:
+                    print(f"[t={t_now:6.2f}] 경고: Chrono가 실시간보다 느려 {lag:.2f} s 뒤처졌다 (차량·흙이 늦게 보인다)")
+        dist = c.distance_to(c.robot_xy)
+        if dist < c.near_dist and not c.near_event_sent:
+            c.near_event_sent = True
+            sim.last_event = (t_now, f"vehicle_near {dist:.1f}m")
+            if verbose:
+                print(f"[t={t_now:6.2f}] event: vehicle_near ({dist:.2f} m)")
 
     def terrain_step(t_now, base_xy, feet_xy, step):
         """sim.runner Simulation.step_control의 지형 갱신과 같은 규칙. 바뀌었으면 코어로 보낸다."""
@@ -423,6 +475,8 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
                 q=d.qpos[7:], qd=d.qvel[6:], tau=np.array(e.ctrl), contact=contact.astype(float), cmd=cmd,
                 q_des=np.array(e.q_des), terrain_version=sim.terrain.version,
                 wake_us=e.wake_us, compute_us=e.compute_us, cmd_state_t=e.cmd_t)
+        if sim.cosim is not None and sim.cosim.has_vehicle:
+            rec.log(vehicle_pos=sim.cosim.vehicle["pos"], vehicle_speed=sim.cosim.vehicle["speed"])
 
     scan_log = {}
     odom_offset = [None]
@@ -501,12 +555,16 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
             if rec is not None:                                      # 기록은 다음 스텝의 이벤트·지형 전에 (sim.runner와 같은 순서)
                 mirror(e)
                 record(e)
+            if sim.cosim is not None and sim.cosim.feet_enabled:     # 발자국: 스텝 동안 평균한 발 수직력 참값 (sim.runner와 같은 값)
+                sim.cosim.observe_feet(np.array(e.foot_pos).reshape(4, 3), np.array(e.foot_force))
             sense(e)                                                 # 센서: 물리 뒤, 다음 스텝 이벤트·지형 전 (sim.runner와 같은 순서)
             if stop_after[0] is not None and e.step >= stop_after[0]:  # 콘솔 종료: 그 주기까지 돌았다
                 link.stop()
                 continue
-            apply_events(e.t, e.step + 1)
-            terrain_step(e.t, e.qpos[:2], [np.array(e.foot_pos[3 * i:3 * i + 2]) for i in range(4)], e.step + 1)
+            if e.step + 1 < link.shm.cfg.max_steps:                 # 마지막 스텝 뒤에는 다음 스텝 준비를 하지 않는다 (sim.runner와 같게)
+                apply_events(e.t, e.step + 1)
+                cosim_step(e.t, e.qpos[:2])
+                terrain_step(e.t, e.qpos[:2], [np.array(e.foot_pos[3 * i:3 * i + 2]) for i in range(4)], e.step + 1)
             if dis_srv is not None:
                 dis_srv.after_events()
             if bridge is not None and (e.t >= next_viz - 1e-9 or fell_at is not None):
@@ -530,7 +588,7 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
                 print(f"DIS 시나리오 콘솔 대기: UDP {dis.get('host', '127.0.0.1')}:{dis_srv.port}{' (인증)' if dis.get('key') else ''}")
         if viz or brain == "ros":
             from .ros2_bridge import Ros2StreamPublisher, launch_mujoco_viewer, launch_rviz_stack
-            bridge = Ros2StreamPublisher(sim.model, sim.terrain)
+            bridge = Ros2StreamPublisher(sim.model, sim.terrain, sim.cosim)
         if "rviz" in viz:
             rviz, adapter = launch_rviz_stack(log_dir)
             displays.append(("RViz", rviz)); helpers.append(adapter)
@@ -576,11 +634,17 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
         apply_events(0.0, 0)
         if dis_srv is not None:
             dis_srv.after_events()
+        cosim_step(sim.data.time, sim.data.qpos[:2])
         terrain_step(sim.data.time, sim.data.qpos[:2], sim.feet_xy(), 0)
         link.start()
         n_steps = link.shm.cfg.max_steps
         if lockstep:
+            wall0 = time.monotonic()
             for k in range(n_steps):
+                if displays:                                       # 화면이 있으면 벽시계보다 앞서지 않게 (sim.runner --rviz와 같이 실시간 속도)
+                    ahead = k * link.control_dt - (time.monotonic() - wall0)
+                    if ahead > 0:
+                        time.sleep(ahead)
                 state_sent = link.shm.ctl.link_mode == 0           # 링크 두절이면 코어가 상태를 내지 않는다
                 link.shm.ctl.lockstep_target = k
                 while link.shm.stats.steps < k + 1:
@@ -603,7 +667,12 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
                 if dis_srv is not None:
                     dis_srv.poll()
                     dis_srv.after_events()                        # 일시정지 중에도 재개 요청과 주기 보고
-                    link.shm.ctl.freeze = int(sim.frozen)
+                if chrono_hold["on"]:                              # Chrono 따라잡기 (코어는 멈춰 있다)
+                    sim.cosim.sync(sim.data.time, block=False)
+                    if sim.cosim.lag(sim.data.time) <= chrono_max_lag / 2:
+                        chrono_hold["on"] = False
+                        chrono_hold["wall"] += time.monotonic() - chrono_hold["since"]
+                link.shm.ctl.freeze = int(sim.frozen or chrono_hold["on"])
                 if sensors[0] is not None:
                     deliver_scans()
                 ls = link.read_state()
@@ -633,12 +702,19 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
             "cmd_late_steps": int((lat_ms > 1000 * link.control_dt + 1e-3).sum()),   # 명령이 한 주기보다 늦게 실행된 주기 수
             "noise_underruns": int(st.noise_underruns), "mlockall": bool(st.locked), "sched_fifo": bool(st.rt_ok),
         }
+        mop["min_vehicle_distance_m"] = round(sim.cosim.min_dist, 3) if sim.cosim is not None and sim.cosim.has_vehicle else None
+        mop.update(terrain_deformation(terrain0, sim.terrain.applied))
         if rec is not None:
             mop.update({"touchdowns": touchdowns, "edge_touchdowns": edge_touchdowns,
                         "est_speed_rmse_mps": round(float(np.sqrt(np.mean(np.square(est_err_v[25:])))), 4)
                         if len(est_err_v) > 25 else None})
         if not lockstep:
             mop["supervisor_lag_steps_max"] = lag_max[0]
+            if sim.cosim is not None:
+                mop["chrono_lag_s_max"] = round(chrono_lag[0], 3)
+                mop["chrono_lag_s_end"] = round(sim.cosim.lag(t_end), 3)
+                mop["chrono_holds"] = chrono_hold["count"]                  # Chrono를 기다리느라 세계를 멈춘 횟수, 시간 (벽시계 s)
+                mop["chrono_hold_s"] = round(chrono_hold["wall"], 2)
             if scan_delay:
                 mop["scan_delay_ms_mean"] = round(1000 * float(np.mean(scan_delay)), 1)
                 mop["scan_delay_ms_max"] = round(1000 * float(np.max(scan_delay)), 1)
@@ -690,7 +766,9 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
                 p.terminate()
         if bridge is not None:
             bridge.close()
-        sim.close()
+        stats = sim.close()
+        if stats and verbose:
+            print(f"Chrono 서버 계산 시간: {stats['busy_s']:.1f} s")
         scn_path.unlink(missing_ok=True)
 
 
@@ -709,6 +787,8 @@ def main():
     ap.add_argument("--dis-key", metavar="FILE", help="DIS 인증 공유 키")
     ap.add_argument("--dis-host", default="127.0.0.1", help="콘솔 요청을 받을 주소 (127.0.0.1 밖은 --dis-key 필요)")
     ap.add_argument("--dis-comm-lost", choices=["STOP", "CONTINUE"], default="STOP")
+    ap.add_argument("--chrono-max-lag", type=float, default=CHRONO_MAX_LAG, metavar="S",
+                    help=f"실시간 Chrono가 이보다 뒤처지면 세계를 멈춰 기다린다 (기본 {CHRONO_MAX_LAG}, 0: 상한 없음)")
     ap.add_argument("--rviz", action="store_true", help="RViz로 보기 (sim.runner --rviz와 같은 화면)")
     ap.add_argument("--mjviz", action="store_true", help="MuJoCo 렌더러로 보기")
     ap.add_argument("--cpu", type=int, default=5, help="코어를 고정할 CPU (-1: 고정 안 함)")
@@ -735,7 +815,7 @@ def main():
             dis = {"port": a.dis_port, "host": a.dis_host, "wait": a.dis_wait, "comm_lost": a.dis_comm_lost,
                    "key": load_key(a.dis_key) if a.dis_key else None}
         mop, _ = run(scn, a.lockstep, a.cpu, a.priority, brain=a.brain, policy=a.policy, remote=a.remote_brain,
-                     viz=viz, out_dir=out, variant=a.variant, overrides=a.set or (), dis=dis)
+                     viz=viz, out_dir=out, variant=a.variant, overrides=a.set or (), dis=dis, chrono_max_lag=a.chrono_max_lag)
         print("\n== MOP (C++ 실시간 코어) ==")
         for k, v in mop.items():
             print(f"  {k:20s} {v}")

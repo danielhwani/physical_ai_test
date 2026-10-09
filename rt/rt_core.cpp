@@ -271,16 +271,18 @@ int main(int argc, char** argv) {
       double e = 0.0;
       for (int j = 0; j < NJ; j++) e += std::fabs(d->ctrl[j] * d->qvel[6 + j]);
       energy += e * ts;
+      double f[4] = {0, 0, 0, 0};        // 스텝마다 발별 합을 먼저 내고 누적 (Python과 같은 덧셈 순서: 발 하나에 접촉 여러 개일 때)
       for (int c = 0; c < d->ncon; c++) {
         const mjContact& con = d->contact[c];
         for (int i = 0; i < 4; i++) {
           int g = cfg.foot_geom[i];
           if ((con.geom1 == g || con.geom2 == g) && (con.geom1 == cfg.terrain_geom || con.geom2 == cfg.terrain_geom)) {
             mj_contactForce(m, d, c, out6);
-            fn[i] += out6[0];
+            f[i] += out6[0];
           }
         }
       }
+      for (int i = 0; i < 4; i++) fn[i] += f[i];
     }
     for (int i = 0; i < 4; i++) foot_force[i] = fn[i] / cfg.decim;
 
