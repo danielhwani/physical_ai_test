@@ -1186,6 +1186,36 @@ Unitree 어댑터는 실제 Go2용 외부 제어기를 시험할 일이 생기�
 `python -m control.robot_msgs --build` (같은 ROS2 배포판 Humble 권장). 다른 팀이 두뇌만 만들게 되면 `go2_rt_msgs`만 별도 저장소로,
 여러 PC 설치 관리가 필요해지면 deb 패키지(`bloom`)로.
 
+**일반 터미널에서 확인** (모든 터미널에서 같은 `ROS_DOMAIN_ID`, mj_ros 환경, `~/physics_ai_test`에서)
+```bash
+# 1. 형식: "로봇 경계 메시지 형식: typed"면 커스텀 메시지가 빌드돼 있음
+python -m control.robot_msgs
+
+# 2. ros 두뇌로 실행 (터미널 1). 두뇌 노드 로그 runs/<실행>/controller_node.log 끝에 "robot messages: typed"
+export ROS_DOMAIN_ID=77
+python -m sim.rt_link scenarios/flat_trot.yaml --brain ros --rviz
+
+# 3. ROS2 도구로 보기 (터미널 2, 2가 도는 동안)
+export ROS_DOMAIN_ID=77
+source /opt/ros/humble/setup.bash
+source ~/physics_ai_test/ros2_ws/install/setup.bash        # 도구가 go2_rt_msgs를 알게 (시뮬레이터·두뇌 노드는 source 불필요)
+ros2 topic list -t | grep -E "low_state|low_cmd|estimate"  # go2_rt_msgs/msg/... (json이면 std_msgs/msg/String)
+ros2 topic hz /robot/low_state                             # 약 50 Hz
+ros2 topic echo /robot/low_cmd --once                      # 필드별로 보임 (json이면 JSON 문자열 한 줄)
+ros2 interface show go2_rt_msgs/msg/LowState
+
+# 4. JSON 방식과 비교: 로봇 움직임은 같고, 3의 토픽 타입이 std_msgs/msg/String으로 바뀜
+python -m sim.rt_link scenarios/flat_trot.yaml --brain ros --ros-msg json --rviz
+
+# 5. 두뇌를 따로 띄우기 (다른 PC 흉내). 터미널 1: 두뇌 노드, 터미널 2: 시뮬레이터 (노드를 기다림)
+python -m control.ros_node --ros-msg typed --scenario scenarios/flat_trot.yaml
+python -m sim.rt_link scenarios/flat_trot.yaml --brain ros --remote-brain --ros-msg typed --rviz
+#    두뇌 노드를 --ros-msg json으로 띄우면 시뮬레이터가 바로 "두뇌 노드의 메시지 형식이 다르다 ... --ros-msg typed로 띄울 것"
+#    (이때 빈 실행 폴더 runs/flat_trot_rt_<시각>가 생길 수 있다). 노드는 Ctrl+C로 끝낸다
+```
+- 옵션은 `--scenario`처럼 `--`를 붙인다 (`scenario`만 쓰면 usage 오류).
+- 3에서 `ros2_ws/install/setup.bash`를 source하지 않으면 도구가 타입을 몰라 `echo`가 실패한다.
+
 **확인**: `test_ros_equivalence.py` 4개(트롯, 정책, 추정 정책, 지형 인지 트롯)가 typed와 json 모두 통과. 실시간 코어 경로의 ros 두뇌
 (lockstep 비트 동일, 고장, LiDAR 지형 인지)도 typed로 통과.
 
