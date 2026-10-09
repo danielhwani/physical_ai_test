@@ -36,6 +36,7 @@ python conformance/test_control.py                       # 로봇 경계: 알고
 python conformance/test_lidar.py                         # LiDAR: 스트림만으로 재현, 지형 표면, 자기 몸 제외
 python conformance/test_perception.py                    # 지형 인지: 높이 지도, 디딜 곳, LiDAR 지도 정확도, 점군만으로 재현, height_scan 규약
 python conformance/test_ros_equivalence.py               # ROS 노드 = 같은 프로세스(20 ms 지연 흉내) (ROS2 필요)
+python conformance/test_rt_core.py                       # C++ 실시간 코어: 규약 일치, 물리 비트 동일, 닫힌 고리 동일, 실시간 실행
 python conformance/test_dis_console.py                   # DIS 콘솔: 핸드셰이크, 고장 주입, 실행 제어, 링크 감시, 제어권·인증·원본 기록, HMMWV 투입·흙(Chrono), 기록으로 비트 단위 재실행
 python conformance/test_render_stream.py                 # 렌더 스트림 계약 (스트림만으로 장면 재구성 = 시뮬레이터)
 python conformance/compare_variants.py [--policy card.yaml]   # cpu vs mjx 설정의 MOP 분포 비교
@@ -76,6 +77,7 @@ Chrono 시나리오의 MOP에는 지면 변형량(`deformed_cells`, `deform_mean
 | `viz/sensor_renderer.py`, `viz/sensor_node.py` | 센서 렌더러 (중립 스트림 -> 장면 -> 레이캐스트 -> 점군)와 ROS2 별도 프로세스 노드 | §8 |
 | `cosim/` | 엔진 간 연결 규약 `wire.py`(표준 라이브러리), Chrono 서버 `chrono_server.py`(chrono 환경) | §5 |
 | `sim/recorder.py` | Parquet 기록, Virtual 출처와 버전 조합 기록 | §4, §9.2, §13.3 |
+| `rt/`, `sim/rt_link.py` | C++ 실시간 코어 (물리, 로봇 쪽 경계, 고정 주기 루프)와 Python 관리 프로세스, 공유 메모리 규약 | §11 |
 | `conformance/` | 결정성, IK-모델 일치, 관측 기준 벡터(`reference/obs_reference.npz`), 오버라이드-상류 일치, 변형 간 MOP 비교 | §12.3, §13.2 |
 
 ## MJX 준비 사항
@@ -700,6 +702,52 @@ python3 -m siman_r.player recordings/sim_session.jsonl --target 127.0.0.1:3000 -
 - 룰 기반 교사 모방(`go2_trot_bc_*`)은 지형 판단 없는 기본 보행을 CPU로 빠르게 만들어 배치 경로를 시험하는 용도로 남긴다
   (룰 기반 교사를 넘어설 수 없고, 미세한 문턱값 판단은 따라 하기도 어려웠다: 위 `go2_trot_bc_terrain`).
 
+## 실시간 코어 (C++, 문서 §11)
+
+```bash
+python -m sim.rt_link --build                                  # 코어 빌드 (cmake, mj_ros의 libmujoco 사용)
+python -m sim.rt_link scenarios/flat_trot.yaml                 # 실시간: SCHED_FIFO 80, CPU 5 고정, 메모리 잠금
+python -m sim.rt_link scenarios/flat_trot.yaml --lockstep      # 한 스텝씩 (Python 실행과 비교)
+python conformance/test_rt_core.py                             # 규약 일치, 물리 비트 동일, 닫힌 고리 동일, 실시간 실행
+```
+
+**나눈 일**
+```
+C++ 코어 rt/rt_core (실시간 루프)                     Python 관리 프로세스 sim/rt_link.py (실시간 아님)
+  20 ms마다 (절대 시각 clock_nanosleep)                  모델(.mjb)·시작 상태·센서 편향 준비, 코어 띄우기
+   1. 로봇 상태 측정 (센서 모델) ──LowState──▶  공유 메모리  ──▶ 보행 알고리즘 control/ (지금 코드 그대로)
+   2. 최신 관절 명령 고르기      ◀──LowCmd──   /dev/shm    ◀──  관절 명령
+   3. 물리 10스텝 (PD 모터 -> mj_step)            ◀── 센서 잡음 (미리, Python과 같은 난수)
+   4. 참값·타이밍 기록          ──참값 링──▶               ──▶ 넘어짐 판정, MOP, 이벤트(이동 명령, 고장)
+```
+- 코어는 시작 전에 메모리를 잠그고(`mlockall`), CPU를 고정하고, SCHED_FIFO로 돈다. 루프 안에서는 할당·입출력·잠금을 하지 않는다.
+  공유 메모리 칸은 seqlock(쓰는 쪽 하나)으로 주고받는다. 규약은 `rt/shm_layout.h`와 `sim/rt_link.py`(ctypes)에 같은 것을 두고 시험으로 대조한다.
+- 명령은 직전 주기까지의 상태로 계산된 최신 것을 쓴다 (연결 지연 한 주기, `sim.runner`와 같다). 보행 알고리즘이 늦으면 마지막 명령을
+  계속 쓰고 늦은 만큼이 명령 지연 MOP에 드러난다. 링크 두절(마지막 명령 유지 / 감쇠), 배터리 저하, IMU 고장도 코어가 처리한다.
+- 센서 잡음은 Python이 `(seed, 표본 번호)` 난수로 미리 만들어 링 버퍼로 넘긴다 (`ProprioSensors.draw_noise`). 그래서 같은 실행은 같은 잡음이다.
+
+**같은 결과** (`test_rt_core.py`)
+- Python 시뮬레이터가 실행한 관절 명령을 그대로 넣으면 200스텝 매번 몸통·관절 상태가 비트 단위로 같다 (같은 libmujoco 3.5,
+  같은 PD 식과 계산 순서, `-ffp-contract=off`). 로봇 상태 출력은 삼각함수·노름의 마지막 자리 차이로 최대 1.7e-13.
+- 보행 알고리즘까지 붙인 lockstep 실행도 Python 실행과 끝 상태가 비트 단위로 같다 (flat_trot: 전진 3.918 m, CoT 2.404).
+
+**실시간 측정** (flat_trot 30초 = 1500주기, 이 PC 기본 설정: 절전 `powersave`, 깊은 대기 상태 C10까지, 코어 격리 없음, 데스크톱 사용 중)
+
+| | Python 루프 (`sim.runner --realtime`과 같은 방식, SCHED_FIFO) | C++ 코어 |
+|---|---|---|
+| 주기 초과 | 25번 (1.7%) | **0번** |
+| 깨어남 지연 평균 / p99 / 최대 | 0.13 / 1.2 / 5.4 ms | **0.07 / 0.26 / 0.74 ms** |
+| 한 주기 계산 평균 / p99 / 최대 | 8.7 / 21 / 24 ms | 7.3 / 14 / 19 ms |
+| 명령 지연 | – | 항상 20 ms (보행 알고리즘이 매 주기 제때 응답) |
+
+- 계산 시간이 아직 크고 들쭉날쭉한 것은 CPU 절전 때문이다: 같은 물리 10스텝이 CPU가 쉬지 않으면 0.8 ms, 주기마다 쉬면 3.4 ms이고
+  가끔 24 ms까지 튄다 (C++ 측정). 잠들지 않고 기다리면(spin) 빨라지지만 커널 RT 스로틀링(1초에 0.95초까지)에 걸려 매초 멈췄다.
+  그래서 시간 보장의 다음 단계는 시스템 설정이다 (루트 권한): CPU 주파수 `performance`, `/dev/cpu_dma_latency`로 깊은 대기 상태 금지,
+  커널 인자 `isolcpus=4,5 nohz_full=4,5 rcu_nocbs=4,5 irqaffinity=0-3`로 실시간 코어 격리.
+
+**아직 이 경로에 없는 것**: 지형 패치 이벤트·지형 창(코어로 높이 갱신 보내기), Chrono, LiDAR, ROS2 보행 알고리즘 노드(지금은 같은 프로세스의
+Python 알고리즘), DIS 콘솔, 기록(Parquet)·가시화. 이 기능들은 `python -m sim.runner`로 실행한다.
+
 ## 저사양을 고려해 의도적으로 뺀 것
 
 - **UE5 / 카메라 센서**: GPU 드라이버가 없어 불가 (LiDAR는 CPU 레이캐스트로 구현). 렌더러는 포즈 스트림을 받는 얇은 클라이언트로 나중에 붙인다. 연동 계획과 추천 PC 제원은 [`docs/ue5_integration.md`](docs/ue5_integration.md).
@@ -710,5 +758,5 @@ python3 -m siman_r.player recordings/sim_session.jsonl --target 127.0.0.1:3000 -
 
 - 트롯 보행기는 규칙 기반이라 요철에서 방위가 최대 약 18° 흔들리고 측방 이동이 남는다 (측방 위치 제어 없음).
 - 지형 인지 트롯도 자국 안을 따라 걷기(hmmwv_follow)와 15 cm 자국에서는 자주 넘어진다 (위 지형 인지 보행 절).
-- 실시간 루프가 Python이므로 지터 보장은 없다. 문서 §11대로 RT 루프는 추후 C++로 옮긴다.
+- `sim.runner`의 실시간 루프는 Python이라 지터 보장이 없다. C++ 실시간 코어(`sim.rt_link`)는 아직 일부 기능만 지원하고, 시간 보장에는 시스템 설정이 더 필요하다 (위 실시간 코어 절).
 - 지형 갱신은 발 근처 셀을 보류하므로 로봇이 홈 위에 서 있으면 반영이 늦어진다 (의도된 동작).

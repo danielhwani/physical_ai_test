@@ -58,22 +58,31 @@ class ProprioSensors:
     def clear_fault(self):
         self.set_fault()
 
+    NOISE_DIM = 36      # 표본 하나의 잡음: 자세 롤·피치 2, 관절각 12, 관절속도 12, 자이로 3, 가속도 3, 발 힘 4
+
+    def draw_noise(self, n):
+        """표본 번호 n의 잡음 (NOISE_DIM). 난수는 (seed, n)으로만 정해진다: C++ 실시간 코어(rt/)에 미리 만들어 넘겨도 같은 값."""
+        s = self.spec
+        rng = np.random.default_rng((s.seed, n))
+        att = np.radians(s.attitude_noise_deg)
+        return np.concatenate([[rng.normal(0, att), rng.normal(0, att)], rng.normal(0, s.joint_pos_noise, 12),
+                               rng.normal(0, s.joint_vel_noise, 12), rng.normal(0, s.gyro_noise, 3),
+                               rng.normal(0, s.accel_noise, 3), rng.normal(0, s.foot_force_noise, 4)])
+
     def measure(self, t, quat_wxyz, gyro, accel, q, dq, foot_force):
         """참값 -> 측정값 (로봇 상태 메시지의 내용). 쿼터니언 출력은 x, y, z, w (ROS 규약)."""
-        s = self.spec
-        rng = np.random.default_rng((s.seed, self.n))
+        z = self.draw_noise(self.n)
         self.n += 1
-        att = np.radians(s.attitude_noise_deg)
         fr, fp, fy = self.fault_att
-        err = quat_from_rpy(rng.normal(0, att) + fr, rng.normal(0, att) + fp, self.yaw_drift * t + fy)   # 월드 기준 오차 회전
+        err = quat_from_rpy(z[0] + fr, z[1] + fp, self.yaw_drift * t + fy)   # 월드 기준 오차 회전
         qm = quat_mul(err, np.asarray(quat_wxyz, dtype=float))
         qm /= np.linalg.norm(qm)
         return {
             "t": float(t),
-            "q": (np.asarray(q) + rng.normal(0, s.joint_pos_noise, 12)).tolist(),
-            "dq": (np.asarray(dq) + rng.normal(0, s.joint_vel_noise, 12)).tolist(),
+            "q": (np.asarray(q) + z[2:14]).tolist(),
+            "dq": (np.asarray(dq) + z[14:26]).tolist(),
             "imu": {"quat": [qm[1], qm[2], qm[3], qm[0]],
-                    "gyro": (np.asarray(gyro) + self.gyro_bias + rng.normal(0, s.gyro_noise, 3) + self.fault_gyro).tolist(),
-                    "accel": (np.asarray(accel) + self.accel_bias + rng.normal(0, s.accel_noise, 3)).tolist()},
-            "foot_force": np.maximum(np.asarray(foot_force) + rng.normal(0, s.foot_force_noise, 4), 0.0).tolist(),
+                    "gyro": (np.asarray(gyro) + self.gyro_bias + z[26:29] + self.fault_gyro).tolist(),
+                    "accel": (np.asarray(accel) + self.accel_bias + z[29:32]).tolist()},
+            "foot_force": np.maximum(np.asarray(foot_force) + z[32:36], 0.0).tolist(),
         }
