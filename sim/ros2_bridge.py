@@ -164,10 +164,13 @@ class Ros2StreamPublisher:
 
     # ---- 로봇 경계 (보행 알고리즘을 별도 노드로 돌릴 때) ----
     def enable_robot_io(self):
+        """로봇 경계 토픽. 형식은 control/robot_msgs.py (go2_rt_msgs 커스텀 메시지, 없으면 JSON. GO2_ROS_MSG / --ros-msg)."""
         from geometry_msgs.msg import Twist
         from sensor_msgs.msg import Imu, JointState
+        from control.robot_msgs import Codec
+        self.codec = Codec()
         self._Twist2, self._Imu, self._JS2 = Twist, Imu, JointState
-        self.pub_low_state = self.node.create_publisher(self._String, "/robot/low_state", 10)
+        self.pub_low_state = self.node.create_publisher(self.codec.State, "/robot/low_state", 10)
         self.pub_imu = self.node.create_publisher(Imu, "/robot/imu", 10)
         self.pub_meas_js = self.node.create_publisher(JointState, "/robot/joint_states", 10)
         from geometry_msgs.msg import TwistStamped
@@ -177,12 +180,12 @@ class Ros2StreamPublisher:
         self.latest_cmd = self.latest_est = None
         self.cmds = []
         self._rx = 0                                  # 받은 메시지 수 (spin_some이 큐가 비었는지 판단)
-        self.node.create_subscription(self._String, "/robot/low_cmd", self._on_low_cmd, 10)
+        self.node.create_subscription(self.codec.Cmd, "/robot/low_cmd", self._on_low_cmd, 10)
         # 알고리즘의 상태 추정 (진단용). 판정자(러너)가 참값과 비교해 추정 오차 MOP를 남긴다
-        self.node.create_subscription(self._String, "/control/estimate", self._on_estimate, 10)
+        self.node.create_subscription(self.codec.Est, "/control/estimate", self._on_estimate, 10)
 
     def _on_low_cmd(self, msg):
-        cmd = json.loads(msg.data)
+        cmd = self.codec.cmd(msg)
         self.cmds.append(cmd)
         del self.cmds[:-10]                            # 최근 명령 몇 개만 (상태 시각으로 고른다)
         self.latest_cmd = cmd; self._rx += 1
@@ -194,11 +197,11 @@ class Ros2StreamPublisher:
         return ok[-1] if ok else None
 
     def _on_estimate(self, msg):
-        self.latest_est = json.loads(msg.data); self._rx += 1
+        self.latest_est = self.codec.est(msg); self._rx += 1
 
     def publish_low_state(self, ls):
-        """로봇 상태: 알고리즘용 JSON 전체 + 표준 도구용 Imu, JointState (측정값)."""
-        self.pub_low_state.publish(self._String(data=json.dumps(ls)))
+        """로봇 상태: 알고리즘용 전체 (go2_rt_msgs/LowState 또는 JSON) + 표준 도구용 Imu, JointState (측정값)."""
+        self.pub_low_state.publish(self.codec.state_msg(ls))
         stamp = self._stamp(ls["t"])
         imu = self._Imu()
         imu.header.stamp, imu.header.frame_id = stamp, "imu"

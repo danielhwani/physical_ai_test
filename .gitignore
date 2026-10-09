@@ -3,6 +3,10 @@ third_party/
 # 실행 결과
 runs/
 build/
+# ROS2 메시지 패키지 빌드 결과 (python -m control.robot_msgs --build)
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
 # 내부 문서, 작업용 캡처
 *.docx
 Screenshot*.png

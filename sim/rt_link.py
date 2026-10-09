@@ -254,6 +254,11 @@ class RosBrain(InprocBrain):
     def ready(self):
         if self.proc is not None and self.proc.poll() is not None:
             raise RuntimeError("두뇌 노드가 끝났다 (build/rt/controller_node.log)")
+        want = "std_msgs/msg/String" if self.bridge.codec.mode == "json" else "go2_rt_msgs/msg/LowCmd"
+        got = {i.topic_type for i in self.bridge.node.get_publishers_info_by_topic("/robot/low_cmd")} - {want}
+        if got:                                    # 두뇌 노드가 다른 형식으로 떴다 (다른 PC에서 --ros-msg가 다름)
+            raise RuntimeError(f"두뇌 노드의 메시지 형식이 다르다: {sorted(got)} (이쪽 {want}). "
+                               f"두뇌 노드를 --ros-msg {self.bridge.codec.mode}로 띄울 것")
         return self.bridge.node.count_subscribers("/robot/low_state") > 0 and \
             self.bridge.node.count_subscribers("/cmd_vel_stamped") > 0
 
@@ -617,7 +622,8 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
             if remote and time.monotonic() >= next_note:
                 next_note += 10
                 print(f"두뇌 노드를 기다린다: 다른 PC에서 ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', 0)} "
-                      f"python -m control.ros_node --scenario <이 시나리오 파일 복사본> (시나리오: {scn_path})")
+                      f"python -m control.ros_node --ros-msg {br.bridge.codec.mode} --scenario <이 시나리오 파일 복사본> "
+                      f"(시나리오: {scn_path})")
             if time.monotonic() - t0 > (3600 if remote else 30):
                 raise RuntimeError("두뇌가 붙지 않았다")
             time.sleep(0.05)
@@ -780,6 +786,8 @@ def main():
     ap.add_argument("--brain", choices=["inproc", "shm", "ros"], default="inproc",
                     help="두뇌(보행 알고리즘) 연결: inproc 이 프로세스, shm 같은 PC 별도 프로세스, ros ROS2 노드")
     ap.add_argument("--remote-brain", action="store_true", help="--brain ros: 노드를 띄우지 않고 다른 PC의 노드를 기다린다")
+    ap.add_argument("--ros-msg", choices=["auto", "typed", "json"],
+                    help="--brain ros 로봇 경계 메시지: typed(go2_rt_msgs), json, auto(빌드돼 있으면 typed, 기본). 두뇌 노드도 같게")
     ap.add_argument("--policy", help="정책 카드 (없으면 시나리오의 트롯)")
     ap.add_argument("--variant", choices=["cpu", "mjx"], default="cpu", help="모델 설정 (sim.runner --variant와 같다)")
     ap.add_argument("--dis-port", type=int, metavar="PORT", help="DIS 시나리오 콘솔 요청을 받는다 (UDP, 실시간 전용)")
@@ -798,6 +806,8 @@ def main():
     a = ap.parse_args()
     if a.build:
         print(f"빌드: {build()}")
+    from control.robot_msgs import set_mode
+    set_mode(a.ros_msg)
     if a.layout:
         print(json.dumps(layout(), indent=2))
     if a.scenario:

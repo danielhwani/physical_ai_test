@@ -779,6 +779,8 @@ def main():
                     help="센서 켜기 (specs/go2_sensors.yaml의 이름, 여러 번 가능). 예: --sensor front_lidar")
     ap.add_argument("--sensor-node", action="store_true",
                     help="센서를 별도 프로세스(ROS2 중립 스트림만 구독)에서 계산 (--ros2, --realtime 자동. 결정성 없음)")
+    ap.add_argument("--ros-msg", choices=["auto", "typed", "json"],
+                    help="--controller-node 로봇 경계 메시지: typed(go2_rt_msgs), json, auto(빌드돼 있으면 typed, 기본)")
     ap.add_argument("--controller-node", action="store_true",
                     help="보행 알고리즘을 별도 ROS2 노드로 (로봇 상태/관절 명령 토픽으로만 주고받음. --ros2, --realtime 자동)")
     ap.add_argument("--dis-port", type=int, metavar="PORT",
@@ -792,6 +794,8 @@ def main():
     ap.add_argument("--set", action="append", metavar="KEY=VALUE",
                     help="시나리오 값 바꾸기 (여러 번 가능). 예: --set chrono.scm.soil.bekker_kphi=2e7")
     args = ap.parse_args()
+    from control.robot_msgs import set_mode
+    set_mode(getattr(args, "ros_msg", None))
     if args.rviz or args.mjviz or args.sensor_node or args.controller_node:
         args.ros2 = args.realtime = True
     run(args)

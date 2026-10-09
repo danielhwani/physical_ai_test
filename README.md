@@ -113,8 +113,8 @@ python conformance/test_control.py
   요철·바퀴 자국에서는 발이 미끄러져 오차가 커진다 (편향 +0.03~0.05 m/s). 실제 로봇의 다리 주행거리계와 같은 한계다.
 - **관절 명령** (Unitree LowCmd를 본뜸): `q_des, dq_des, kp, kd, tau_ff`. 정책 카드의 PD 게인은 알고리즘이 명령에 실어 보내고,
   토크 한계는 로봇 쪽이 지킨다.
-- **별도 노드** (`--controller-node`): `/robot/low_state`(JSON) + `/robot/imu`, `/robot/joint_states`(측정값) -> `control/ros_node.py`
-  -> `/robot/low_cmd`(JSON). 운용자 명령은 `/cmd_vel`(원격 조종 도구, 즉시 적용)과 `/cmd_vel_stamped`(시나리오 이벤트, 시각을 붙여 그 시각 상태부터 적용). 로봇 쪽은 마지막으로 받은 명령을 실행하고, 명령 지연을 MOP
+- **별도 노드** (`--controller-node`): `/robot/low_state`(`go2_rt_msgs/LowState`) + `/robot/imu`, `/robot/joint_states`(측정값) -> `control/ros_node.py`
+  -> `/robot/low_cmd`(`go2_rt_msgs/LowCmd`). 메시지 형식은 아래 "로봇 경계 ROS2 메시지". 운용자 명령은 `/cmd_vel`(원격 조종 도구, 즉시 적용)과 `/cmd_vel_stamped`(시나리오 이벤트, 시각을 붙여 그 시각 상태부터 적용). 로봇 쪽은 마지막으로 받은 명령을 실행하고, 명령 지연을 MOP
   (`cmd_latency_ms_*`)로 기록한다. 이 PC에서 지연은 항상 20 ms(1주기)였고, 같은 프로세스에서 1주기 지연을 넣은 결과와 같다.
   (처음에는 수신 메시지를 한 주기에 하나씩만 처리해 명령이 밀려 넘어졌다 -> 쌓인 메시지를 모두 비우도록 수정)
 - **MOP**: 추정 오차 `est_speed_rmse_mps`(전진 속도, 순간값 대비), `est_yaw_err_end_deg`. 판정자 쪽(러너)만 참값과 비교한다.
@@ -742,9 +742,9 @@ python conformance/test_rt_core.py                             # 규약 일치, 
 |---|---|---|
 | inproc (관리 작업과 한 프로세스) | 20.0 / 40 ms | 1 |
 | shm (별도 프로세스) | 20.0 / 20 ms | 0 |
-| ros (ROS2, JSON 메시지) | 20.1 / 60 ms | 2 |
+| ros (ROS2, 이 측정 때는 JSON 메시지) | 20.1 / 60 ms | 2 |
 
-- 아직: ROS2 메시지는 기존 노드와 같은 JSON 문자열이다. 다른 PC 사이 실시간에는 바이너리 메시지(ROS2 정해진 형식 또는 Unitree와 같은 구조체)가 낫다.
+- 로봇 경계 메시지는 커스텀 ROS2 메시지 `go2_rt_msgs`다 (2026-10-10, 아래 "로봇 경계 ROS2 메시지"). JSON도 선택지로 남겼다.
 
 **나눈 일**
 ```
@@ -1126,6 +1126,68 @@ ros:     C++ 코어 ──shm──▶ rt_link ──ROS2──▶ ros_node.py �
 
 `rt_brain.py`는 두뇌만 도는 전용 루프이고, inproc은 그 루프를 `rt_link` 주 루프(기록, LiDAR 전달, 화면, DIS 사이사이)에 끼워 넣은 형태다.
 그래서 inproc은 관리 작업이 밀리면 명령도 늦어진다. 결과는 lockstep 세 방식이 비트 단위로 같다.
+
+## 로봇 경계 ROS2 메시지 (`go2_rt_msgs`, 2026-10-10)
+
+두뇌(상위 제어기)를 ROS2 노드로 돌릴 때(`sim.runner --controller-node`, `sim.rt_link --brain ros`) 주고받는 세 토픽의 형식이다.
+
+| 토픽 | 방향 | 커스텀 메시지 (typed) | JSON (처음 방식) |
+|---|---|---|---|
+| `/robot/low_state` | 몸 -> 두뇌 | `go2_rt_msgs/LowState` | `std_msgs/String` |
+| `/robot/low_cmd` | 두뇌 -> 몸 | `go2_rt_msgs/LowCmd` | `std_msgs/String` |
+| `/control/estimate` | 두뇌 -> 판정자 (진단) | `go2_rt_msgs/Estimate` | `std_msgs/String` |
+
+나머지(`/cmd_vel_stamped` TwistStamped, `/sensors/<이름>/points` PointCloud2, `/robot/imu` Imu, `/robot/joint_states` JointState)는 처음부터 ROS2 표준 메시지다.
+
+```bash
+python -m control.robot_msgs --build      # 메시지 패키지 빌드 (ros2_ws/src/go2_rt_msgs, colcon + 시스템 ROS2 Humble). 한 번만
+python -m control.robot_msgs              # 지금 쓰일 형식 확인
+python -m sim.rt_link scenarios/flat_trot.yaml --brain ros                 # 기본 auto: 빌드돼 있으면 typed, 아니면 json
+python -m sim.rt_link scenarios/flat_trot.yaml --brain ros --ros-msg json  # 처음 방식
+python -m control.ros_node --ros-msg typed --scenario <시나리오>           # 다른 PC의 두뇌: 시뮬레이터와 같은 형식으로
+source ros2_ws/install/setup.bash && ros2 topic echo /robot/low_cmd       # ROS2 도구로 필드별 보기 (도구 쪽만 source 필요)
+```
+
+**왜 바꿨나** (속도가 아니라 형식): 이 PC에서 JSON 변환은 로봇 상태 899바이트·만들기 23 µs·읽기 20 µs, 관절 명령 389바이트·10/9 µs로
+20 ms 주기에 비해 작고, Python JSON은 실수를 손실 없이 주고받아 lockstep도 비트 단위로 같았다. 문제는 JSON 안의 필드 구성이 코드 속
+암묵적 약속이라 ROS2에는 "문자열 하나"로만 보인다는 점이다 (사실상 비공식 커스텀 메시지). 정식 메시지로 바꾸면:
+- 형식 검사: 필드 이름·배열 길이(`float64[12]`)가 틀리면 보낼 때 오류 (JSON은 받는 쪽에서 실행 중 오류).
+- 도구: `ros2 topic echo`, `ros2 bag`이 필드별로 다룬다.
+- 다른 언어 두뇌: C++/Python 코드가 자동 생성된다 (JSON 해석 코드 불필요).
+- ROS2 표준 메시지만으로는 부족하다: 관절 각도·속도(JointState), IMU(Imu)는 있지만 저수준 모터 명령(kp, kd, 앞먹임 토크)과
+  "어느 상태 시각으로 계산한 명령인가"(`t`, 지연 측정과 lockstep 판정의 기준)를 담는 표준이 없다.
+
+**커스텀 메시지 vs Unitree 메시지** (결정: 안쪽은 커스텀, Unitree는 경계 어댑터로)
+
+| 기준 | 커스텀 (`go2_rt_msgs`) | Unitree (`unitree_go/LowState`, `LowCmd`) |
+|---|---|---|
+| 벤더 중립 목표 | 맞음 | Go2 전용 (다른 로봇이면 변환 필요) |
+| 지연 측정용 상태 시각 `t` | 있음 | 없음 |
+| 시뮬레이터에 없는 정보 | 필요한 것만 | 모터 온도, 배터리, 리모컨, CRC, 모터 20칸 등을 채워야 함 |
+| 실제 Go2 소프트웨어 연결 | 어댑터 필요 | 그대로 붙음 (Unitree SDK2 제어기를 시뮬레이터에) |
+| 형식 변경 주도권 | 우리 | Unitree |
+```
+우리 두뇌 (control/) ──go2_rt_msgs──▶ 시뮬레이터 (sim.rt_link / sim.runner)
+                                            ▲
+Go2용 외부 제어기 (Unitree SDK2) ──Unitree 메시지──▶ Unitree 어댑터 노드 (나중, 필요할 때) ──go2_rt_msgs──┘
+```
+Unitree 어댑터는 실제 Go2용 외부 제어기를 시험할 일이 생기면 만든다 (그때 Unitree 메시지 정의를 직접 확인한다).
+
+**구성**
+- `ros2_ws/src/go2_rt_msgs/msg/{LowState,LowCmd,Estimate}.msg`: 정의. 필드는 JSON 때와 같고 실수는 8바이트 그대로라 값이 같다.
+  `LowState.step`은 실시간 코어 경로의 주기 번호(없으면 -1). 필드는 추가만 하고 지우거나 뜻을 바꾸지 않는다.
+- `control/robot_msgs.py`: 형식 선택(`GO2_ROS_MSG` 환경변수 = `--ros-msg`)과 dict <-> 메시지 변환. 시뮬레이터 쪽(`sim/ros2_bridge.py`)과
+  두뇌 노드(`control/ros_node.py`)가 같은 코드를 쓴다. setup.bash를 source하지 않아도 저장소의 `ros2_ws/install`에서 찾아 쓰고
+  (라이브러리를 미리 불러옴), 띄우는 두뇌 노드는 환경변수를 물려받는다.
+- 두 프로세스의 형식이 다르면 (예: 다른 PC 두뇌를 `--ros-msg json`으로 띄움) `sim.rt_link`가 기다리지 않고 바로 알려 준다.
+- 빌드 결과(`ros2_ws/build`, `install`, `log`)는 git에 넣지 않는다.
+
+**배포 (다른 PC의 두뇌)**: 양쪽이 같은 메시지 정의를 가져야 한다. 지금은 저장소에 포함해 두뇌 PC에서 `git clone` 후
+`python -m control.robot_msgs --build` (같은 ROS2 배포판 Humble 권장). 다른 팀이 두뇌만 만들게 되면 `go2_rt_msgs`만 별도 저장소로,
+여러 PC 설치 관리가 필요해지면 deb 패키지(`bloom`)로.
+
+**확인**: `test_ros_equivalence.py` 4개(트롯, 정책, 추정 정책, 지형 인지 트롯)가 typed와 json 모두 통과. 실시간 코어 경로의 ros 두뇌
+(lockstep 비트 동일, 고장, LiDAR 지형 인지)도 typed로 통과.
 
 ## 검토 중인 아이디어 (결정 전)
 
