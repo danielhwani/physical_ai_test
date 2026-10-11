@@ -21,7 +21,7 @@ from pathlib import Path
 import mujoco
 
 from .adapters import mj_quat_to_ros
-from .model_builder import TERRAIN_BODY
+from .model_builder import SOIL_PLATE, TERRAIN_BODY
 from .stream import TerrainPatchStream, build_manifest
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -90,9 +90,13 @@ class Ros2StreamPublisher:
         self.pub_terrain = self.node.create_publisher(
             String, "/sim/terrain_patch", QoSProfile(depth=500, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.pub_status = self.node.create_publisher(String, "/sim/status", latched)
+        # 화면 전용 지형 표시 깊이 (무른 흙 발자국). 물리 지형 토픽과 따로 두어 센서 노드는 받지 않는다
+        self.pub_overlay = self.node.create_publisher(
+            String, "/sim/terrain_overlay", QoSProfile(depth=500, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.frame = frame
         self.bodies = [(i, n) for i in range(1, model.nbody)
-                       if (n := mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, i)) != TERRAIN_BODY]
+                       if (n := mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, i)) != TERRAIN_BODY
+                       and not n.startswith(SOIL_PLATE)]
         self.joints = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, j) for j in range(1, model.njnt)]
 
         self.cosim = cosim
@@ -110,6 +114,10 @@ class Ros2StreamPublisher:
                 return True
             time.sleep(0.2)
         return False
+
+    def publish_overlay(self, patch):
+        if patch:
+            self.pub_overlay.publish(self._String(data=json.dumps(patch)))
 
     def publish(self, data):
         stamp = self._stamp(data.time)

@@ -91,8 +91,10 @@ class RvizAdapter(Node):
         self.pub_status = self.create_publisher(MarkerArray, "/viz/status_markers", 10)
         self.create_subscription(String, "/sim/scene_manifest", self.on_manifest, latched)
         self.create_subscription(String, "/sim/terrain_patch", self.on_patch, history)
+        self.create_subscription(String, "/sim/terrain_overlay", self.on_overlay, history)   # 화면 전용 표시 깊이 (발자국)
         self.create_subscription(String, "/sim/status", self.on_status, 10)
         self.manifest, self.grid, self.pending, self.tiles, self.path = None, None, [], {}, []
+        self.overlay, self.pending_overlay = None, []
         self.frame = "world"
 
     # ---- 장면/로봇 ----
@@ -100,6 +102,10 @@ class RvizAdapter(Node):
         self.manifest = check_manifest(json.loads(msg.data))
         self.frame = self.manifest["frame"]
         self.grid = TerrainGrid(self.manifest["terrain"])
+        self.overlay = TerrainGrid(self.manifest["terrain"])
+        for p in self.pending_overlay:
+            self.overlay.apply(p)
+        self.pending_overlay = []
         # 창 반폭: 원래 해상도로 MAX_CELLS 안에 들어가는 크기 (2 cm 격자 -> 약 3 m, 5 cm -> 6 m). 세계가 창보다 크면 창을 옮긴다
         t = self.manifest["terrain"]
         res = 2 * t["half_size"][0] / (t["ncol"] - 1)
@@ -122,6 +128,14 @@ class RvizAdapter(Node):
         self.grid.apply(patch)
         self.publish_terrain()
 
+    def on_overlay(self, msg):
+        patch = json.loads(msg.data)
+        if self.overlay is None:
+            self.pending_overlay.append(patch)
+            return
+        self.overlay.apply(patch)
+        self.publish_terrain()
+
     def stride(self):
         """표시 간격 k칸: 창의 셀 수가 MAX_CELLS 이하가 되는 가장 작은 값."""
         w, k = self.window, 1
@@ -134,7 +148,7 @@ class RvizAdapter(Node):
         새로 들어온 타일만 추가, 빠진 타일만 지운다 (전체를 지우고 다시 그리면 그동안 화면이 빈다)."""
         w, g, k = self.window, self.grid, self.stride()
         span = TILE * k                                          # 타일 한 변의 세계 격자 칸 수
-        H = g.heights
+        H = g.heights - self.overlay.heights                     # 화면 전용 발자국 깊이를 뺀 높이
         r_end, c_end = w.r0 + w.wnrow - 1, w.c0 + w.wncol - 1
         tiles = {}
         for tr in range(w.r0 // span * span, r_end, span):

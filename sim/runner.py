@@ -535,6 +535,9 @@ def run(args):
         from .ros2_bridge import (Ros2StreamPublisher, launch_controller_node, launch_mujoco_viewer, launch_rviz_stack,
                                   launch_sensor_node)
         bridge = Ros2StreamPublisher(m, sim.terrain, sim.cosim)
+        if sim.foot_soil is not None:           # 무른 흙 발자국: 화면 전용 표시 깊이 (물리·센서에는 안 들어감)
+            from .stream import TerrainOverlayStream
+            footprints = TerrainOverlayStream(sim.foot_soil.display_depth, sim.foot_soil.display.shape)
         odom_offset = None                       # 알고리즘 지형 지도(odom) 표시 정렬 (판정자 쪽 참값, 표시 전용)
         if sim.controller.terrain is not None:   # 시작: odom 원점 = 시작 몸통 위치
             odom_offset = d.qpos[:3].copy()
@@ -674,6 +677,8 @@ def run(args):
             if bridge:
                 bridge.publish(d)
                 viz_count += 1
+                if sim.foot_soil is not None and viz_count % 5 == 0:
+                    bridge.publish_overlay(footprints.update())
                 if odom_offset is not None and viz_count % 5 == 0 and (est := sim.estimate()) is not None and "pos" in est:
                     # world -> odom을 계속 로봇에 맞춘다: 실제 몸통 위치 - 추정 위치 (1초 저역통과, 평행이동만).
                     # 로봇 주변 지도가 실제 지면에 붙어 보이고, 오래전에 쌓은 먼 칸에는 그동안의 추정 표류가 남아 보인다

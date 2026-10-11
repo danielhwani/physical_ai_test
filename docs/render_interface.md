@@ -68,6 +68,11 @@
 - 순서대로 적용하면 물리엔진이 쓰는 지형과 같아진다 (오차 < 1e-6 m, 계약 시험).
 - "물리엔진에 반영된" 지형이다. Terrain Map Service가 로봇 발 근처 셀을 보류하는 동안은 그 셀이 바뀌지 않는다.
 
+#### 3-1. 화면 전용 지형 표시 깊이: `/sim/terrain_overlay` (std_msgs/String, JSON, transient local, depth 500)
+무른 흙(`foot_soil`)에서 발이 판 구멍처럼 화면에만 보일 깊이. 지형 패치와 같은 형식이고 `"kind": "display_depth"`,
+`heights`는 원래 지형에서 내려갈 깊이(m, 양수 = 아래). 렌더러는 `지형 - 표시 깊이`로 그린다 (RViz, MuJoCo 어댑터).
+물리와 센서(LiDAR, 센서 노드)는 이 토픽을 받지 않는다. 바뀐 영역만 약 10 Hz로 보낸다.
+
 ### 4. 상태: `/sim/status` (std_msgs/String, JSON, 10 Hz)
 
 ```json

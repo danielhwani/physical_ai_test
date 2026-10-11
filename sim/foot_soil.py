@@ -108,6 +108,8 @@ class FootSoil:
         self.plow_work = 0.0                  # 쟁기질로 흙에 준 일 (J)
         self.plow_work_up = 0.0               # 그중 위로 움직인 성분 (발을 빼며 흙을 들어 올린 일)
         self.top = np.zeros(n)                # 받침판 윗면 높이
+        T = sim.terrain
+        self.display = np.zeros((T.nrow, T.ncol), np.float32)   # 화면 전용: 지형 격자 점마다 발자국 구멍 깊이 (물리·센서는 쓰지 않음)
         for i, g in enumerate(self.feet):    # 시작: 받침판을 발 아래 흙 표면에
             x, y, zc = sim.data.geom_xpos[g]
             self._place(i, x, y, zc - self.r + 0.001)
@@ -126,10 +128,39 @@ class FootSoil:
     def _cell(self, x, y):
         return int(round(x / PLASTIC_CELL)), int(round(y / PLASTIC_CELL))
 
+    def _stamp_display(self, x, y, zp, out):
+        """화면용 구멍: 지형 격자 점마다 그 칸(반 칸 둘레) 안에서 가장 깊은 구멍 깊이. 격자(예: 5 cm)가 발(지름 4.4 cm)보다
+        거칠어도 구멍이 보이게 칸 단위로 넓혀 그린다."""
+        if zp <= 0:
+            return
+        T, r = self.sim.terrain, self.r
+        a = math.sqrt(max(2 * r * zp - zp * zp, 0.0)) if zp < r else r
+        reach, half = a + 0.5 * T.res, 0.5 * T.res
+        c0 = max(int(math.floor((x - reach + T.half_x) / T.res)), 0)
+        c1 = min(int(math.ceil((x + reach + T.half_x) / T.res)), T.ncol - 1)
+        r0 = max(int(math.floor((y - reach + T.half_y) / T.res)), 0)
+        r1 = min(int(math.ceil((y + reach + T.half_y) / T.res)), T.nrow - 1)
+        for rr in range(r0, r1 + 1):
+            for cc in range(c0, c1 + 1):
+                rho = max(math.hypot(T.xs[cc] - x, T.ys[rr] - y) - half, 0.0)
+                if rho < a:
+                    depth = zp - (r - math.sqrt(r * r - rho * rho))
+                    if depth > out[rr, cc]:
+                        out[rr, cc] = depth
+
+    def display_depth(self):
+        """화면 전용 발자국 깊이 격자 (남은 구멍 + 지금 디딘 발의 구멍). 물리와 센서(LiDAR)는 쓰지 않는다."""
+        out = self.display.copy()
+        for i in range(len(self.feet)):
+            if self.on[i]:
+                self._stamp_display(*self.xy[i], self.zp[i], out)
+        return out
+
     def _stamp(self, x, y, zp):
         """발을 든 자리에 구 모양 구멍을 남긴다."""
         if zp <= 0:
             return
+        self._stamp_display(x, y, zp, self.display)
         a = math.sqrt(max(2 * self.r * zp - zp * zp, 0.0)) if zp < self.r else self.r
         k = int(math.ceil(a / PLASTIC_CELL))
         ix0, iy0 = self._cell(x, y)

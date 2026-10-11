@@ -117,6 +117,28 @@ class TerrainPatchStream:
         return self._patch(int(r0), int(r1), int(c0), int(c1))
 
 
+class TerrainOverlayStream:
+    """화면 전용 지형 표시 깊이(예: 무른 흙 발자국)의 변경분 패치. 지형 패치와 같은 형식이고 heights는 원래 지형에서 내려갈 깊이(m).
+    물리 지형(/sim/terrain_patch)과 따로 보내 센서(LiDAR)와 물리에는 들어가지 않는다."""
+
+    def __init__(self, source, shape):
+        self.source = source                  # 지금 표시 깊이 격자를 돌려주는 함수
+        self.sent = np.zeros(shape, np.float32)
+        self.version = 0
+
+    def update(self):
+        cur = self.source()
+        diff = cur != self.sent
+        if not diff.any():
+            return None
+        rows, cols = np.where(diff.any(1))[0], np.where(diff.any(0))[0]
+        r0, r1, c0, c1 = int(rows[0]), int(rows[-1]) + 1, int(cols[0]), int(cols[-1]) + 1
+        self.sent[r0:r1, c0:c1] = cur[r0:r1, c0:c1]
+        self.version += 1
+        return {"version": self.version, "kind": "display_depth", "r0": r0, "c0": c0, "nrow": r1 - r0, "ncol": c1 - c0,
+                "encoding": "base64-float32-le", "heights": encode_heights(self.sent[r0:r1, c0:c1])}
+
+
 def build_status(sim, start_xy, energy, late, final_mop=None):
     """시험 상태 값. 표시 형식(문구, 색)은 렌더러 어댑터가 정한다."""
     d = sim.data

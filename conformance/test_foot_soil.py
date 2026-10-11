@@ -8,9 +8,10 @@
 3. 서 있는 로봇: 소성 침하가 일어서는 동안 받은 최대 하중에서의 SCM 침하와 맞는다 (단단한 흙, 보통 흙, 무른 흙)
 4. 발을 든 자리에 구멍이 남는다 (소성 지도)
 5. 단단한·보통 흙에서 트롯이 넘어지지 않고 걷고, 흙이 무를수록 디딤 침하가 커진다
-6. 쟁기질 (흙 속을 옆이나 위로 지나가는 발의 저항): 무른 흙에서 전진이 줄고 흙에 준 일이 생긴다 (발을 빼며 위로 든 일 포함).
+6. 화면 발자국: 구멍은 화면 전용 토픽으로만 나가고, 물리 지형과 센서가 받는 지형은 그대로다
+7. 쟁기질 (흙 속을 옆이나 위로 지나가는 발의 저항): 무른 흙에서 전진이 줄고 흙에 준 일이 생긴다 (발을 빼며 위로 든 일 포함).
    끄면(plow_ratio 0) 저항 없이 더 멀리 간다. 단단한 흙은 발이 반지름보다 얕게 빠져 위에 덮인 흙이 없으므로 위쪽 저항이 거의 0이다
-7. C++ 실시간 코어 경로는 이 옵션을 받지 않는다
+8. C++ 실시간 코어 경로는 이 옵션을 받지 않는다
 """
 import contextlib
 import copy
@@ -131,6 +132,34 @@ def test_plowing_slows_soft_soil():
     assert hard[2] < 0.05 * hard[1], res                           # 단단한 흙: 위쪽 저항 거의 없음
     print(f"    무른 흙 8초 전진: 쟁기질 없음 {off[0]:.2f} m, 있음 {on[0]:.2f} m (흙에 준 일 {on[1]:.0f} J, 그중 위로 {on[2]:.0f} J), "
           f"단단한 흙 위로 {hard[2]:.1f} / {hard[1]:.0f} J")
+
+
+def test_footprints_shown_on_screen_only():
+    """발자국 구멍은 화면 전용 토픽(/sim/terrain_overlay) 패치로만 나간다. 물리 지형과 센서가 받는 지형 패치는 그대로다."""
+    from sim.stream import StreamTap, TerrainOverlayStream
+    from viz.stream_decode import TerrainGrid
+    scn = copy.deepcopy(BASE)
+    scn["foot_soil"] = {"preset": "soft"}
+    sim = Simulation(scn)
+    fs = sim.foot_soil
+    tap = StreamTap(sim)
+    overlay = TerrainOverlayStream(fs.display_depth, fs.display.shape)
+    shown = TerrainGrid(tap.manifest["terrain"])
+    terrain = TerrainGrid(tap.manifest["terrain"])
+    applied0 = sim.terrain.applied.copy()
+    with contextlib.redirect_stdout(io.StringIO()):
+        while sim.data.time < 4.0:
+            sim.step_control()
+            for p in tap.patches():
+                terrain.apply(p)
+            if (p := overlay.update()) is not None:
+                shown.apply(p)
+    depth = fs.display_depth()
+    assert depth.max() > 0.03 and (depth > 0).sum() > 20, (depth.max(), (depth > 0).sum())
+    assert np.array_equal(shown.heights, depth)                    # 패치 누적 = 표시 깊이
+    assert np.array_equal(sim.terrain.applied, applied0)           # 물리 지형은 그대로
+    assert np.array_equal(terrain.heights, applied0.astype(np.float32))   # 센서가 받는 지형에도 구멍 없음
+    print(f"    화면 발자국: 격자 점 {(depth > 0).sum()}개, 가장 깊은 곳 {100 * depth.max():.1f} cm")
 
 
 def test_rt_core_rejects_foot_soil():

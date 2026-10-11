@@ -157,10 +157,12 @@ class MujocoViewerAdapter:
         history = QoSProfile(depth=500, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.node.create_subscription(String, "/sim/scene_manifest", self.on_manifest, latched)
         self.node.create_subscription(String, "/sim/terrain_patch", self.on_patch, history)
+        self.node.create_subscription(String, "/sim/terrain_overlay", self.on_overlay, history)   # 화면 전용 표시 깊이 (발자국)
         self.node.create_subscription(TFMessage, "/tf", self.on_tf, 50)
         self.node.create_subscription(String, "/sim/status", self.on_status, 10)
         self.manifest = self.grid = None
         self.patches, self.poses, self.status, self.path = [], {}, None, []
+        self.overlays = []
         self.lock = threading.Lock()
         # 메시지는 별도 스레드에서 계속 받아 최신 값만 유지한다 (그리기가 느려도 밀리지 않게)
         self.spinner = threading.Thread(target=self._spin, daemon=True)
@@ -179,6 +181,10 @@ class MujocoViewerAdapter:
     def on_patch(self, msg):
         with self.lock:
             self.patches.append(json.loads(msg.data))
+
+    def on_overlay(self, msg):
+        with self.lock:
+            self.overlays.append(json.loads(msg.data))
 
     def on_tf(self, msg):
         with self.lock:
@@ -202,6 +208,8 @@ class MujocoViewerAdapter:
         model, mocap, hid, win = build_render_model(self.manifest)
         data = mujoco.MjData(model)
         self.grid = TerrainGrid(self.manifest["terrain"])
+        overlay = TerrainGrid(self.manifest["terrain"])
+        shown = TerrainGrid(self.manifest["terrain"])           # 그리는 높이 = 지형 - 화면 전용 발자국 깊이
         z_range = self.manifest["terrain"]["z_range"]
         self.node.get_logger().info(f"render model: {len(mocap)} bodies, {model.ngeom} geoms")
         before = set(threading.enumerate())
@@ -215,6 +223,7 @@ class MujocoViewerAdapter:
                 t0 = time.perf_counter()
                 with self.lock:
                     patches, self.patches = self.patches, []
+                    overlays, self.overlays = self.overlays, []
                     poses, status, path = dict(self.poses), self.status, list(self.path)
                 moved = status is not None and win.recenter(*status["base_pos"][:2])
                 if moved:                                 # 창 이동: 지형 mocap 바디를 옮긴다
@@ -222,8 +231,11 @@ class MujocoViewerAdapter:
                 if patches:
                     for p in patches:
                         self.grid.apply(p)
-                if patches or moved:
-                    write_terrain(model, hid, self.grid, z_range, win)
+                for p in overlays:
+                    overlay.apply(p)
+                if patches or overlays or moved:
+                    shown.heights = np.maximum(self.grid.heights - overlay.heights, z_range[0])   # heightfield 범위 안으로
+                    write_terrain(model, hid, shown, z_range, win)
                     viewer.update_hfield(hid)
                 with viewer.lock():
                     apply_poses(model, data, mocap, poses)
