@@ -55,14 +55,16 @@ HEARTBEAT = "Report_ConsoleHeartbeat"
 SUPPORTED = [CONNECT, RELEASE_CONTROL, SET_COMMAND, ADD_PATCH, INJECT_FAULT, CLEAR_FAULT, CREATE_ENTITY, REMOVE_ENTITY, SET_SOIL,
              FREEZE, RESUME, STOP]
 ENTITY_TYPES = ("HMMWV",)
-# 흙 (Bekker-Wong + Janosi, Chrono SCM). 자국 깊이는 HMMWV 기준 이 PC 측정값 (scenarios/vehicle_crossing*.yaml)
+# 흙 (Bekker-Wong + Janosi, Chrono SCM). 자국 깊이는 HMMWV 기준 이 PC 측정값 (scenarios/vehicle_crossing*.yaml).
+# Go2 발(반지름 2.2 cm) 기준 (sim/foot_soil.py, README "무른 흙과 로봇 발"): 정지 침하는 발 하중 37 N / 75 N(트롯 디딤)에서,
+# 걸을 때는 flat_trot 디딤 평균. 이름과 달리 soft도 로봇에게는 아주 무른 흙이다 (보통 흙길은 firm).
 _SOIL = {"bekker_kc": 0.0, "bekker_n": 1.1, "cohesion": 0.0, "friction_deg": 30.0, "janosi_shear": 0.01,
          "elastic_k": 4.0e7, "damping_r": 3.0e4}
 SOIL_PRESETS = {
-    "hard": {**_SOIL, "bekker_kphi": 2.0e7},                    # 자국 약 1.8 cm
-    "firm": {**_SOIL, "bekker_kphi": 5.0e6},                    # 약 5.5 cm (vehicle_crossing 기본)
-    "soft": {**_SOIL, "bekker_kphi": 1.0e6},                    # 약 15 cm
-    "mud": {**_SOIL, "bekker_kphi": 5.0e5, "friction_deg": 20.0, "janosi_shear": 0.03},   # 젖은 흙: 더 깊고 미끄러움
+    "hard": {**_SOIL, "bekker_kphi": 2.0e7},                    # 자국 약 1.8 cm. 발 0.7 / 1.0 cm, 걸을 때 1.0 cm (다져진 흙길)
+    "firm": {**_SOIL, "bekker_kphi": 5.0e6},                    # 약 5.5 cm (vehicle_crossing 기본). 발 1.5 / 2.2 cm, 1.8 cm (보통 흙)
+    "soft": {**_SOIL, "bekker_kphi": 1.0e6},                    # 약 15 cm. 발 4.1 / 7.2 cm, 6.0 cm (갓 쌓인 눈, 아주 무른 모래)
+    "mud": {**_SOIL, "bekker_kphi": 5.0e5, "friction_deg": 20.0, "janosi_shear": 0.03},   # 젖은 흙: 더 깊고 미끄러움. 발 7.1 / 12.9 cm, 10.3 cm
 }
 SOIL_KEYS = tuple(_SOIL) + ("bekker_kphi",)
 
