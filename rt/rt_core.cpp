@@ -85,6 +85,7 @@ void print_layout() {
   std::printf("{\n");
   F(cfg); F(ctl); F(stats); F(state); F(cmd); F(op_head); F(op); F(noise_head); F(noise); F(truth_head); F(truth);
   F(cfg.qpos0); F(cfg.torque_limit); F(ctl.torque_scale); F(state.foot_force); F(cmd.tau_ff); F(truth[0].wake_us);
+  F(ctl.fault_seq); F(truth[0].terrain_seq);
   std::printf("  \"total\": [0, %zu]\n}\n", sizeof(Shm));
 #undef F
 }
@@ -194,6 +195,8 @@ int main(int argc, char** argv) {
     }
     double t0 = now_ns();
     const double t = d->time;
+    const uint64_t fault_seq = shm->ctl.fault_seq;        // 고장 값보다 먼저 읽는다 (관리 프로세스는 값을 쓴 뒤 올린다): 새 판이면 값도 새 것
+    barrier();
 
     // 0. 지형 반영 (seqlock: 복사 중 바뀌면 다음 주기에 다시)
     if (terr) {
@@ -306,6 +309,8 @@ int main(int argc, char** argv) {
         if (d->contact[c].geom1 == cfg.foot_geom[i] || d->contact[c].geom2 == cfg.foot_geom[i]) { bits |= 1u << i; break; }
     }
     te.contact_bits = bits;
+    te.fault_seq = fault_seq;
+    te.terrain_seq = terrain_seq;
     for (int b = 0; b < std::min((int)m->nbody, NBODY_MAX); b++) {
       for (int a = 0; a < 3; a++) te.body_xpos[3 * b + a] = d->xpos[3 * b + a];
       for (int a = 0; a < 4; a++) te.body_xquat[4 * b + a] = d->xquat[4 * b + a];

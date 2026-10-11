@@ -7,6 +7,7 @@
      처음 창 밖으로 나간 발의 접촉을 놓쳤다 (8.92초에 발 접촉 누락, 확인함). mocap 바디로 옮겨 해결.
 2. 창을 옮긴 직후 MuJoCo 지형 데이터와 위치 = 세계 지도의 창 영역 (요철 지형)
 3. 창 밖 세계 지도로 걸어가도 넘어지지 않는다 (창 크기보다 먼 거리 보행)
+4. 지형 반영(commit)이 바뀐 셀만 보아도 세계 지도 전체를 비교하는 규칙과 같은 결과다 (패치, Chrono 셀 갱신, 발 근처 보류)
 """
 import contextlib
 import copy
@@ -21,6 +22,7 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from sim.runner import Simulation  # noqa: E402
+from sim.terrain_service import TerrainMapService  # noqa: E402
 
 
 def _load(name):
@@ -98,6 +100,35 @@ def test_walk_beyond_initial_window():
     traj, shifts = _run(scn)
     reach = np.abs(traj[:, :2]).max()                      # 실행 중 가장 멀리 간 거리 (축별)
     assert reach > 2.5 and shifts >= 3, (reach, shifts)     # 처음 창(±1.5 m) 밖까지 넘어지지 않고 걸었다
+
+
+def test_commit_on_changed_cells_matches_full_rule():
+    """실시간 관리 프로세스용으로 바뀐 셀만 보는 반영이, 매번 세계 지도 전체를 비교하던 규칙(참조)과 같은 지형을 낸다."""
+    class _Model:                                   # write_all이 쓰는 칸만
+        hfield_adr = [0]
+        hfield_data = np.zeros(10 ** 6)
+    rng = np.random.default_rng(3)
+    T = TerrainMapService((10.0, 10.0), 0.05, (-0.3, 0.4), seed=1, window=(3.0, 3.0))
+    ref_applied = T.applied.copy()
+    for it in range(60):
+        r = rng.random()
+        if r < 0.25:
+            a, b = rng.uniform(-9, 9, 2), rng.uniform(-9, 9, 2)
+            T.add_patch({"kind": "rut", "start": a.tolist(), "end": b.tolist(), "width": 0.3, "depth": 0.05,
+                         "profile": str(rng.choice(["box", "cosine"]))})
+        elif r < 0.35:
+            T.add_patch({"kind": "bump", "center": rng.uniform(-5, 5, 2).tolist(), "radius": 0.6, "height": 0.05})
+        elif r < 0.6:                               # Chrono처럼 일부 셀 갱신
+            n = 200
+            T.set_cells(rng.integers(0, T.nrow, n), rng.integers(0, T.ncol, n), rng.uniform(-0.1, 0.1, n))
+        feet = [tuple(rng.uniform(-9, 9, 2)) for _ in range(4)]
+        pending = T.target != ref_applied           # 참조: 이전 규칙 (세계 지도 전체)
+        for fx, fy in feet:
+            pending &= (T.X - fx) ** 2 + (T.Y - fy) ** 2 > 0.15 ** 2
+        ref_applied[pending] = T.target[pending]
+        changed = T.commit(_Model, 0, feet, 0.15)
+        assert changed == bool(pending.any()), it
+        assert np.array_equal(T.applied, ref_applied), it
 
 
 if __name__ == "__main__":

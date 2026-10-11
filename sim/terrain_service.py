@@ -25,6 +25,7 @@ class TerrainMapService:
         self.X, self.Y = np.meshgrid(self.xs, self.ys)
         self.target = np.zeros((self.nrow, self.ncol))    # 최신 지형 (원천)
         self.applied = self.target.copy()                  # 물리엔진에 반영된 지형
+        self._cand = None   # 반영 대기일 수 있는 셀 (rows, cols). None이면 다음 반영 때 세계 지도 전체를 비교한다
         self.version = 0            # 원천(target)이 바뀔 때 증가
         self.applied_version = 0    # 물리엔진 반영(applied)이 바뀔 때 증가 (렌더러 갱신 기준)
 
@@ -75,6 +76,11 @@ class TerrainMapService:
 
     # ---- 패치 생성 ----
     def add_patch(self, p):
+        self.apply_delta(self.patch_delta(p))
+
+    def patch_delta(self, p):
+        """패치가 원천 지형에 더할 높이 격자 (아직 반영하지 않음). 실시간 경로는 시각이 정해진 패치를 미리 계산해 둔다
+        (rough만 난수를 쓰므로 반영 순서대로 계산해야 한다: 미리 계산하지 않는다)."""
         kind = p["kind"]
         X, Y = self.X, self.Y
         if kind == "bump":
@@ -94,23 +100,43 @@ class TerrainMapService:
             # 선분을 따라가는 홈. 단면 profile: cosine(기본, 완만) 또는 box(평평한 바닥, 가파른 벽)
             (ax, ay), (bx, by) = p["start"], p["end"]
             d = np.array([bx - ax, by - ay]); length = np.linalg.norm(d); d /= length
-            px, py = X - ax, Y - ay
+            half_w = p["width"] / 2
+            # 홈은 선분에서 half_w 안쪽뿐이라 그 사각형 밖은 0이다. 사각형만 계산한다 (세계 지도 전체면 실시간에서 약 100 ms. 값은 같다)
+            c0 = max(int(np.searchsorted(self.xs, min(ax, bx) - half_w)) - 1, 0)
+            c1 = min(int(np.searchsorted(self.xs, max(ax, bx) + half_w, side="right")) + 1, self.ncol)
+            r0 = max(int(np.searchsorted(self.ys, min(ay, by) - half_w)) - 1, 0)
+            r1 = min(int(np.searchsorted(self.ys, max(ay, by) + half_w, side="right")) + 1, self.nrow)
+            px, py = X[r0:r1, c0:c1] - ax, Y[r0:r1, c0:c1] - ay
             along = px * d[0] + py * d[1]
             dist = np.abs(px * d[1] - py * d[0])
-            half_w = p["width"] / 2
             inside = (dist < half_w) & (along >= 0) & (along <= length)
             if p.get("profile", "cosine") == "box":   # 평평한 바닥 + 가파른 벽 (Chrono SCM 바퀴 자국과 같은 모양)
-                delta = np.where(inside, -p["depth"], 0.0)
+                block = np.where(inside, -p["depth"], 0.0)
             else:
-                delta = np.where(inside, -p["depth"] * 0.5 * (1 + np.cos(np.pi * dist / half_w)), 0.0)
+                block = np.where(inside, -p["depth"] * 0.5 * (1 + np.cos(np.pi * dist / half_w)), 0.0)
+            return (slice(r0, r1), slice(c0, c1)), block      # 사각형만 (바깥은 0)
         else:
             raise ValueError(f"unknown patch kind: {kind}")
-        self.apply_heights(self.target + delta)
+        return delta
+
+    def apply_delta(self, delta):
+        """patch_delta 결과를 원천에 더한다. 사각형 패치(홈)는 그 사각형만 고친다: 세계 지도 전체를 더하고 자르면 실시간에서 약 50 ms
+        (원천은 늘 범위 안이라 바깥 셀은 전체 계산과 같은 값이다)."""
+        if not isinstance(delta, tuple):
+            self.apply_heights(self.target + delta)
+            return
+        (rs, cs), block = delta
+        self.target[rs, cs] = np.clip(self.target[rs, cs] + block, self.z_min, self.z_max)
+        self.version += 1
+        if self._cand is not None:                 # 바뀔 수 있는 셀: 보류 중이던 셀 + 패치가 0이 아닌 셀
+            rows, cols = np.nonzero(block)
+            self._cand = (np.concatenate([self._cand[0], rows + rs.start]), np.concatenate([self._cand[1], cols + cs.start]))
 
     def apply_heights(self, heights):
         """외부(예: Chrono SCM)에서 받은 절대 높이 격자를 원천에 반영."""
         self.target = np.clip(heights, self.z_min, self.z_max)
         self.version += 1
+        self._cand = None
 
     def set_cells(self, rows, cols, heights):
         """외부 물리엔진(Chrono SCM)이 계산한 일부 셀의 절대 높이를 원천에 반영. 격자 밖 셀은 버린다."""
@@ -119,6 +145,8 @@ class TerrainMapService:
         if ok.any():
             self.target[rows[ok], cols[ok]] = np.clip(heights[ok], self.z_min, self.z_max)
             self.version += 1
+            if self._cand is not None:
+                self._cand = (np.concatenate([self._cand[0], rows[ok]]), np.concatenate([self._cand[1], cols[ok]]))
         return int(ok.sum())
 
     def cell_of(self, x, y):
@@ -134,14 +162,27 @@ class TerrainMapService:
     # ---- 물리엔진 배포 ----
     def commit(self, model, hfield_id, feet_xy=(), guard_radius=0.15):
         """대기 중인 변경을 MuJoCo에 반영. 발 근처 셀은 보류. 변경이 있었으면 True."""
-        pending = self.target != self.applied
-        if not pending.any():
+        # 바뀐 셀에서만 본다. 세계 지도 전체로 비교·거리 계산을 하면 1201x1201에서 약 30 ms라 실시간 관리 프로세스가 한 주기를 넘긴다.
+        # 전체 비교는 지형 전체가 바뀐 뒤(패치)에만, 그 밖에는 보류된 셀과 새로 바뀐 셀(Chrono)만 (결과는 전체 비교와 같다)
+        if self._cand is None:
+            rows, cols = np.nonzero(self.target != self.applied)
+        else:
+            idx = np.unique(self._cand[0] * self.ncol + self._cand[1])
+            rows, cols = idx // self.ncol, idx % self.ncol
+            diff = self.target[rows, cols] != self.applied[rows, cols]
+            rows, cols = rows[diff], cols[diff]
+        self._cand = (rows, cols)
+        if rows.size == 0:
             return False
+        x, y = self.X[rows, cols], self.Y[rows, cols]
+        keep = np.ones(rows.size, bool)
         for fx, fy in feet_xy:
-            pending &= (self.X - fx) ** 2 + (self.Y - fy) ** 2 > guard_radius ** 2
-        if not pending.any():
+            keep &= (x - fx) ** 2 + (y - fy) ** 2 > guard_radius ** 2
+        if not keep.any():
             return False
-        self.applied[pending] = self.target[pending]
+        self._cand = (rows[~keep], cols[~keep])           # 발 근처라 보류한 셀
+        rows, cols = rows[keep], cols[keep]
+        self.applied[rows, cols] = self.target[rows, cols]
         self.applied_version += 1
         self.write_all(model, hfield_id)
         return True

@@ -11,7 +11,7 @@ import os
 import time
 from pathlib import Path
 
-MAGIC, VERSION = 0x47324F52, 9
+MAGIC, VERSION = 0x47324F52, 10
 NJ, NQ, NV, NOISE_DIM, NOISE_RING, TRUTH_RING, OP_RING = 12, 19, 18, 36, 4096, 1024, 32
 NBODY_MAX, SCAN_MAX_PTS = 16, 32768
 D = C.c_double
@@ -32,7 +32,8 @@ class Config(C.Structure):
 
 class Control(C.Structure):
     _fields_ = [("start", C.c_uint64), ("stop", C.c_uint64), ("lockstep_target", C.c_uint64), ("link_mode", C.c_uint64),
-                ("torque_scale", D), ("fault_gyro", arr(D, 3)), ("fault_att", arr(D, 3)), ("brain_ready", C.c_uint64), ("freeze", C.c_uint64)]
+                ("torque_scale", D), ("fault_gyro", arr(D, 3)), ("fault_att", arr(D, 3)), ("brain_ready", C.c_uint64), ("freeze", C.c_uint64),
+                ("fault_seq", C.c_uint64)]
 
 
 class LowState(C.Structure):
@@ -61,6 +62,7 @@ class TruthEntry(C.Structure):
     _fields_ = [("step", C.c_uint64), ("t", D), ("qpos", arr(D, NQ)), ("qvel", arr(D, NV)), ("ctrl", arr(D, NJ)),
                 ("q_des", arr(D, NJ)), ("energy", D), ("foot_force", arr(D, 4)), ("cmd_t", D), ("wake_us", D), ("compute_us", D),
                 ("base_xmat", arr(D, 9)), ("foot_pos", arr(D, 12)), ("contact_bits", C.c_uint32), ("pad", C.c_uint32),
+                ("fault_seq", C.c_uint64), ("terrain_seq", C.c_uint64),
                 ("body_xpos", arr(D, NBODY_MAX * 3)), ("body_xquat", arr(D, NBODY_MAX * 4))]
 
 
@@ -82,7 +84,8 @@ def layout():
            for name in ("cfg", "ctl", "stats", "state", "cmd", "op_head", "op", "noise_head", "noise", "truth_head", "truth")}
     sub = {"cfg.qpos0": (Shm.cfg, Config.qpos0), "cfg.torque_limit": (Shm.cfg, Config.torque_limit),
            "ctl.torque_scale": (Shm.ctl, Control.torque_scale), "state.foot_force": (Shm.state, LowState.foot_force),
-           "cmd.tau_ff": (Shm.cmd, LowCmd.tau_ff), "truth[0].wake_us": (Shm.truth, TruthEntry.wake_us)}
+           "cmd.tau_ff": (Shm.cmd, LowCmd.tau_ff), "truth[0].wake_us": (Shm.truth, TruthEntry.wake_us),
+           "ctl.fault_seq": (Shm.ctl, Control.fault_seq), "truth[0].terrain_seq": (Shm.truth, TruthEntry.terrain_seq)}
     out.update({k: [a.offset + b.offset, b.size] for k, (a, b) in sub.items()})
     out["total"] = [0, C.sizeof(Shm)]
     return out
@@ -116,6 +119,7 @@ class TerrainView:
         h.mocap_pos[:] = mocap_pos
         h.apply_step = apply_step
         h.seq = s + 2
+        return s + 2
 
     def close(self):
         del self.head, self.data

@@ -57,6 +57,7 @@ from .stream import build_status
 
 ROOT = Path(__file__).resolve().parent.parent
 CORE = ROOT / "build/rt/rt_core"
+PATCH_LEAD_S = 1.0          # 실시간: 시각이 정해진 지형 패치를 이만큼 미리 계산해 둔다
 EVENT_LEAD_S = 1.0          # 별도 프로세스 두뇌에 이동 명령을 미리 보내는 시간 (명령에 적용 시각이 붙어 있어 결과는 같다)
 VIZ_DT = 0.04               # 가시화 발행 주기 (시뮬레이션 시간 s, 25 Hz)
 CHRONO_LAG_WARN = 0.5      # 실시간, 상한 없음: Chrono가 이만큼(s) 뒤처지면 한 번 경고한다
@@ -126,7 +127,7 @@ class RtLink:
         """관리 프로세스 모델의 heightfield와 지형 창 위치를 코어로 (apply_step 스텝 시작부터)."""
         sim = self.sim
         mp = sim.data.mocap_pos[sim.terrain_mocap] if sim.terrain_mocap >= 0 else (0.0, 0.0, 0.0)
-        self.terrain.write(sim.model.hfield_data[self.hfield], mp, apply_step)
+        return self.terrain.write(sim.model.hfield_data[self.hfield], mp, apply_step)
 
     def fill_noise(self, ahead):
         """표본 번호 (지금 코어 스텝 + ahead)까지 잡음을 채운다 (sensors/proprio.py와 같은 난수)."""
@@ -176,14 +177,19 @@ class InprocBrain:
 
     def __init__(self, sim, link):
         self.node, self.link = sim.controller, link
+        self.pending = []                      # [(적용 시각, vx, wz)]: 그 시각 이후 첫 상태부터 (별도 프로세스 두뇌와 같은 규칙)
 
     def ready(self):
         return True
 
     def command(self, t, vx, wz):              # 그 시각 상태보다 먼저 불린다 (sim/runner.py와 같은 순서)
-        self.node.set_command(vx, wz)
+        self.pending.append((t, vx, wz))
+        self.pending.sort(key=lambda c: c[0])  # 같은 시각이면 보낸 순서 (안정 정렬)
 
     def on_state(self, ls):
+        while self.pending and self.pending[0][0] <= ls["t"] + 1e-6:
+            _, vx, wz = self.pending.pop(0)
+            self.node.set_command(vx, wz)
         self.link.write_cmd(self.node.step(ls))
 
     def on_scan(self, name, scan):
@@ -342,9 +348,19 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
     def apply_events(t_next, step_next):
         """다음 스텝(step_next, 상태 시각 t_next)까지의 이벤트 (sim/runner.py와 같은 뜻). 고장은 코어로, 이동 명령은 두뇌로."""
         lead = getattr(br, "lead", 0.0)
+        if not lockstep:                           # 실시간: 시각이 정해진 지형 패치는 미리 계산해 둔다 (그 스텝에 계산하면 코어보다 늦는다)
+            for e in events:
+                if (e["action"] == "add_patch" and e["patch"]["kind"] != "rough" and id(e) not in patch_ready
+                        and t_next + 1e-9 < e["t"] <= t_next + PATCH_LEAD_S):
+                    patch_ready[id(e)] = sim.terrain.patch_delta(e["patch"])
+                    break                          # 한 스텝에 하나씩 (관리 프로세스가 한 번에 오래 멈추지 않게)
         for e in [e for e in list(events) if e["t"] <= t_next + 1e-9 + (lead if e["action"] == "set_command" else 0.0)]:
             events.remove(e)
             if e["action"] == "set_command":
+                if not lockstep and e["t"] < t_next - 1e-9:
+                    # 실시간: 시각 없이 보낸 콘솔 명령은 이미 지난 시각이 붙어 온다. 두뇌는 아직 처리하지 않은 첫 상태부터 적용하므로
+                    # 그게 어느 상태인지가 타이밍에 따라 갈린다. 다음 스텝 시각으로 정해 보내고 기록한다 (재실행과 같게)
+                    e["t"] = t_next
                 br.command(e["t"], e["vx"], e.get("yaw_rate", 0.0))
                 shown_cmds.append((e["t"], e["vx"], e.get("yaw_rate", 0.0)))
                 inflight.append(e)
@@ -356,9 +372,14 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
                 sim.stop_requested = True
                 stop_after[0] = step_next
             elif e["action"] == "add_patch":
-                sim.terrain.add_patch(e["patch"])
+                delta = patch_ready.pop(id(e), None)
+                if delta is None:
+                    sim.terrain.add_patch(e["patch"])
+                else:
+                    sim.terrain.apply_delta(delta)
             elif e["action"] == "inject_fault":
-                faults[e["fault"]] = (None if e.get("duration") is None else e["t"] + e["duration"], e.get("params") or {})
+                # 끝 시각은 적용 시각부터 (sim.runner와 같다). 시각 없이 보낸 콘솔 고장은 요청 시각(t)보다 늦게 적용된다
+                faults[e["fault"]] = (None if e.get("duration") is None else t_next + e["duration"], e.get("params") or {})
             elif e["action"] == "clear_fault":
                 faults.pop(e["fault"], None)
             elif e["action"] == "create_entity":                  # 개체 투입 (Chrono 차량 슬롯)
@@ -392,8 +413,17 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
         ctl.fault_att[:] = np.radians(ip.get("attitude_offset_deg", (0, 0, 0)))
         lf = faults.get("link_loss")
         ctl.link_mode = 0 if lf is None else 2 if lf[1].get("robot_behavior") == "damp" else 1
+        vals = (ctl.link_mode, ctl.torque_scale, *ctl.fault_gyro, *ctl.fault_att)
+        if vals != fault_vals[0]:                  # 바뀌었으면 판을 올리고, 코어가 실제로 쓴 스텝을 참값에서 확인한다
+            fault_vals[0] = vals
+            ctl.fault_seq = ctl.fault_seq + 1
+            pending_apply.append(("fault", ctl.fault_seq, step_next))
 
     next_commit = [0.0]
+    patch_ready = {}                           # 실시간: 미리 계산한 지형 패치 (이벤트 id -> 높이 변화)
+    fault_vals = [None]                        # 코어에 마지막으로 쓴 고장 값
+    pending_apply = []                         # [(종류, 판, 적용할 스텝)]: 코어가 그 판을 처음 쓴 스텝과 비교
+    late_applies = []                          # 실시간: 관리 프로세스가 늦어 코어가 정한 스텝보다 늦게 쓴 변경 [(종류, 정한 스텝, 실제 스텝)]
 
     chrono_lag = [0.0, False]                  # 실시간: Chrono가 로봇 시각보다 뒤처진 최대 시간 (s), 경고 했는지
     chrono_hold = {"on": False, "since": 0.0, "count": 0, "wall": 0.0}   # 실시간: Chrono를 기다리느라 코어를 멈춘 상태·횟수·시간
@@ -440,7 +470,7 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
             changed |= T.commit(sim.model, sim.hfield_id, feet_xy, sim.guard_radius)   # 발 근처 갱신 보류
             next_commit[0] += 1.0 / TERRAIN_COMMIT_HZ
         if changed:
-            link.send_terrain(step)
+            pending_apply.append(("terrain", link.send_terrain(step), step))
 
     def mirror(e):
         """참값으로 관리 프로세스의 MuJoCo 데이터를 맞춘다 (위치, 접촉. 물리 진행은 하지 않음)."""
@@ -550,6 +580,15 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
             if e is None:                                          # 이 프로세스가 너무 늦어 링을 놓침
                 continue
             energy += e.energy
+            while pending_apply:                                   # 고장·지형 변경이 실제로 걸린 스텝
+                kind, seq, want = pending_apply[0]
+                if (e.fault_seq if kind == "fault" else e.terrain_seq) < seq:
+                    break
+                pending_apply.pop(0)
+                if e.step > want:
+                    late_applies.append((kind, want, int(e.step)))
+                    if verbose:
+                        print(f"[t={e.t:6.2f}] 경고: {kind} 변경이 {e.step - want}스텝 늦게 걸렸다 (관리 프로세스 지연)")
             d.qpos[:], d.qvel[:], d.time = e.qpos, e.qvel, e.t           # DIS 서버·정보판이 보는 지금 상태 (참값)
             wake.append(e.wake_us); comp.append(e.compute_us)
             if e.cmd_t >= 0:
@@ -710,6 +749,7 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
             "cmd_latency_ms_mean": round(float(lat_ms.mean()), 1) if lat else None,
             "cmd_latency_ms_max": round(float(lat_ms.max()), 1) if lat else None,
             "cmd_late_steps": int((lat_ms > 1000 * link.control_dt + 1e-3).sum()),   # 명령이 한 주기보다 늦게 실행된 주기 수
+            "late_applies": len(late_applies),     # 고장·지형 변경이 정한 스텝보다 늦게 걸린 수 (관리 프로세스 지연. 0이 아니면 재실행과 다를 수 있다)
             "noise_underruns": int(st.noise_underruns), "mlockall": bool(st.locked), "sched_fifo": bool(st.rt_ok),
         }
         mop["min_vehicle_distance_m"] = round(sim.cosim.min_dist, 3) if sim.cosim is not None and np.isfinite(sim.cosim.min_dist) else None   # 차가 한 번도 안 나왔으면 None

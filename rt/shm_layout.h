@@ -9,7 +9,7 @@
 namespace rtshm {
 
 constexpr uint32_t MAGIC = 0x47324F52;   // "RO2G"
-constexpr uint32_t VERSION = 9;
+constexpr uint32_t VERSION = 10;
 constexpr int NJ = 12;
 constexpr int NQ = 19, NV = 18;           // Go2 (자유 관절 + 12)
 constexpr int NOISE_DIM = 36;             // sensors/proprio.py ProprioSensors.NOISE_DIM
@@ -48,6 +48,7 @@ struct Control {                          // 관리 프로세스 -> 코어 (실�
   double fault_gyro[3], fault_att[3];     // IMU 고장 (rad/s, rad)
   uint64_t brain_ready;                   // 별도 프로세스 두뇌가 공유 메모리를 열었다 (control/rt_brain.py)
   uint64_t freeze;                        // 1이면 일시정지 (실시간: 다음 주기 전에 멈추고, 풀리면 시계를 다시 맞춘다)
+  uint64_t fault_seq;                     // 고장 값(link_mode, torque_scale, fault_gyro, fault_att)을 바꿀 때마다 값을 쓴 뒤 1 올린다
 };
 
 struct LowState {                         // 코어 -> 보행 알고리즘 (최신 하나)
@@ -96,6 +97,8 @@ struct TruthEntry {                       // 코어 -> 관리 프로세스 (판�
   double foot_pos[12];
   uint32_t contact_bits;                  // 발 i가 무엇이든 닿아 있으면 비트 i
   uint32_t pad;
+  uint64_t fault_seq;                     // 이 스텝이 쓴 고장 값의 판 (ctl.fault_seq): 고장이 실제로 걸린 스텝을 관리 프로세스가 안다
+  uint64_t terrain_seq;                   // 이 스텝이 쓴 지형의 판 (TerrainHeader.seq)
   double body_xpos[NBODY_MAX * 3];        // 바디 위치·자세 (스텝 직후 값, 센서 렌더러가 쓴다)
   double body_xquat[NBODY_MAX * 4];       // w, x, y, z
 };

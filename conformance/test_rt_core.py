@@ -13,7 +13,8 @@
    Chrono (lockstep): 발자국, HMMWV 투입·제거, 흙 바꾸기, LiDAR가 차량을 보는 지형 인지 보행도 같다.
    Chrono 실시간 (기다리지 않는 교환, 뒤처짐 상한): DIS 콘솔로 흙·차량 투입
 5. DIS 콘솔 (실시간, 별도 프로세스 두뇌): 콘솔 명령(이동, 자국, 링크 두절, 종료)이 접수·적용되고, 남은 scenario_replay.yaml을
-   Python 시뮬레이터(sim.runner)로 다시 돌리면 같은 결과다 (실시간 실행에서 늦은 명령이 없었을 때)
+   Python 시뮬레이터(sim.runner)로 다시 돌리면 같은 결과다 (실시간 실행에서 늦은 명령·늦게 걸린 변경이 없었을 때).
+   실행 도중 시각 없이 보낸 요청(이동, 자국, 링크 두절 감쇠)도 같다
 6. 실시간: 몇 초 돌려 잡음이 모자라지 않고, 모든 스텝을 돌고, 타이밍이 기록된다 (주기 초과 수는 시스템 설정에 달려 판정하지 않음)
 """
 import contextlib
@@ -195,7 +196,7 @@ def test_dis_console_on_rt_core():
                              capture_output=True, text=True, check=True).stdout
         dirs.append(ROOT / re.search(r"기록: (\S+)", rep).group(1))
         replay_x = float(re.search(r"forward_x_m\s+(\S+)", rep).group(1))
-        if mop["cmd_late_steps"] == 0:                     # 실시간에서 늦은 명령이 없었으면 Python 재현과 같다
+        if mop["cmd_late_steps"] == 0 and mop["late_applies"] == 0:   # 실시간에서 늦은 명령·늦게 걸린 변경이 없었으면 Python 재현과 같다
             assert replay_x == mop["forward_x_m"], (replay_x, mop["forward_x_m"])
         print(f"    DIS 콘솔 (C++ 코어, 실시간): 전진 {mop['forward_x_m']} m, Python 재현 {replay_x} m, 늦은 명령 {mop['cmd_late_steps']}")
     finally:
@@ -204,6 +205,51 @@ def test_dis_console_on_rt_core():
             proc.kill()
         for d in dirs:
             shutil.rmtree(d, ignore_errors=True)
+
+def test_dis_immediate_events_replay_on_rt_core():
+    """실시간 도중 시각 없이 보낸 콘솔 요청(이동 명령, 홈, 링크 두절 감쇠)도 기록대로 다시 실행하면 같다.
+    고장 끝 시각은 적용 시각부터 (요청 시각부터 세면 한 주기 일찍 끝났다), 지난 시각이 붙은 명령은 다음 스텝 시각으로 정한다."""
+    import re
+    import shutil
+    import socket
+    import time
+    import pandas as pd
+    from dis_console import protocol as P
+    from dis_console.console import Console, parse_command
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sk:
+        sk.bind(("127.0.0.1", 0)); port = sk.getsockname()[1]
+    proc = subprocess.Popen([sys.executable, "-m", "sim.rt_link", "scenarios/dis_console.yaml", "--dis-port", str(port),
+                             "--dis-wait", "--brain", "shm"], cwd=ROOT, stdout=subprocess.PIPE, text=True)
+    con = Console(("127.0.0.1", port), out=lambda *_: None)
+    dirs = []
+    try:
+        assert con.call(P.CONNECT, {"role": "control"}, timeout=30)[0] == "COMPLETED"
+        time.sleep(1.0)                                    # 실행 도중에
+        for line in ("cmd 0.4", "rut 1.0", "fault link 0.5 damp", "end @4"):
+            st, body = con.call(*parse_command(line), timeout=30)
+            assert st == "COMPLETED", (line, st, body)
+        out, _ = proc.communicate(timeout=60)
+        run_dir = ROOT / re.search(r"기록: (\S+)", out).group(1)
+        dirs.append(run_dir)
+        mop = json.loads((run_dir / "summary.json").read_text())["mop"]
+        rep = subprocess.run([sys.executable, "-m", "sim.runner", str(run_dir / "scenario_replay.yaml")], cwd=ROOT,
+                             capture_output=True, text=True, check=True).stdout
+        dirs.append(ROOT / re.search(r"기록: (\S+)", rep).group(1))
+        replay_x = float(re.search(r"forward_x_m\s+(\S+)", rep).group(1))
+        damp = int((pd.read_parquet(run_dir / "timeseries.parquet").cmd_state_t == -2).sum())
+        on_time = mop["cmd_late_steps"] == 0 and mop["late_applies"] == 0
+        if on_time:
+            assert damp == 26, damp                        # 0.5 s = 25주기 + 복구 주기 (새 명령 전까지 감쇠 유지)
+            assert replay_x == mop["forward_x_m"], (replay_x, mop["forward_x_m"])
+        print(f"    즉시 요청 (C++ 코어, 실시간): 전진 {mop['forward_x_m']} m, Python 재현 {replay_x} m, 감쇠 {damp}주기, "
+              f"늦은 명령 {mop['cmd_late_steps']}, 늦게 걸린 변경 {mop['late_applies']}{'' if on_time else ' (비교 생략)'}")
+    finally:
+        con.close()
+        if proc.poll() is None:
+            proc.kill()
+        for d in dirs:
+            shutil.rmtree(d, ignore_errors=True)
+
 
 def test_dis_chrono_realtime_on_rt_core():
     """실시간 Chrono (기다리지 않는 교환): 콘솔로 흙·차량 투입이 되고, Chrono 뒤처짐은 상한(0.2 s) 근처로 묶인다."""

@@ -37,7 +37,7 @@ def main():
     pending, last_step = [], -1
     try:
         while not view.shm.ctl.stop:
-            pending = sorted(pending + view.new_ops())
+            pending = sorted(pending + view.new_ops(), key=lambda c: c[0])   # 같은 시각이면 보낸 순서 (안정 정렬)
             if scans is not None and (sc := scans.read_new()) is not None:
                 node.on_scan(node.sensor, *sc)
             ls = view.read_state()
