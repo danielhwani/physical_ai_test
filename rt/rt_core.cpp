@@ -26,6 +26,8 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <climits>
+#include <vector>
 
 #include "shm_layout.h"
 
@@ -80,12 +82,224 @@ void quat_mul(const double a[4], const double b[4], double o[4]) {
   o[3] = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2;
 }
 
+// ---- 무른 흙 발 상호작용 (sim/foot_soil.py FootSoil과 같은 알고리즘·같은 연산 순서 -> lockstep 비트 동일) ----
+// 소성 지도: 1 cm 칸 -> 원래 표면 아래 소성 침하. 실시간 루프에서 할당하지 않도록 시작 때 크기를 정한 해시 표 (선형 탐사).
+struct PlasticMap {
+  static constexpr size_t CAP = 1u << 18;                // 26만 칸 (구멍 하나 최대 49칸, 디딤 5천 번 넘게)
+  std::vector<int64_t> keys;
+  std::vector<double> vals;
+  size_t used = 0;
+  uint64_t dropped = 0;                                   // 가득 차서 버린 칸 (0이어야 Python과 같다)
+  PlasticMap() : keys(CAP, INT64_MIN), vals(CAP, 0.0) {}
+  static int64_t key(int64_t ix, int64_t iy) { return (int64_t)(((uint64_t)ix << 32) ^ (uint32_t)iy); }
+  size_t slot(int64_t k) const { return (size_t)((uint64_t)k * 0x9E3779B97F4A7C15ULL >> 46) & (CAP - 1); }
+  double get(int64_t ix, int64_t iy) const {
+    int64_t k = key(ix, iy);
+    for (size_t s = slot(k);; s = (s + 1) & (CAP - 1)) {
+      if (keys[s] == k) return vals[s];
+      if (keys[s] == INT64_MIN) return 0.0;
+    }
+  }
+  void set_max(int64_t ix, int64_t iy, double v) {        // Python: if depth > plastic.get(...): plastic[...] = depth
+    int64_t k = key(ix, iy);
+    for (size_t s = slot(k);; s = (s + 1) & (CAP - 1)) {
+      if (keys[s] == k) { if (v > vals[s]) vals[s] = v; return; }
+      if (keys[s] == INT64_MIN) {
+        if (!(v > 0.0)) return;
+        if (used + 1 >= CAP * 3 / 4) { dropped++; return; }
+        keys[s] = k; vals[s] = v; used++;
+        return;
+      }
+    }
+  }
+};
+
+double soil_interp(double x, const double* xs, const double* ys, int n) {   // sim/foot_soil.py interp
+  if (x <= xs[0]) return ys[0];
+  if (x >= xs[n - 1]) return ys[n - 1];
+  int j = (int)(std::upper_bound(xs, xs + n, x) - xs) - 1;
+  return ys[j] + (ys[j + 1] - ys[j]) / (xs[j + 1] - xs[j]) * (x - xs[j]);
+}
+
+double front_area(double h, double r) {
+  h = std::min(std::max(h, 0.0), 2 * r);
+  return r * r * std::acos((r - h) / r) - (r - h) * std::sqrt(std::max(2 * r * h - h * h, 0.0));
+}
+
+double top_area(double h, double r) {
+  double t = std::min(std::max(h - r, 0.0), r);
+  return M_PI * t * t;
+}
+
+struct FootSoil {
+  const SoilConfig& c;
+  const Config& cfg;
+  const mjModel* m;
+  mjData* d;
+  volatile Shm* shm;
+  bool on[4] = {false, false, false, false};
+  double zp[4] = {0, 0, 0, 0}, xy[4][2] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}}, top[4] = {0, 0, 0, 0}, fn[4] = {0, 0, 0, 0};
+  double plow_work = 0.0, plow_work_up = 0.0, sink_sum = 0.0, sink_max = 0.0, slip_sum = 0.0;
+  uint64_t stance_n = 0;
+  PlasticMap plastic;
+  std::vector<mjtNum> jac, ju, minv;
+  double out6[6];
+
+  FootSoil(const Config& cfg_, const mjModel* m_, mjData* d_, volatile Shm* shm_)
+      : c(cfg_.soil), cfg(cfg_), m(m_), d(d_), shm(shm_), jac(3 * m_->nv), ju(m_->nv), minv(m_->nv) {
+    for (int i = 0; i < 4; i++) {                         // 시작: 받침판을 발 아래 흙 표면에
+      const double* p = d->geom_xpos + 3 * cfg.foot_geom[i];
+      place(i, p[0], p[1], p[2] - c.r + 0.001);
+    }
+  }
+
+  double surface(double x, double y) const {              // MuJoCo 지형 heightfield의 쌍선형 보간
+    const int hid = cfg.hfield_id, tg = cfg.terrain_geom, tm = cfg.terrain_mocap;
+    const double hx = m->hfield_size[4 * hid], hy = m->hfield_size[4 * hid + 1], hz = m->hfield_size[4 * hid + 2];
+    double cx = m->geom_pos[3 * tg], cy = m->geom_pos[3 * tg + 1], cz = m->geom_pos[3 * tg + 2];
+    if (tm >= 0) { cx = d->mocap_pos[3 * tm] + cx; cy = d->mocap_pos[3 * tm + 1] + cy; cz = d->mocap_pos[3 * tm + 2] + cz; }
+    const int nr = m->hfield_nrow[hid], nc = m->hfield_ncol[hid];
+    double col = (x - cx + hx) / (2.0 * hx) * (double)(nc - 1);
+    double row = (y - cy + hy) / (2.0 * hy) * (double)(nr - 1);
+    int c0 = std::min(std::max((int)std::floor(col), 0), nc - 2);
+    int r0 = std::min(std::max((int)std::floor(row), 0), nr - 2);
+    double fx = std::min(std::max(col - c0, 0.0), 1.0);
+    double fy = std::min(std::max(row - r0, 0.0), 1.0);
+    const float* hf = m->hfield_data + m->hfield_adr[hid] + r0 * nc + c0;
+    double h00 = hf[0], h01 = hf[1], h10 = hf[nc], h11 = hf[nc + 1];
+    double h = (h00 * (1.0 - fx) + h01 * fx) * (1.0 - fy) + (h10 * (1.0 - fx) + h11 * fx) * fy;
+    return cz + h * hz;
+  }
+
+  int64_t cell(double v) const { return (int64_t)std::nearbyint(v / c.plastic_cell); }   // Python round (짝수 반올림)
+  double hole(double x, double y) const { return plastic.get(cell(x), cell(y)); }
+
+  void stamp(double x, double y, double z) {
+    if (z <= 0) return;
+    uint64_t h = shm->stamp_head;                          // 화면 발자국 (관리 프로세스가 읽는다)
+    shm->stamp[h % STAMP_RING].x = x; shm->stamp[h % STAMP_RING].y = y; shm->stamp[h % STAMP_RING].zp = z;
+    barrier();
+    shm->stamp_head = h + 1;
+    const double r = c.r;
+    double a = z < r ? std::sqrt(std::max(2 * r * z - z * z, 0.0)) : r;
+    int64_t k = (int64_t)std::ceil(a / c.plastic_cell);
+    int64_t ix0 = cell(x), iy0 = cell(y);
+    for (int64_t ix = ix0 - k; ix <= ix0 + k; ix++)
+      for (int64_t iy = iy0 - k; iy <= iy0 + k; iy++) {
+        double dx = (double)ix * c.plastic_cell - x, dy = (double)iy * c.plastic_cell - y;
+        double rho2 = dx * dx + dy * dy;
+        if (rho2 <= a * a) plastic.set_max(ix, iy, z - (r - std::sqrt(r * r - rho2)));
+      }
+  }
+
+  double foot_force(int i) {
+    double f = 0.0;
+    const int g = cfg.foot_geom[i], p = c.plate_geom[i];
+    for (int k = 0; k < d->ncon; k++) {
+      const mjContact& con = d->contact[k];
+      if ((con.geom1 == g && con.geom2 == p) || (con.geom1 == p && con.geom2 == g)) {
+        mj_contactForce(m, d, k, out6);
+        f += out6[0];
+      }
+    }
+    return f;
+  }
+
+  void place(int i, double x, double y, double bottom) {
+    double t = on[i] ? surface(xy[i][0], xy[i][1]) - zp[i] : std::min(surface(x, y) - hole(x, y), bottom - 0.001);
+    top[i] = t;
+    double* mp = d->mocap_pos + 3 * c.plate_mocap[i];
+    mp[0] = x; mp[1] = y; mp[2] = t - c.plate_half_z;
+  }
+
+  void update() {                                         // mj_step 뒤 (sim/foot_soil.py FootSoil.update)
+    const double dt = m->opt.timestep;
+    for (int i = 0; i < 4; i++) {
+      const double* p = d->geom_xpos + 3 * cfg.foot_geom[i];
+      const double x = p[0], y = p[1], zc = p[2];
+      const double f = foot_force(i);
+      fn[i] = f;
+      if (on[i]) {
+        double t = surface(xy[i][0], xy[i][1]) - zp[i];
+        if (f <= 0 && zc - c.r > t + c.lift_gap) {        // 발을 들었다: 구멍을 남긴다
+          stamp(xy[i][0], xy[i][1], zp[i]);
+          double dx = x - xy[i][0], dy = y - xy[i][1];
+          stance_n++;
+          sink_sum += zp[i];
+          sink_max = std::max(sink_max, zp[i]);
+          slip_sum += std::sqrt(dx * dx + dy * dy);
+          on[i] = false;
+        }
+      }
+      if (!on[i] && f > 0) {                               // 디딤 시작
+        on[i] = true;
+        xy[i][0] = x; xy[i][1] = y;
+        zp[i] = std::max(surface(x, y) - top[i], 0.0);
+      }
+      if (on[i] && f > 0) {                                // 소성 침하
+        const double z = zp[i];
+        double fb = z > c.z_tab[0] ? soil_interp(z, c.z_tab, c.f_tab, c.n_tab) : 0.0;
+        if (f > fb) {
+          double z_eq = soil_interp(f, c.f_tab, c.z_tab, c.n_tab);
+          double area = std::max(z > c.z_tab[0] ? soil_interp(z, c.z_tab, c.a_tab, c.n_tab) : 0.0, c.area_min);
+          double rate = (f - fb) / (c.damping_r * area);
+          zp[i] = std::min(z + rate * dt, z_eq);
+        }
+      }
+      place(i, x, y, zc - c.r);
+    }
+    if (c.p_coef > 0) plow();
+  }
+
+  void plow() {                                           // 흙 속을 옆이나 위로 지나가는 발의 저항 (다음 스텝 qfrc_applied)
+    const int nv = m->nv;
+    const double dt = m->opt.timestep;
+    for (int j = 0; j < nv; j++) d->qfrc_applied[j] = 0.0;
+    for (int i = 0; i < 4; i++) {
+      const double* p = d->geom_xpos + 3 * cfg.foot_geom[i];
+      const double x = p[0], y = p[1], zc = p[2];
+      const double bottom = zc - c.r;
+      const double h = surface(x, y) - hole(x, y) - bottom;
+      if (h <= 0) continue;
+      mjtNum point[3] = {x, y, bottom + 0.5 * std::min(h, 2 * c.r)};
+      mj_jac(m, d, jac.data(), nullptr, point, c.foot_body[i]);
+      double v[3];
+      for (int k = 0; k < 3; k++) {
+        double s = 0.0;
+        for (int j = 0; j < nv; j++) s += jac[k * nv + j] * d->qvel[j];
+        v[k] = s;
+      }
+      const double pr = c.p_coef * std::pow(h, c.bekker_n);
+      const double vh = std::sqrt(v[0] * v[0] + v[1] * v[1]);
+      for (int up = 0; up < 2; up++) {
+        double speed, u0 = 0.0, u1 = 0.0, u2 = 0.0, area;
+        if (up) { speed = v[2]; u2 = 1.0; area = top_area(h, c.r); }
+        else {
+          speed = vh; area = front_area(h, c.r);
+          if (speed >= 1e-6) { u0 = v[0] / speed; u1 = v[1] / speed; }
+        }
+        if (speed < 1e-6 || area <= 0) continue;
+        for (int j = 0; j < nv; j++) ju[j] = u0 * jac[j] + u1 * jac[nv + j] + u2 * jac[2 * nv + j];
+        mj_solveM(m, d, minv.data(), ju.data(), 1);
+        double s = 0.0;
+        for (int j = 0; j < nv; j++) s += ju[j] * minv[j];
+        const double m_eff = 1.0 / std::max(s, 1e-9);
+        const double f = std::min(pr * area, m_eff * speed / dt);
+        for (int j = 0; j < nv; j++) d->qfrc_applied[j] = d->qfrc_applied[j] - f * ju[j];
+        plow_work += f * speed * dt;
+        if (up) plow_work_up += f * speed * dt;
+      }
+    }
+  }
+};
+
 void print_layout() {
 #define F(field) std::printf("  \"%s\": [%zu, %zu],\n", #field, offsetof(Shm, field), sizeof(((Shm*)0)->field))
   std::printf("{\n");
   F(cfg); F(ctl); F(stats); F(state); F(cmd); F(op_head); F(op); F(noise_head); F(noise); F(truth_head); F(truth);
+  F(stamp_head); F(stamp);
   F(cfg.qpos0); F(cfg.torque_limit); F(ctl.torque_scale); F(state.foot_force); F(cmd.tau_ff); F(truth[0].wake_us);
-  F(ctl.fault_seq); F(truth[0].terrain_seq);
+  F(ctl.fault_seq); F(truth[0].terrain_seq); F(cfg.soil); F(truth[0].stance_n);
   std::printf("  \"total\": [0, %zu]\n}\n", sizeof(Shm));
 #undef F
 }
@@ -139,6 +353,8 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "지형 공유 메모리 크기가 모델 heightfield와 다르다\n");
     return 1;
   }
+  // 무른 흙 (선택): 소성 지도 등은 여기서 미리 잡는다 (실시간 루프에서 할당하지 않는다)
+  FootSoil* soil = cfg.soil.on ? new FootSoil(cfg, m, d, shm) : nullptr;
   uint64_t terrain_seq = 0;
   const int hf_n = m->hfield_nrow[cfg.hfield_id] * m->hfield_ncol[cfg.hfield_id];
   float* hf_dst = m->hfield_data + m->hfield_adr[cfg.hfield_id];
@@ -271,6 +487,7 @@ int main(int argc, char** argv) {
         d->ctrl[j] = std::min(std::max(tau, -lim), lim);
       }
       mj_step(m, d);
+      if (soil) soil->update();                           // 이번 스텝 접촉력으로 침하 갱신, 다음 스텝 받침판·쟁기질 (Python RobotIO와 같은 자리)
       double e = 0.0;
       for (int j = 0; j < NJ; j++) e += std::fabs(d->ctrl[j] * d->qvel[6 + j]);
       energy += e * ts;
@@ -285,6 +502,8 @@ int main(int argc, char** argv) {
           }
         }
       }
+      if (soil)
+        for (int i = 0; i < 4; i++) f[i] += soil->fn[i];  // 무른 흙: 받침판 접촉력 (sim.runner foot_normal_forces와 같은 덧셈)
       for (int i = 0; i < 4; i++) fn[i] += f[i];
     }
     for (int i = 0; i < 4; i++) foot_force[i] = fn[i] / cfg.decim;
@@ -311,6 +530,19 @@ int main(int argc, char** argv) {
     te.contact_bits = bits;
     te.fault_seq = fault_seq;
     te.terrain_seq = terrain_seq;
+    if (soil) {
+      uint32_t sb = 0;
+      for (int i = 0; i < 4; i++) {
+        if (soil->on[i]) sb |= 1u << i;
+        te.soil_zp[i] = soil->zp[i];
+        te.soil_xy[2 * i] = soil->xy[i][0];
+        te.soil_xy[2 * i + 1] = soil->xy[i][1];
+      }
+      te.soil_on = sb;
+      te.plow_work = soil->plow_work; te.plow_work_up = soil->plow_work_up;
+      te.sink_sum = soil->sink_sum; te.sink_max = soil->sink_max; te.slip_sum = soil->slip_sum;
+      te.stance_n = soil->stance_n;
+    }
     for (int b = 0; b < std::min((int)m->nbody, NBODY_MAX); b++) {
       for (int a = 0; a < 3; a++) te.body_xpos[3 * b + a] = d->xpos[3 * b + a];
       for (int a = 0; a < 4; a++) te.body_xquat[4 * b + a] = d->xquat[4 * b + a];
@@ -326,6 +558,9 @@ int main(int argc, char** argv) {
     barrier();
     shm->stats.steps = k + 1;
   }
+  if (soil && soil->plastic.dropped)
+    std::fprintf(stderr, "무른 흙 소성 지도가 가득 차 %lu칸을 버렸다\n", (unsigned long)soil->plastic.dropped);
+  delete soil;
   shm->stats.done = 1;
   mj_deleteData(d);
   mj_deleteModel(m);

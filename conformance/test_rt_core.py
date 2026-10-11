@@ -12,6 +12,7 @@
    LiDAR·지형 인지 보행 (LiDAR 끊김 고장 포함): 세 두뇌 연결 방식 모두 기록과 스캔 점이 비트 단위로 같다.
    Chrono (lockstep): 발자국, HMMWV 투입·제거, 흙 바꾸기, LiDAR가 차량을 보는 지형 인지 보행도 같다.
    Chrono 실시간 (기다리지 않는 교환, 뒤처짐 상한): DIS 콘솔로 흙·차량 투입
+   무른 흙 (foot_soil): 지형 패치 이벤트(세 두뇌 연결 방식), 지형 창 + 실행 중 자국 추가도 기록·MOP가 비트 단위로 같다
 5. DIS 콘솔 (실시간, 별도 프로세스 두뇌): 콘솔 명령(이동, 자국, 링크 두절, 종료)이 접수·적용되고, 남은 scenario_replay.yaml을
    Python 시뮬레이터(sim.runner)로 다시 돌리면 같은 결과다 (실시간 실행에서 늦은 명령·늦게 걸린 변경이 없었을 때).
    실행 도중 시각 없이 보낸 요청(이동, 자국, 링크 두절 감쇠)도 같다
@@ -333,14 +334,39 @@ def _runner_vs_rt(scn, brains, tmp, extra_npz=()):
             b = pq.read_table(tmp / brain / "timeseries.parquet").to_pandas()
             diff = [c for c in a.columns if len(a) != len(b) or not np.array_equal(a[c].to_numpy(), b[c].to_numpy(), equal_nan=True)]
             assert not diff, (brain, diff)
-            for k in ("min_vehicle_distance_m", "deformed_cells", "deform_mean_m", "deform_max_m", "forward_x_m"):
-                assert ma[k] == mb[k], (brain, k, ma[k], mb[k])
+            for k in ("min_vehicle_distance_m", "deformed_cells", "deform_mean_m", "deform_max_m", "forward_x_m",
+                      "foot_sink_mean_m", "foot_sink_max_m", "foot_slip_mean_m", "plow_work_j", "plow_work_up_j"):
+                assert ma.get(k) == mb.get(k), (brain, k, ma.get(k), mb.get(k))
             for name in extra_npz:
                 la, lb = np.load(py_dir / f"{name}.npz"), np.load(tmp / brain / f"{name}.npz")
                 assert np.array_equal(la["points"], lb["points"]) and np.array_equal(la["label"], lb["label"]), brain
         return ma
     finally:
         shutil.rmtree(py_dir, ignore_errors=True)
+
+
+def test_foot_soil_matches_runner():
+    """무른 흙 (foot_soil, C++ 코어의 같은 알고리즘): 지형 패치 이벤트가 있는 rough_rut(세 두뇌 연결 방식)과
+    지형 창 + 실행 중 자국 추가가 sim.runner와 기록·MOP까지 비트 단위로 같다."""
+    import shutil
+    import tempfile
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        rr = yaml.safe_load((ROOT / "scenarios/rough_rut.yaml").read_text())
+        rr["duration"], rr["foot_soil"] = 5.0, {"preset": "firm"}
+        ma = _runner_vs_rt(rr, ("inproc", "shm", "ros"), tmp / "rr")
+        win = yaml.safe_load((ROOT / "scenarios/dis_console.yaml").read_text())
+        win["duration"], win["foot_soil"] = 8.0, {"preset": "soft", "plow_ratio": 0.5}
+        win["events"] = [{"t": 0.5, "action": "set_command", "vx": 0.5, "yaw_rate": 0.0},
+                         {"t": 2.0, "action": "add_patch",
+                          "patch": {"kind": "rut", "start": [1.0, -50.0], "end": [1.0, 50.0], "width": 0.25, "depth": 0.05,
+                                    "profile": "box"}}]
+        mb = _runner_vs_rt(win, ("inproc",), tmp / "win")
+        assert ma["foot_sink_mean_m"] > 0.005 and mb["plow_work_j"] > 0, (ma, mb)
+        print(f"    무른 흙 (C++ 코어 lockstep = sim.runner): rough_rut firm 침하 {100 * ma['foot_sink_mean_m']:.1f} cm, "
+              f"지형 창 soft 쟁기질 {mb['plow_work_j']:.0f} J")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_chrono_matches_runner():

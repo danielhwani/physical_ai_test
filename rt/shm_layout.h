@@ -9,7 +9,7 @@
 namespace rtshm {
 
 constexpr uint32_t MAGIC = 0x47324F52;   // "RO2G"
-constexpr uint32_t VERSION = 10;
+constexpr uint32_t VERSION = 11;
 constexpr int NJ = 12;
 constexpr int NQ = 19, NV = 18;           // Go2 (자유 관절 + 12)
 constexpr int NOISE_DIM = 36;             // sensors/proprio.py ProprioSensors.NOISE_DIM
@@ -18,6 +18,19 @@ constexpr int TRUTH_RING = 1024;          // 참값 기록 (약 20 s)
 constexpr int NBODY_MAX = 16;            // 바디 위치·자세를 넘길 수 있는 바디 수 (Go2 모델 14)
 constexpr int SCAN_MAX_PTS = 32768;       // 스캔 공유 메모리의 최대 점 수
 constexpr int OP_RING = 32;               // 운용자 이동 명령 (관리 프로세스 -> 별도 프로세스 두뇌)
+constexpr int SOIL_TAB = 600;             // 무른 흙 지지력 표 최대 길이 (sim/foot_soil.py: 570)
+constexpr int STAMP_RING = 256;           // 무른 흙: 발을 든 자리에 남긴 구멍 (화면 발자국용)
+
+struct SoilConfig {                       // 무른 흙 발 상호작용 (sim/foot_soil.py와 같은 알고리즘). on이 0이면 단단한 접촉
+  int32_t on;
+  int32_t n_tab;                          // 지지력 표 길이
+  int32_t plate_geom[4], plate_mocap[4], foot_body[4];
+  double r;                               // 발 구 반지름
+  double damping_r, bekker_n;
+  double p_coef;                          // 쟁기질 압력 = p_coef * h^n (0이면 쟁기질 끔)
+  double area_min, lift_gap, plastic_cell, plate_half_z;
+  double z_tab[SOIL_TAB], f_tab[SOIL_TAB], a_tab[SOIL_TAB];   // 깊이 -> 지지력, 접촉 면적 (Python이 계산)
+};
 
 struct Config {                           // 관리 프로세스가 코어 시작 전에 쓴다
   int32_t mode;                           // 0 실시간 (시계), 1 lockstep (관리 프로세스가 한 스텝씩)
@@ -37,6 +50,7 @@ struct Config {                           // 관리 프로세스가 코어 시�
   double gyro_bias[3], accel_bias[3], yaw_drift;   // 센서 모델 (실행마다 정해진 값, Python이 계산)
   double hold_q[NJ], hold_kp[NJ], hold_kd[NJ];     // 명령이 아직 없을 때 (기본 자세)
   double qpos0[NQ], qvel0[NV];                     // 시작 상태 (지형 높이 맞춘 뒤)
+  SoilConfig soil;
 };
 
 struct Control {                          // 관리 프로세스 -> 코어 (실행 중 바꿀 수 있는 값)
@@ -96,9 +110,13 @@ struct TruthEntry {                       // 코어 -> 관리 프로세스 (판�
   double base_xmat[9];
   double foot_pos[12];
   uint32_t contact_bits;                  // 발 i가 무엇이든 닿아 있으면 비트 i
-  uint32_t pad;
+  uint32_t soil_on;                       // 무른 흙: 발 i가 디딤 중이면 비트 i
   uint64_t fault_seq;                     // 이 스텝이 쓴 고장 값의 판 (ctl.fault_seq): 고장이 실제로 걸린 스텝을 관리 프로세스가 안다
   uint64_t terrain_seq;                   // 이 스텝이 쓴 지형의 판 (TerrainHeader.seq)
+  // 무른 흙 (스텝 끝 상태, 누적 값): 디딘 자리의 소성 침하와 위치, 쟁기질 일, 끝난 디딤 통계
+  double soil_zp[4], soil_xy[8];
+  double plow_work, plow_work_up, sink_sum, sink_max, slip_sum;
+  uint64_t stance_n;
   double body_xpos[NBODY_MAX * 3];        // 바디 위치·자세 (스텝 직후 값, 센서 렌더러가 쓴다)
   double body_xquat[NBODY_MAX * 4];       // w, x, y, z
 };
@@ -111,6 +129,10 @@ struct Stats {
   uint64_t locked;                        // mlockall 성공
   uint64_t rt_ok;                         // SCHED_FIFO 성공
   double max_wake_us, max_compute_us;
+};
+
+struct SoilStamp {                        // 발을 든 자리의 구멍 (x, y, 소성 침하)
+  double x, y, zp;
 };
 
 struct Shm {
@@ -128,6 +150,8 @@ struct Shm {
   NoiseEntry noise[NOISE_RING];
   uint64_t truth_head;                    // 코어가 쓴 참값 개수
   TruthEntry truth[TRUTH_RING];
+  uint64_t stamp_head;                    // 무른 흙: 코어가 남긴 구멍 개수
+  SoilStamp stamp[STAMP_RING];
 };
 
 // 지형 공유 메모리 (<이름>_terrain): 관리 프로세스가 지형 높이를 바꾸면 쓴다 (자국 이벤트, 5 Hz 반영, 지형 창 이동).

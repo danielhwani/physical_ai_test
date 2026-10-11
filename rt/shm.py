@@ -11,14 +11,22 @@ import os
 import time
 from pathlib import Path
 
-MAGIC, VERSION = 0x47324F52, 10
+MAGIC, VERSION = 0x47324F52, 11
 NJ, NQ, NV, NOISE_DIM, NOISE_RING, TRUTH_RING, OP_RING = 12, 19, 18, 36, 4096, 1024, 32
 NBODY_MAX, SCAN_MAX_PTS = 16, 32768
+SOIL_TAB, STAMP_RING = 600, 256
 D = C.c_double
 
 
 def arr(t, n):
     return t * n
+
+
+class SoilConfig(C.Structure):
+    _fields_ = [("on", C.c_int32), ("n_tab", C.c_int32), ("plate_geom", arr(C.c_int32, 4)), ("plate_mocap", arr(C.c_int32, 4)),
+                ("foot_body", arr(C.c_int32, 4)), ("r", D), ("damping_r", D), ("bekker_n", D), ("p_coef", D), ("area_min", D),
+                ("lift_gap", D), ("plastic_cell", D), ("plate_half_z", D), ("z_tab", arr(D, SOIL_TAB)), ("f_tab", arr(D, SOIL_TAB)),
+                ("a_tab", arr(D, SOIL_TAB))]
 
 
 class Config(C.Structure):
@@ -27,7 +35,7 @@ class Config(C.Structure):
                 ("pad1", C.c_int32), ("cpu", C.c_int32), ("priority", C.c_int32), ("max_steps", C.c_int64),
                 ("control_dt", D), ("torque_limit", arr(D, NJ)), ("gyro_bias", arr(D, 3)), ("accel_bias", arr(D, 3)),
                 ("yaw_drift", D), ("hold_q", arr(D, NJ)), ("hold_kp", arr(D, NJ)), ("hold_kd", arr(D, NJ)),
-                ("qpos0", arr(D, NQ)), ("qvel0", arr(D, NV))]
+                ("qpos0", arr(D, NQ)), ("qvel0", arr(D, NV)), ("soil", SoilConfig)]
 
 
 class Control(C.Structure):
@@ -61,8 +69,10 @@ class NoiseEntry(C.Structure):
 class TruthEntry(C.Structure):
     _fields_ = [("step", C.c_uint64), ("t", D), ("qpos", arr(D, NQ)), ("qvel", arr(D, NV)), ("ctrl", arr(D, NJ)),
                 ("q_des", arr(D, NJ)), ("energy", D), ("foot_force", arr(D, 4)), ("cmd_t", D), ("wake_us", D), ("compute_us", D),
-                ("base_xmat", arr(D, 9)), ("foot_pos", arr(D, 12)), ("contact_bits", C.c_uint32), ("pad", C.c_uint32),
+                ("base_xmat", arr(D, 9)), ("foot_pos", arr(D, 12)), ("contact_bits", C.c_uint32), ("soil_on", C.c_uint32),
                 ("fault_seq", C.c_uint64), ("terrain_seq", C.c_uint64),
+                ("soil_zp", arr(D, 4)), ("soil_xy", arr(D, 8)), ("plow_work", D), ("plow_work_up", D), ("sink_sum", D),
+                ("sink_max", D), ("slip_sum", D), ("stance_n", C.c_uint64),
                 ("body_xpos", arr(D, NBODY_MAX * 3)), ("body_xquat", arr(D, NBODY_MAX * 4))]
 
 
@@ -71,21 +81,27 @@ class Stats(C.Structure):
                 ("locked", C.c_uint64), ("rt_ok", C.c_uint64), ("max_wake_us", D), ("max_compute_us", D)]
 
 
+class SoilStamp(C.Structure):
+    _fields_ = [("x", D), ("y", D), ("zp", D)]
+
+
 class Shm(C.Structure):
     _fields_ = [("magic", C.c_uint32), ("version", C.c_uint32), ("size", C.c_uint64), ("cfg", Config), ("ctl", Control),
                 ("stats", Stats), ("state", LowState), ("cmd", LowCmd), ("est", Estimate), ("op_head", C.c_uint64), ("op", arr(OpEntry, OP_RING)),
                 ("noise_head", C.c_uint64), ("noise", arr(NoiseEntry, NOISE_RING)), ("truth_head", C.c_uint64),
-                ("truth", arr(TruthEntry, TRUTH_RING))]
+                ("truth", arr(TruthEntry, TRUTH_RING)), ("stamp_head", C.c_uint64), ("stamp", arr(SoilStamp, STAMP_RING))]
 
 
 def layout():
     """rt_core --layout과 같은 형식의 위치·크기."""
     out = {name: [getattr(Shm, name).offset, getattr(Shm, name).size]
-           for name in ("cfg", "ctl", "stats", "state", "cmd", "op_head", "op", "noise_head", "noise", "truth_head", "truth")}
+           for name in ("cfg", "ctl", "stats", "state", "cmd", "op_head", "op", "noise_head", "noise", "truth_head", "truth",
+                        "stamp_head", "stamp")}
     sub = {"cfg.qpos0": (Shm.cfg, Config.qpos0), "cfg.torque_limit": (Shm.cfg, Config.torque_limit),
            "ctl.torque_scale": (Shm.ctl, Control.torque_scale), "state.foot_force": (Shm.state, LowState.foot_force),
            "cmd.tau_ff": (Shm.cmd, LowCmd.tau_ff), "truth[0].wake_us": (Shm.truth, TruthEntry.wake_us),
-           "ctl.fault_seq": (Shm.ctl, Control.fault_seq), "truth[0].terrain_seq": (Shm.truth, TruthEntry.terrain_seq)}
+           "ctl.fault_seq": (Shm.ctl, Control.fault_seq), "truth[0].terrain_seq": (Shm.truth, TruthEntry.terrain_seq),
+           "cfg.soil": (Shm.cfg, Config.soil), "truth[0].stance_n": (Shm.truth, TruthEntry.stance_n)}
     out.update({k: [a.offset + b.offset, b.size] for k, (a, b) in sub.items()})
     out["total"] = [0, C.sizeof(Shm)]
     return out

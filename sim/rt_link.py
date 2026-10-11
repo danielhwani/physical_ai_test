@@ -114,6 +114,20 @@ class RtLink:
         hold = sim.hold_cmd()
         cfg.hold_q[:], cfg.hold_kp[:], cfg.hold_kd[:] = hold["q_des"], hold["kp"], hold["kd"]
         cfg.qpos0[:], cfg.qvel0[:] = d.qpos, d.qvel
+        fs = sim.foot_soil
+        if fs is not None:                        # 무른 흙: 코어가 같은 알고리즘으로 계산한다 (지지력 표는 여기서 넘긴다)
+            from .foot_soil import LIFT_GAP, PLASTIC_CELL
+            from .model_builder import PLATE_HALF
+            sc = cfg.soil
+            if len(fs.z_tab) > R.SOIL_TAB:
+                raise ValueError(f"지지력 표가 규약보다 길다 ({len(fs.z_tab)} > {R.SOIL_TAB})")
+            sc.on, sc.n_tab = 1, len(fs.z_tab)
+            sc.plate_geom[:], sc.plate_mocap[:], sc.foot_body[:] = fs.plates, fs.mocap, fs.bodies
+            sc.r, sc.damping_r, sc.bekker_n = fs.r, fs.soil["damping_r"], fs.soil["bekker_n"]
+            sc.p_coef = fs.p_coef if fs.plow_ratio > 0 else 0.0
+            sc.area_min, sc.lift_gap, sc.plastic_cell, sc.plate_half_z = fs.area_min, LIFT_GAP, PLASTIC_CELL, PLATE_HALF[2]
+            n = len(fs.z_tab)
+            sc.z_tab[:n], sc.f_tab[:n], sc.a_tab[:n] = fs.z_tab, fs.f_tab, fs.a_tab
         s.ctl.torque_scale = 1.0
         self.noise_n = 0
         self.fill_noise(R.NOISE_RING // 2)
@@ -307,9 +321,6 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
     if unsupported:
         sim.close()
         raise SystemExit(f"실시간 코어 경로가 지원하지 않는 이벤트: {unsupported}")
-    if sim.foot_soil is not None:
-        sim.close()
-        raise SystemExit("foot_soil(무른 흙 발 반력)은 아직 sim.runner 전용이다 (C++ 코어에는 없다)")
     if sim.link_jitter is not None:
         sim.close()
         raise SystemExit("control_link의 통계적 지연(late_probability, extra_steps_probs, drop_probability)은 sim.runner lockstep 전용이다. "
@@ -521,6 +532,20 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
             rec.log(vehicle_pos=sim.cosim.vehicle["pos"], vehicle_speed=sim.cosim.vehicle["speed"])
 
     scan_log = {}
+    k_stamp = [0]                              # 무른 흙: 읽은 구멍 개수 (코어의 stamp 링)
+    footprints = [None]                        # 무른 흙: 화면 전용 발자국 패치 (sim.runner와 같은 토픽)
+
+    def soil_mirror(e):
+        """무른 흙: 코어의 흙 상태를 관리 프로세스의 FootSoil에 비춘다 (MOP, 화면 발자국). 물리는 코어가 한다."""
+        fs, shm = sim.foot_soil, link.shm
+        while k_stamp[0] < shm.stamp_head:
+            st = shm.stamp[k_stamp[0] % R.STAMP_RING]
+            fs.add_display_stamp(st.x, st.y, st.zp)
+            k_stamp[0] += 1
+        for i in range(4):
+            fs.on[i], fs.zp[i], fs.xy[i] = bool(e.soil_on >> i & 1), e.soil_zp[i], [e.soil_xy[2 * i], e.soil_xy[2 * i + 1]]
+        fs.stance_n, fs.sink_sum, fs.sink_max, fs.slip_sum = int(e.stance_n), e.sink_sum, e.sink_max, e.slip_sum
+        fs.plow_work, fs.plow_work_up = e.plow_work, e.plow_work_up
     odom_offset = [None]
     viz_count = [0]
 
@@ -561,6 +586,8 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
             mirror(e)
         bridge.publish(sim.data)
         viz_count[0] += 1
+        if footprints[0] is not None and viz_count[0] % 2 == 0:     # 무른 흙 발자국 (화면 전용)
+            bridge.publish_overlay(footprints[0].update())
         if sim.controller.terrain is not None:
             est = (br.node.est.pos if br.name == "inproc" and br.node.est is not None else
                    (br.bridge.latest_est or {}).get("pos") if br.name == "ros" else
@@ -593,6 +620,8 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
                     if verbose:
                         print(f"[t={e.t:6.2f}] 경고: {kind} 변경이 {e.step - want}스텝 늦게 걸렸다 (관리 프로세스 지연)")
             d.qpos[:], d.qvel[:], d.time = e.qpos, e.qvel, e.t           # DIS 서버·정보판이 보는 지금 상태 (참값)
+            if sim.foot_soil is not None:
+                soil_mirror(e)
             wake.append(e.wake_us); comp.append(e.compute_us)
             if e.cmd_t >= 0:
                 lat.append(e.t - link.control_dt - e.cmd_t)        # 실행한 스텝의 상태 시각 - 명령이 쓴 상태 시각
@@ -640,6 +669,9 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
         if viz or brain == "ros":
             from .ros2_bridge import Ros2StreamPublisher, launch_mujoco_viewer, launch_rviz_stack
             bridge = Ros2StreamPublisher(sim.model, sim.terrain, sim.cosim)
+            if sim.foot_soil is not None:
+                from .stream import TerrainOverlayStream
+                footprints[0] = TerrainOverlayStream(sim.foot_soil.display_depth, sim.foot_soil.display.shape)
         if "rviz" in viz:
             rviz, adapter = launch_rviz_stack(log_dir)
             displays.append(("RViz", rviz)); helpers.append(adapter)
@@ -757,6 +789,8 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
         }
         mop["min_vehicle_distance_m"] = round(sim.cosim.min_dist, 3) if sim.cosim is not None and np.isfinite(sim.cosim.min_dist) else None   # 차가 한 번도 안 나왔으면 None
         mop.update(terrain_deformation(terrain0, sim.terrain.applied))
+        if sim.foot_soil is not None:
+            mop.update(sim.foot_soil.mop())
         if rec is not None:
             mop.update({"touchdowns": touchdowns, "edge_touchdowns": edge_touchdowns,
                         "est_speed_rmse_mps": round(float(np.sqrt(np.mean(np.square(est_err_v[25:])))), 4)

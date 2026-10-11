@@ -11,7 +11,7 @@
 6. 화면 발자국: 구멍은 화면 전용 토픽으로만 나가고, 물리 지형과 센서가 받는 지형은 그대로다
 7. 쟁기질 (흙 속을 옆이나 위로 지나가는 발의 저항): 무른 흙에서 전진이 줄고 흙에 준 일이 생긴다 (발을 빼며 위로 든 일 포함).
    끄면(plow_ratio 0) 저항 없이 더 멀리 간다. 단단한 흙은 발이 반지름보다 얕게 빠져 위에 덮인 흙이 없으므로 위쪽 저항이 거의 0이다
-8. C++ 실시간 코어 경로는 이 옵션을 받지 않는다
+C++ 실시간 코어와 같은 결과인지는 conformance/test_rt_core.py test_foot_soil_matches_runner (lockstep 비트 동일)
 """
 import contextlib
 import copy
@@ -86,7 +86,7 @@ def test_standing_sinkage_matches_scm():
             ref = _scm(peak[i], kphi)
             zp = sim.foot_soil.zp[i]
             assert abs(zp - ref) < max(0.2 * ref, 0.0025), (preset, i, peak[i], zp, ref)
-        print(f"    서 있기 {preset}: 소성 침하 {np.round(100 * sim.foot_soil.zp, 2)} cm, "
+        print(f"    서 있기 {preset}: 소성 침하 {np.round(100 * np.array(sim.foot_soil.zp), 2)} cm, "
               f"최대 하중 {np.round(peak)} N에서 SCM {[round(100 * _scm(p, kphi), 2) for p in peak]} cm")
 
 
@@ -95,8 +95,8 @@ def test_holes_remain():
     scn["foot_soil"] = {"preset": "firm"}
     sim = _run(scn, 4.0)
     fs = sim.foot_soil
-    assert len(fs.plastic) > 50 and len(fs.stances) > 10
-    deepest, sink = max(fs.plastic.values()), max(z for z, _ in fs.stances)
+    assert len(fs.plastic) > 50 and fs.stance_n > 10
+    deepest, sink = max(fs.plastic.values()), fs.sink_max
     assert 0.7 * sink < deepest <= sink + 1e-12, (deepest, sink)   # 구 모양 구멍: 칸 중심이 구 중심에서 벗어난 만큼 얕다
 
 
@@ -160,19 +160,6 @@ def test_footprints_shown_on_screen_only():
     assert np.array_equal(sim.terrain.applied, applied0)           # 물리 지형은 그대로
     assert np.array_equal(terrain.heights, applied0.astype(np.float32))   # 센서가 받는 지형에도 구멍 없음
     print(f"    화면 발자국: 격자 점 {(depth > 0).sum()}개, 가장 깊은 곳 {100 * depth.max():.1f} cm")
-
-
-def test_rt_core_rejects_foot_soil():
-    from sim.rt_link import run
-    scn = copy.deepcopy(BASE)
-    scn["foot_soil"] = {"preset": "firm"}
-    try:
-        with contextlib.redirect_stdout(io.StringIO()):
-            run(scn, lockstep=True, verbose=False)
-    except SystemExit as e:
-        assert "foot_soil" in str(e)
-        return
-    raise AssertionError("실시간 코어 경로가 foot_soil을 받았다")
 
 
 if __name__ == "__main__":
