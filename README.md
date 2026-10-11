@@ -646,7 +646,20 @@ Chrono 충돌 여유 두께로 맞춰 보았지만 설명되지 않아 보정 �
 - **결과를 `plow_ratio` 범위로 보고하기**: 쟁기질 비율은 아직 맞추지 않았으므로, 무른 흙 결과는 범위의 양 끝(0.25와 1)으로 돌려 함께 낸다.
   ```bash
   python -m sim.sweep scenarios/flat_trot.yaml --param foot_soil.plow_ratio --values 0.25 1 --set foot_soil.preset=soft
+  # 시드 여러 개 (비율마다 따로)
+  python -m sim.sweep scenarios/flat_trot.yaml --param seed --values 0 1 2 3 4 --set foot_soil.preset=soft --set foot_soil.plow_ratio=0.25
+  python -m sim.sweep scenarios/flat_trot.yaml --param seed --values 0 1 2 3 4 --set foot_soil.preset=soft --set foot_soil.plow_ratio=1
   ```
+  첫 명령의 결과 예 (시나리오 기본 시드 0 한 번, 2026-10-11 일반 터미널):
+
+  | plow_ratio | 전진 (m) | CoT | 측방 표류 (m) |
+  |---|---|---|---|
+  | 0.25 | 3.84 | 4.73 | 0.10 |
+  | 1 | 0.37 | 25.46 | 0.48 |
+
+  같은 soft 흙에서 비율만 바꿔도 "거의 정상으로 걷는다"(단단한 지형 3.92 m의 98 %)와 "거의 멈춘다"로 갈린다. 두 값 모두에서 성립하는 것은
+  CoT가 단단한 지형(2.42)보다 높다는 것과 디딤 침하(평균 4~6 cm)뿐이다. 1에서 측방 표류가 큰 것은 거의 멈춘 채 몸이 틀어졌기 때문이다.
+  sweep은 시드 하나만 돌므로 아래 표(시드 5개 평균)와 값이 다르다.
   flat_trot 12초, 시드 5개 평균, `plow_ratio` 0.25 ~ 1 (넘어짐은 모두 0):
 
   | 흙 | 전진 (m) | CoT | 디딤 침하 평균 (cm) |
@@ -662,6 +675,21 @@ Chrono 충돌 여유 두께로 맞춰 보았지만 설명되지 않아 보정 �
 - **`plow_ratio`에 민감하다** (soft, 시드 5개): 0 -> 5.30 m (CoT 3.20), 0.25 -> 3.24 m (5.63), 0.5 -> 1.02 m (14.55), 1 -> 0.90 m (17.39),
   2 -> 0.86 m (17.77). 0.5 이상에서는 거의 멈춰 비슷하고, 그 아래에서 크게 달라진다. 무른 흙 결과의 절댓값은 이 값에 달려 있으므로,
   맞추기 전에는 흙끼리의 비교(순서, 경향)로 쓴다.
+
+**시험** (`python conformance/test_foot_soil.py`, 약 25초. 2026-10-11 일반 터미널에서 8개 모두 통과, 제 실행과 숫자까지 같음 = 결정적)
+
+| 시험 | 확인하는 것 | 그날 값 |
+|---|---|---|
+| `test_bearing_matches_scm_reference` | 지지력 식이 Chrono SCM 기준과 맞음 | 16개 조건에서 최대 차이 2.5 mm |
+| `test_off_keeps_model` | `foot_soil`이 없으면 모델 그대로 | 받침판 없음, 발 충돌 설정 그대로 |
+| `test_standing_sinkage_matches_scm` | 서 있는 로봇의 소성 침하 = 일어설 때 받은 최대 하중에서의 SCM 침하 | 예: soft 5.8 cm vs SCM 5.9 cm, firm 2.2 vs 2.05 |
+| `test_holes_remain` | 발을 든 자리에 구멍이 남음 | 가장 깊은 구멍 ≈ 가장 깊은 디딤 |
+| `test_walks_on_hard_and_firm_and_softer_sinks_more` | hard·firm은 걷고, 무를수록 더 빠짐 | 10초 전진: 단단한 지형 3.48, hard 3.54, firm 3.58, kphi 2e6 0.56 m |
+| `test_plowing_slows_soft_soil` | 쟁기질이 무른 흙에서 전진을 줄이고, 단단한 흙에서는 위쪽 저항이 거의 0 | soft 8초 3.50 -> 0.50 m (흙에 준 일 200 J, 그중 위로 40 J), hard 위로 0.0 J |
+| `test_footprints_shown_on_screen_only` | 구멍은 화면 토픽에만, 물리·센서 지형은 그대로 | 격자 점 45개, 가장 깊은 곳 9.8 cm |
+| `test_rt_core_rejects_foot_soil` | C++ 실시간 코어는 이 옵션을 거부 | 거부 메시지 |
+
+시험은 8~10초만 돌아서 전진 거리가 위 표(12초)와 다르다.
 
 **한계와 다음 단계**
 - 쟁기질 비율(`plow_ratio`)은 실측으로 맞추지 않았다 (위). 밀린 흙이 쌓이는 것, 진흙에서 발을 뽑을 때의 흡착(빨아들임)은 없다 (위로 빼는 저항은 덮인 흙을 들어 올리는 몫만).
