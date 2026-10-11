@@ -1,0 +1,96 @@
+{
+ "grid_m": 0.0025,
+ "duration_s": 2.0,
+ "radius_m": 0.022,
+ "soil": {
+  "bekker_kc": 0.0,
+  "bekker_n": 1.1,
+  "cohesion": 0.0,
+  "friction_deg": 30.0,
+  "janosi_shear": 0.01,
+  "elastic_k": 40000000.0,
+  "damping_r": 30000.0
+ },
+ "rows": [
+  {
+   "bekker_kphi": 20000000.0,
+   "fn": 30.0,
+   "sink_m": 0.00398
+  },
+  {
+   "bekker_kphi": 20000000.0,
+   "fn": 50.0,
+   "sink_m": 0.00617
+  },
+  {
+   "bekker_kphi": 20000000.0,
+   "fn": 80.0,
+   "sink_m": 0.00885
+  },
+  {
+   "bekker_kphi": 20000000.0,
+   "fn": 120.0,
+   "sink_m": 0.01152
+  },
+  {
+   "bekker_kphi": 10000000.0,
+   "fn": 30.0,
+   "sink_m": 0.00715
+  },
+  {
+   "bekker_kphi": 10000000.0,
+   "fn": 50.0,
+   "sink_m": 0.01027
+  },
+  {
+   "bekker_kphi": 10000000.0,
+   "fn": 80.0,
+   "sink_m": 0.01364
+  },
+  {
+   "bekker_kphi": 10000000.0,
+   "fn": 120.0,
+   "sink_m": 0.01751
+  },
+  {
+   "bekker_kphi": 5000000.0,
+   "fn": 30.0,
+   "sink_m": 0.01152
+  },
+  {
+   "bekker_kphi": 5000000.0,
+   "fn": 50.0,
+   "sink_m": 0.0156
+  },
+  {
+   "bekker_kphi": 5000000.0,
+   "fn": 80.0,
+   "sink_m": 0.02124
+  },
+  {
+   "bekker_kphi": 5000000.0,
+   "fn": 120.0,
+   "sink_m": 0.02842
+  },
+  {
+   "bekker_kphi": 1000000.0,
+   "fn": 30.0,
+   "sink_m": 0.03361
+  },
+  {
+   "bekker_kphi": 1000000.0,
+   "fn": 50.0,
+   "sink_m": 0.05043
+  },
+  {
+   "bekker_kphi": 1000000.0,
+   "fn": 80.0,
+   "sink_m": 0.07455
+  },
+  {
+   "bekker_kphi": 1000000.0,
+   "fn": 120.0,
+   "sink_m": 0.10546
+  }
+ ]
+}

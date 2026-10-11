@@ -27,6 +27,7 @@ import yaml
 
 from .adapters import quat_to_roll_pitch, quat_to_yaw
 from control.node import ControllerNode
+from .foot_soil import FootSoil, friction as soil_friction
 from .link_jitter import make_link_jitter
 from .model_builder import ROOT, TERRAIN_BODY, build_model
 from .recorder import Recorder
@@ -39,7 +40,7 @@ FAULTS = ("lidar_blackout", "link_loss", "imu_bias", "battery_low")
 CONTROL_ACTIONS = ("freeze", "stop")      # 실행 제어: 물리에 영향 없음. 다시 실행할 시나리오에서는 뺀다 (stop은 duration으로)
 
 SIM_VERSION = "0.3.0"
-OPTIONAL_SECTIONS = ("control_link",)   # 시나리오에 없어도 --set으로 만들 수 있는 절
+OPTIONAL_SECTIONS = ("control_link", "foot_soil")   # 시나리오에 없어도 --set으로 만들 수 있는 절
 TERRAIN_COMMIT_HZ = 5.0       # 지형 갱신은 수 Hz로 충분 (문서 §5.3)
 FALL_HEIGHT = 0.04            # 몸통 높이(지면 기준)가 이보다 낮으면 넘어짐 (몸통이 땅에 박힘). 넘어짐은 주로 기울기로 판정한다.
                               # 똑바로 엎드린 자세(다리 모양에 따라 0.08~0.14 m)는 넘어짐이 아니다: 링크 두절 감쇠 모드 뒤 일어설 수 있다.
@@ -136,7 +137,12 @@ class Simulation:
         for p in t.get("patches", []):
             self.terrain.add_patch(p)
         self.variant = variant
-        self.model, self.hfield_id = build_model(self.spec, self.terrain, variant)
+        # 무른 흙 발 반력 (선택, sim/foot_soil.py): 발·정강이는 단단한 지형과 충돌하지 않고 흙 반력을 받는다
+        self.foot_soil_cfg = self.scn.get("foot_soil") or None
+        if self.foot_soil_cfg and (self.scn.get("chrono") or {}).get("robot_feet"):
+            raise ValueError("foot_soil과 chrono.robot_feet(Chrono 발자국)은 함께 쓰지 않는다 (흙이 두 곳에서 계산된다)")
+        self.model, self.hfield_id = build_model(self.spec, self.terrain, variant,
+                                                 soft_feet=soil_friction(self.foot_soil_cfg) if self.foot_soil_cfg else False)
         self.data = mujoco.MjData(self.model)
 
         # 보행 알고리즘 (control/): 로봇 상태 메시지만 받아 관절 명령을 낸다 (참값을 모른다). 같은 프로세스에서 부른다
@@ -206,9 +212,18 @@ class Simulation:
         mujoco.mj_resetDataKeyframe(self.model, self.data, 0)
         self.data.qpos[2] += self.terrain.height_at(0.0, 0.0)
         mujoco.mj_forward(self.model, self.data)
+        if self.foot_soil_cfg:
+            # 시작 자세는 발이 표면 아래 약 2 cm에 놓인다 (단단한 접촉이 밀어 올림). 흙에서는 그대로면 시작부터 박히므로
+            # 가장 낮은 발이 흙 표면에 닿게 몸통을 올린다
+            g = self.foot_ids
+            low = min(self.data.geom_xpos[i][2] - self.model.geom_size[i][0] - self.terrain.height_at(*self.data.geom_xpos[i][:2])
+                      for i in g)
+            self.data.qpos[2] -= low
+            mujoco.mj_forward(self.model, self.data)
         self.controller.reset()
         # 로봇 쪽 경계: 참값 -> 센서 모델(잡음, 편향, 표류) -> 로봇 상태 메시지. 잡음 난수는 시나리오 시드
         self.robot = RobotIO(self, self.sensor_defs.get("proprio"), seed=self.scn.get("seed", 0))
+        self.foot_soil = FootSoil(self, self.foot_soil_cfg) if self.foot_soil_cfg else None
         self.low_state, self.low_cmd = None, None
         self.prev_state_t = None
         self.remote = None            # 보행 알고리즘을 별도 노드로 돌릴 때: 로봇 경계 토픽 전송 (Ros2StreamPublisher)
@@ -331,6 +346,8 @@ class Simulation:
                 if g in (con.geom1, con.geom2) and self.terrain_geom in (con.geom1, con.geom2):
                     mujoco.mj_contactForce(self.model, self.data, k, out)
                     f[i] += out[0]               # 접촉 좌표계 첫 성분 = 법선 방향
+        if self.foot_soil is not None:           # 무른 흙: 흙 반력 (발은 지형과 접촉하지 않는다)
+            f += self.foot_soil.fn
         return f
 
     def foot_contacts(self):
@@ -340,6 +357,8 @@ class Simulation:
             for i, g in enumerate(self.foot_ids):
                 if g in (con.geom1, con.geom2):
                     c[i] = True
+        if self.foot_soil is not None:
+            c |= self.foot_soil.contacts()
         return c
 
     def hold_cmd(self):
@@ -726,6 +745,7 @@ def run(args):
         # 실행한 명령이 기본 지연(latency_steps)보다 오래된 제어 주기 수 (sim.rt_link의 실시간 MOP와 같은 뜻)
         "cmd_late_steps": int((np.array(cmd_latency) > sim.link_latency * ctrl_dt + 1e-6).sum()) if cmd_latency else None,
         **(sim.link_jitter.mop() if sim.link_jitter is not None and sim.remote is None else {}),
+        **(sim.foot_soil.mop() if sim.foot_soil is not None else {}),
         "touchdowns": touchdowns,
         "edge_touchdowns": edge_touchdowns,
         "late_control_steps": late if (args.realtime or viewer) else None,

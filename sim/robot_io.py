@@ -37,6 +37,8 @@ class RobotIO:
             limit = self.torque_limit * self.torque_scale
             d.ctrl[:] = np.clip(tau, -limit, limit)
             mujoco.mj_step(sim.model, d)
+            if sim.foot_soil is not None:     # 무른 흙 (선택): 이번 스텝 접촉력으로 침하를 갱신하고 다음 스텝 받침판 높이를 정한다
+                sim.foot_soil.update()
             energy += np.abs(d.ctrl * d.qvel[6:]).sum() * sim.model.opt.timestep
             fn += sim.foot_normal_forces()
         # 발 힘 센서: 제어 주기 동안 물리 스텝 평균 (착지 순간 스파이크는 충격량만큼만)

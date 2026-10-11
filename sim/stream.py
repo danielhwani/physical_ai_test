@@ -14,7 +14,7 @@ import mujoco
 import numpy as np
 
 from .adapters import mj_quat_to_ros, quat_to_yaw
-from .model_builder import TERRAIN_BODY
+from .model_builder import SOIL_PLATE, TERRAIN_BODY
 
 STREAM_VERSION = "1.1"     # 1.1: 바디에 entity (어느 개체의 바디인가: 센서가 자기 몸을 구분)
 ROOT = Path(__file__).resolve().parent.parent
@@ -49,8 +49,8 @@ def build_manifest(model, terrain, cosim=None, physics_source="MuJoCo", entity="
     meshes = export_meshes(model)
     bodies, visuals = [], []
     for b in range(1, model.nbody):
-        if name(mujoco.mjtObj.mjOBJ_BODY, b) == TERRAIN_BODY:     # 물리용 지형 창 (렌더러는 지형 패치로 그린다)
-            continue
+        if name(mujoco.mjtObj.mjOBJ_BODY, b) == TERRAIN_BODY or name(mujoco.mjtObj.mjOBJ_BODY, b).startswith(SOIL_PLATE):
+            continue                                                # 물리용 지형 창·흙 받침판 (렌더러는 지형 패치로 그린다)
         parent = model.body_parentid[b]
         bodies.append({"id": b, "name": name(mujoco.mjtObj.mjOBJ_BODY, b),
                        "parent": "world" if parent == 0 else name(mujoco.mjtObj.mjOBJ_BODY, parent),

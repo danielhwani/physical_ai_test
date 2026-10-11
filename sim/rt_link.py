@@ -307,6 +307,9 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
     if unsupported:
         sim.close()
         raise SystemExit(f"실시간 코어 경로가 지원하지 않는 이벤트: {unsupported}")
+    if sim.foot_soil is not None:
+        sim.close()
+        raise SystemExit("foot_soil(무른 흙 발 반력)은 아직 sim.runner 전용이다 (C++ 코어에는 없다)")
     if sim.link_jitter is not None:
         sim.close()
         raise SystemExit("control_link의 통계적 지연(late_probability, extra_steps_probs, drop_probability)은 sim.runner lockstep 전용이다. "

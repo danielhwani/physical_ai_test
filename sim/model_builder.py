@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parent.parent
 MJX_OVERRIDE = ROOT / "specs/go2_mjx_override.yaml"
 COLLISION_GROUP = 3
 TERRAIN_BODY = "terrain_window"   # 창 모드에서 지형 geom을 붙이는 mocap 바디 (렌더 스트림에서는 제외)
+SOIL_PLATE = "soil_plate_"        # 무른 흙: 발마다 흙 받침판 mocap 바디 (렌더 스트림에서는 제외)
+PLATE_HALF = (0.06, 0.06, 0.01)   # 받침판 반크기 (m)
 
 _GEOM_TYPES = {"sphere": mujoco.mjtGeom.mjGEOM_SPHERE, "capsule": mujoco.mjtGeom.mjGEOM_CAPSULE,
                "box": mujoco.mjtGeom.mjGEOM_BOX, "cylinder": mujoco.mjtGeom.mjGEOM_CYLINDER}
@@ -65,7 +67,9 @@ def apply_mjx_override(s, spec_cfg, adopt):
                 g.pos = r["pos"]
 
 
-def build_model(spec_cfg, terrain, variant="cpu"):
+def build_model(spec_cfg, terrain, variant="cpu", soft_feet=False):
+    """soft_feet: 무른 흙(sim/foot_soil.py)을 쓸 때 흙 마찰계수(tanφ). 발과 정강이(calf 바디)는 지형 heightfield와 닿지 않고,
+    발마다 둔 보이지 않는 흙 받침판(mocap 상자)과 닿는다. 받침판 높이는 흙 모델이 정한다. 다른 충돌은 그대로."""
     s = robot_spec(spec_cfg, variant)
 
     # 사전 할당 heightfield (크기/해상도는 이후 변경 불가)
@@ -83,6 +87,26 @@ def build_model(spec_cfg, terrain, variant="cpu"):
     else:
         s.worldbody.add_geom(name="terrain", type=mujoco.mjtGeom.mjGEOM_HFIELD, hfieldname="terrain",
                              pos=terrain.geom_pos, material="terrain")
+
+    if soft_feet:
+        # 충돌 조건: (contype1 & conaffinity2) or (contype2 & conaffinity1).
+        # 지형 2, 받침판 4, 발 1|4, 정강이의 나머지 1, 나머지 로봇 1|2 -> 발·정강이는 지형과 안 닿고, 발만 받침판과 닿는다
+        feet = set(spec_cfg["robot"]["feet"])
+        legs = {b.name for b in s.bodies if b.name.endswith("_calf")}
+        s.geom("terrain").contype, s.geom("terrain").conaffinity = 2, 2
+        for g in s.geoms:
+            if g.name == "terrain" or g.contype == 0 and g.conaffinity == 0:
+                continue
+            if g.name in feet:
+                g.contype, g.conaffinity = 5, 5
+            elif g.parent.name in legs:
+                g.contype, g.conaffinity = 1, 1
+            else:
+                g.contype, g.conaffinity = 3, 3
+        for f in spec_cfg["robot"]["feet"]:
+            body = s.worldbody.add_body(name=SOIL_PLATE + f, mocap=True, pos=[0.0, 0.0, -1.0])
+            body.add_geom(name=SOIL_PLATE + f, type=mujoco.mjtGeom.mjGEOM_BOX, size=list(PLATE_HALF), contype=4, conaffinity=4,
+                          condim=6, priority=1, friction=[float(soft_feet), 0.02, 0.01], group=4, rgba=[0, 0, 0, 0])
 
     # IMU 가속도계 참값 (로봇 쪽 센서 모델의 입력). 센서는 동역학에 영향이 없다
     s.add_sensor(name="imu_accel", type=mujoco.mjtSensor.mjSENS_ACCELEROMETER, objtype=mujoco.mjtObj.mjOBJ_SITE,
