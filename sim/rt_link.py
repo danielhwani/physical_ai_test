@@ -301,6 +301,10 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
     if unsupported:
         sim.close()
         raise SystemExit(f"실시간 코어 경로가 지원하지 않는 이벤트: {unsupported}")
+    if sim.link_jitter is not None:
+        sim.close()
+        raise SystemExit("control_link의 통계적 지연(late_probability, extra_steps_probs, drop_probability)은 sim.runner lockstep 전용이다. "
+                         "실시간 코어는 실제 지연을 쓴다 (--set으로 빼고 실행)")
     link = RtLink(sim, lockstep, cpu, priority)
     scn_path = ROOT / f"build/rt/scenario_{os.getpid()}.yaml"
     scn_path.write_text(yaml.safe_dump(sim.scn, allow_unicode=True, sort_keys=False))

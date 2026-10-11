@@ -38,11 +38,40 @@ python conformance/test_perception.py                    # 지형 인지: 높이
 python conformance/test_ros_equivalence.py               # ROS 노드 = 같은 프로세스(20 ms 지연 흉내) (ROS2 필요)
 python conformance/test_rt_core.py                       # C++ 실시간 코어: 규약 일치, 물리 비트 동일, 닫힌 고리 동일, 실시간 실행
 python conformance/test_dis_console.py                   # DIS 콘솔: 핸드셰이크, 고장 주입, 실행 제어, 링크 감시, 제어권·인증·원본 기록, HMMWV 투입·흙(Chrono), 기록으로 비트 단위 재실행
+python conformance/test_link_jitter.py                   # lockstep 통계적 명령 지연 (시드 결정성, 분포, 로봇 쪽 규칙)
 python conformance/test_render_stream.py                 # 렌더 스트림 계약 (스트림만으로 장면 재구성 = 시뮬레이터)
 python conformance/compare_variants.py [--policy card.yaml]   # cpu vs mjx 설정의 MOP 분포 비교
 python conformance/make_obs_reference.py                 # (관측 명세를 바꾼 경우) 기준 벡터 재생성
 python conformance/make_policy_reference.py <card.yaml>  # (ONNX를 바꾼 경우) 정책 입출력 기준 재생성
 ```
+
+**전체 시험** (`conformance/test_*.py` 13개). pytest 없이 파일마다 `python`으로 돌리며, 한 파일 안에서는 첫 실패에서 멈춘다.
+이 PC(메모리 7.7 GB)에서는 동시에 돌리지 말고 차례로 돌린다.
+```bash
+for f in specs conformance control link_jitter policy render_stream terrain_window lidar perception ros_equivalence cosim dis_console rt_core; do
+  python conformance/test_$f.py || echo "실패: test_$f"
+done
+```
+마지막 전체 실행 (2026-10-11, 커밋 89a67ac, 로봇 경계 메시지 auto = `go2_rt_msgs` typed): **74개 모두 통과, 약 8분.**
+
+| 시험 파일 | 개수 | 시간 | 다루는 것 |
+|---|---|---|---|
+| test_specs | 6 | 8 s | 관측 기준 벡터, 카드 관절 재배열, MJX 오버라이드 |
+| test_conformance | 2 | 3 s | 결정성, IK-모델 일치 |
+| test_control | 6 | 5 s | 로봇 경계, 기구학, 다리 주행거리계, 재현 |
+| test_link_jitter | 5 | 5 s | 통계적 명령 지연: 시드 결정성, 분포, 로봇 쪽 규칙, C++ 경로 거부 (2026-10-11 추가, 통과) |
+| test_policy | 4 | 3 s | 정책 카드, ONNX 입출력, 결정성, 추론 지연 |
+| test_render_stream | 6 | 8 s | 스트림만으로 장면 재구성 |
+| test_terrain_window | 3 | 12 s | 움직이는 지형 창 |
+| test_lidar | 5 | 56 s | LiDAR 재현, 지형 표면, 자기 몸 제외 |
+| test_perception | 6 | 20 s | 높이 지도, 디딜 곳, height_scan 규약 |
+| test_ros_equivalence | 4 | 61 s | ROS 노드 = 같은 프로세스 (트롯, 정책 2종, 지형 인지) |
+| test_cosim | 7 | 50 s | Chrono 연동, 바퀴 자국, 로봇 발자국 |
+| test_dis_console | 12 | 111 s | DIS 콘솔, 고장, 제어권·인증, HMMWV·흙, 비트 단위 재실행 |
+| test_rt_core | 11 | 168 s | C++ 코어: 비트 동일, 두뇌 연결 방식, 실시간, LiDAR, Chrono |
+
+- 실시간이 들어간 비교는 가끔 흔들린다: 2026-10-11 재실행에서 `test_rt_core`의 `test_dis_console_on_rt_core`가 한 번 실패했다
+  (실시간 실행 전진 0.976 m, Python 재현 0.978 m, 늦은 명령 0). 바로 다시 돌리면 통과했다 (0.978 = 0.978). 원인은 아직 모른다.
 
 시나리오 값은 파일을 고치지 않고 `--set 키=값`으로 바꿀 수 있다 (여러 번 가능, 없는 키는 오류, 바꾼 값은 기록 메타데이터에 남음).
 `python -m sim.sweep <시나리오> --param <키> --values ...`는 값 하나를 바꿔 가며 MOP 비교표(`runs/sweep_*.csv`)를 만든다.
@@ -155,6 +184,87 @@ python conformance/test_ros_equivalence.py     # 두 실행이 같은 MOP를 내
 - 이 지연을 넣으면 같은 프로세스 실행과 ROS 노드 실행의 MOP가 소수 셋째 자리까지 같다 (트롯, 두 정책 모두 확인).
   그래서 학습과 대량 시험은 빠르고 결정적인 같은 프로세스로 하고, 최종 판정 MOP는 `--controller-node`로 남긴다.
 - 실기에서는 지연이 일정하지 않으므로, 학습 때는 지연을 0~2주기에서 무작위로 바꾼다 (`train/imitate_trot.py`).
+
+### 통계적 명령 지연: lockstep에서 실시간과 비슷한 지연 패턴 (2026-10-11)
+
+고정 지연만 쓰면 lockstep 시험의 명령은 언제나 정확히 한 주기 늦다. 실시간 실행과 실제 링크에서는 가끔 더 늦거나 사라진다.
+시나리오 `control_link`에 분포를 주면 명령마다 추가 지연을 뽑아, 그 "가끔 늦는" 상황을 결정적으로(시드로) 재현한다 (`sim/link_jitter.py`).
+
+```bash
+python -m sim.runner scenarios/flat_trot_jitter.yaml                            # 이 PC 실측 분포 (ROS2 두뇌, 아래 표)
+python -m sim.runner scenarios/rough_rut.yaml --set 'control_link.extra_steps_probs=[0.05,0.02]' --set control_link.drop_probability=0.01   # 거친 링크
+python -m sim.sweep scenarios/rough_rut.yaml --param seed --values 0 1 2 3 4 --set 'control_link.extra_steps_probs=[0.004]'           # 시드 여러 개로 통계 비교
+python conformance/test_link_jitter.py                                          # 시험 (약 5초)
+```
+```yaml
+control_link:
+  latency_steps: 1               # 기본 지연 (지금과 같음)
+  extra_steps_probs: [0.004]     # 명령마다 +1주기, +2주기, ... 늦을 확률 (실측 히스토그램을 그대로)
+  # late_probability: 0.02       # 또는 약식: 늦을 확률, 늦으면 1..max_extra_steps 주기 균등 (extra_steps_probs와 함께 쓰지 않음)
+  # max_extra_steps: 2
+  drop_probability: 0.0          # 명령이 사라질 확률 (무선 손실)
+```
+- **로봇 쪽 규칙**은 C++ 코어와 같다: 도착한 명령 중 가장 새 것(계산에 쓴 상태 시각이 가장 늦은 것)을 실행하고, 지금 실행 중인 것보다
+  오래된 명령은 버린다(뒤늦게 와서 추월당한 명령). 새 명령이 없으면 마지막 명령을 유지한다. 링크 두절 전에 보낸 명령은 복구 뒤 버린다.
+  그래서 +2주기로 뽑힌 명령도 다음 명령에 추월당하면 실행되지 않고, 실행한 명령의 나이는 대개 20 ms, 가끔 40 ms다.
+- **결정성**: 난수는 시나리오 시드로 정해진다 (같은 시드 = 같은 지연 순서). 센서 잡음 난수와 따로 뽑으므로 지연을 켜도 잡음 순서는 같다.
+  분포를 주지 않으면 이전 고정 지연 경로 그대로다 (flat_trot 시계열 비트 동일 확인).
+- **`--set control_link...`**: `control_link`가 없는 시나리오에도 만들 수 있다 (`OPTIONAL_SECTIONS`). 목록 값은 따옴표로 감싼다.
+- **MOP**: `cmd_late_steps`(실행한 명령이 기본 지연보다 오래된 주기 수, `sim.rt_link` 실시간 MOP와 같은 뜻, 모든 실행에 나옴),
+  지연을 켰을 때 `link_cmds_sent / late / dropped / stale`, `link_extra_steps_hist`. 기록 메타데이터 `control_link.jitter`에 분포가 남는다.
+- **적용 범위**: `sim.runner`의 같은 프로세스 실행 전용. `--controller-node`(별도 ROS2 노드)는 실제 지연을 쓰므로 무시하고 알린다.
+  `sim.rt_link`(C++ 코어)는 이 설정이 있으면 실행하지 않는다 (실시간은 실제 지연, lockstep 비트 동일 비교가 깨지므로).
+
+**이 PC 실측 분포** (C++ 실시간 코어 `sim.rt_link`, flat_trot, 시스템 튜닝 없음, 시작 0.5초 제외. 기록의 `cmd_state_t`로 셈):
+
+| 두뇌 | 실행 | 제어 주기 | +1주기 | +2주기 이상 |
+|---|---|---|---|---|
+| inproc | 12초 | 600 | 0 | 0 |
+| shm | 12초, 지형 인지 60초 | 약 3600 | 0 | 0 |
+| ros (같은 PC) | 12초, 60초 ×2 | 6548 | 27 (0.41%) | 0 |
+| ros, 지형 인지 | 60초 | 2976 | 0 | 0 |
+
+`flat_trot_jitter.yaml`의 `[0.004]`는 ros 두뇌의 값이다. 다른 PC의 두뇌나 무선 링크는 그 장비에서 같은 방법으로 재서 넣는다.
+
+**예 (rough_rut, 시드 0~4, 시드는 지형과 지연 순서를 함께 바꿈)**:
+
+| 링크 | 넘어짐 | 전진 평균 (m) | 측방 표류 절댓값 평균 (m) | CoT 평균 |
+|---|---|---|---|---|
+| 고정 한 주기 | 0/5 | 3.96 | 0.16 | 3.87 |
+| 실측 `[0.004]` | 0/5 | 3.94 | 0.35 | 3.80 |
+| 거친 링크 `[0.05, 0.02]` | 0/5 | 3.65 | 0.39 | 4.35 |
+
+- 0.4%만 늦어도 개별 실행 결과는 바뀐다 (걸음이 조금씩 달라지며 퍼짐). 그래서 한 번의 실행으로 비교하지 말고 시드 여러 개로 본다.
+- 이 규칙 기반 트롯은 5~7% 늦는 링크에서도 넘어지지 않지만 전진이 줄고 표류와 CoT가 는다.
+
+**구조와 `--rviz`: 실시간처럼 보여도 lockstep이다.**
+
+```
+           시나리오 yaml (+ control_link 지연 분포)
+                │
+                ▼
+  제어기 ◄──[링크 지연 모델]──► runner ◄──► MuJoCo (물리 10스텝 = 제어 1주기 20 ms)
+ (트롯 두뇌)                     │   └─ 벽시계 페이싱: 계산이 앞서면 sleep (--realtime, --rviz면 자동)
+  같은 프로세스                  │
+                    ┌────────────┼────────────┐
+                    ▼            ▼            ▼
+              RViz (ROS2 토픽)  MOP 계산    runs/ 기록
+              (보여주기만)
+```
+- `--rviz`를 주면 `--realtime`이 자동으로 켜진다. runner는 한 제어 주기를 계산한 뒤, 시뮬레이션 시각이 벽시계보다 앞서 있으면
+  그만큼 잠든다. 이 PC에서 한 주기 계산은 20 ms보다 훨씬 짧아 화면이 실제 시간 속도로 흐른다. 속도를 맞추는 것은 RViz가 아니라 runner다.
+- 계산 순서는 그대로이고 기다리기만 넣으므로 결과는 `--rviz` 없이 돌린 것과 같다 (두뇌가 같은 프로세스, 지연은 시드로 결정).
+  통계적 지연을 켜도 마찬가지다. 한 주기 계산이 20 ms를 넘으면(Chrono 시나리오 등) 화면만 느려지고 결과는 같다.
+
+| | `sim.runner --rviz` | `sim.rt_link` 실시간 |
+|---|---|---|
+| 시간 기준 | 시뮬레이션 시각 (벽시계에 맞춰 늦출 뿐) | 벽시계 (몸은 기다리지 않음) |
+| 두뇌가 늦으면 | 다 계산할 때까지 기다림 | 지난 명령으로 진행 (실제로 늦음) |
+| 계산이 20 ms를 넘으면 | 화면이 느려짐 (`late_control_steps`), 결과는 같음 | 주기 초과, 결과가 달라짐 |
+| 지연 | 고정 한 주기, 또는 시드로 뽑은 통계적 지연 | 실제 지연 |
+
+즉 `sim.runner --rviz`는 lockstep을 사람이 볼 수 있는 속도로 재생하는 것이고, 통계적 지연은 그 lockstep 안에서 `sim.rt_link` 실시간의
+지연 패턴을 흉내 낸다.
 
 ## 센서: LiDAR (문서 §8)
 
@@ -1278,20 +1388,7 @@ python -m sim.rt_link scenarios/flat_trot.yaml --brain ros --remote-brain --ros-
 
 ## 검토 중인 아이디어 (결정 전)
 
-**lockstep의 명령 지연을 통계적으로 흉내 내기** (2026-10-09 논의, 진행 여부 미정)
-- 지금 lockstep(같은 프로세스) 시험의 명령 지연은 한 주기(20 ms) 고정이다. 실시간에서는 가끔 더 늦는다
-  (실시간 코어 30초 측정: 1500주기 중 0~1번 40 ms). 학습은 이미 에피소드마다 0~2주기 무작위 지연을 쓴다.
-- 안: 시나리오 `control_link`에 주기마다 명령이 더 늦을 확률, 최대 추가 지연, 손실 확률을 넣는다. 늦은 주기에는 실제 로봇처럼
-  직전 명령을 한 번 더 쓴다.
-  ```yaml
-  control_link:
-    latency_steps: 1          # 기본 지연 (지금과 같음)
-    late_probability: 0.001   # 주기마다 한 주기 더 늦을 확률
-    max_extra_steps: 2
-    drop_probability: 0.0     # 명령이 사라질 확률 (무선 손실)
-  ```
-- 조건: 난수는 시나리오 시드로 정해 재현 가능해야 하고(같은 시드 = 같은 지연 순서), 분포는 실제 장비에서 잰 값을 넣는다.
-- 기대 효과: 실시간에서만 보이던 "가끔 늦는" 상황을 lockstep에서 재현 가능하게, 시드 여러 개로 통계 비교한다.
+(지금 없음. lockstep의 통계적 명령 지연은 2026-10-11 구현: 위 "통계적 명령 지연")
 
 ## 저사양을 고려해 의도적으로 뺀 것
 

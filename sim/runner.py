@@ -27,6 +27,7 @@ import yaml
 
 from .adapters import quat_to_roll_pitch, quat_to_yaw
 from control.node import ControllerNode
+from .link_jitter import make_link_jitter
 from .model_builder import ROOT, TERRAIN_BODY, build_model
 from .recorder import Recorder
 from .robot_io import RobotIO
@@ -38,6 +39,7 @@ FAULTS = ("lidar_blackout", "link_loss", "imu_bias", "battery_low")
 CONTROL_ACTIONS = ("freeze", "stop")      # 실행 제어: 물리에 영향 없음. 다시 실행할 시나리오에서는 뺀다 (stop은 duration으로)
 
 SIM_VERSION = "0.3.0"
+OPTIONAL_SECTIONS = ("control_link",)   # 시나리오에 없어도 --set으로 만들 수 있는 절
 TERRAIN_COMMIT_HZ = 5.0       # 지형 갱신은 수 Hz로 충분 (문서 §5.3)
 FALL_HEIGHT = 0.04            # 몸통 높이(지면 기준)가 이보다 낮으면 넘어짐 (몸통이 땅에 박힘). 넘어짐은 주로 기울기로 판정한다.
                               # 똑바로 엎드린 자세(다리 모양에 따라 0.08~0.14 m)는 넘어짐이 아니다: 링크 두절 감쇠 모드 뒤 일어설 수 있다.
@@ -87,14 +89,15 @@ def parse_value(text):
 
 def apply_overrides(scn, sets):
     """시나리오 dict에 'a.b.c=값' 목록을 적용한다. 없는 키는 오류 (오타로 조용히 무시되는 것을 막는다).
-    원래 시나리오에서 값이 null인 절 아래에는 새 키를 만들 수 있다 (켜고 끄는 선택 기능용, 예: controller.perception)."""
+    원래 시나리오에서 값이 null인 절 아래에는 새 키를 만들 수 있다 (켜고 끄는 선택 기능용, 예: controller.perception).
+    OPTIONAL_SECTIONS(예: control_link)는 시나리오에 없어도 만들 수 있다."""
     orig, scn = scn, copy.deepcopy(scn)
     for item in sets or []:
         key, _, text = item.partition("=")
         *path, leaf = key.strip().split(".")
         node, src, opened = scn, orig, False
-        for k in path:
-            if not opened and isinstance(src, dict) and k in src and src[k] is None:
+        for i, k in enumerate(path):
+            if not opened and isinstance(src, dict) and (k in src and src[k] is None or i == 0 and k in OPTIONAL_SECTIONS and k not in src):
                 opened = True
             src = src.get(k) if isinstance(src, dict) else None
             if k not in node or node[k] is None:
@@ -213,6 +216,7 @@ class Simulation:
         link = {**self.spec.get("link", {}), **self.scn.get("control_link", {})}
         self.link_latency = int(link.get("latency_steps", 0))
         self.link_queue = deque()
+        self.link_jitter = make_link_jitter(link, self.scn.get("seed", 0))   # 통계적 추가 지연, 손실 (없으면 None: 고정 지연)
         self.command = (0.0, 0.0)     # 운용자 이동 명령 (마지막 값)
         self.events = sorted((dict(e) for e in self.scn.get("events", [])), key=lambda e: e["t"])
         self.event_log = []         # 적용된 이벤트 (applied_t 포함). 콘솔 이벤트까지 넣어 다시 실행할 수 있는 시나리오를 만든다
@@ -402,11 +406,18 @@ class Simulation:
         self.low_state = self.robot.read()
         if "link_loss" in self.faults:         # 제어 링크 두절: 상태가 알고리즘에 가지 않고 명령도 오지 않는다
             self.low_cmd = self.fallback_cmd()
+            if self.link_jitter is not None:   # 두절 전에 보낸 명령은 복구 뒤 실행하지 않는다 (C++ 코어와 같다)
+                self.link_jitter.inflight.clear()
         elif self.remote is None:
-            self.link_queue.append(self.controller.step(self.low_state))
-            # ROS 배치와 같은 지연: 지연 주기만큼 쌓인 뒤부터 실행. 그 전에는 기본 자세 유지 (첫 명령 전 ROS와 같음),
-            # 링크가 복구된 직후에는 마지막 명령 유지
-            self.low_cmd = self.link_queue.popleft() if len(self.link_queue) > self.link_latency else self.fallback_cmd()
+            cmd = self.controller.step(self.low_state)
+            if self.link_jitter is None:
+                self.link_queue.append(cmd)
+                # ROS 배치와 같은 지연: 지연 주기만큼 쌓인 뒤부터 실행. 그 전에는 기본 자세 유지 (첫 명령 전 ROS와 같음),
+                # 링크가 복구된 직후에는 마지막 명령 유지
+                self.low_cmd = self.link_queue.popleft() if len(self.link_queue) > self.link_latency else self.fallback_cmd()
+            else:
+                k = round(self.data.time / (self.decim * self.model.opt.timestep))   # 제어 스텝 번호
+                self.low_cmd = self.link_jitter.deliver(k, cmd, self.link_latency) or self.fallback_cmd()
         else:                                  # 별도 노드: 상태를 보내고, 마지막으로 받은 명령을 실행 (실제 로봇처럼)
             prev = self.prev_state_t
             if prev is not None:               # 직전 상태의 명령을 한 주기까지 기다린다 (실시간보다 늦어진 동안에도 노드에 계산 시간)
@@ -457,7 +468,8 @@ def run(args):
         "model_variant": args.variant,
         # 버전 조합 기록 (문서 §13.3)
         "control_link": {"mode": "ros_node" if getattr(args, "controller_node", False) else "in_process",
-                         "latency_steps": None if getattr(args, "controller_node", False) else sim.link_latency},
+                         "latency_steps": None if getattr(args, "controller_node", False) else sim.link_latency,
+                         "jitter": sim.link_jitter.config() if sim.link_jitter and not getattr(args, "controller_node", False) else None},
         "versions": {"sim": SIM_VERSION, "spec": sim.spec["spec_version"],
                      "controller": sim.controller_desc, "mujoco": mujoco.__version__,
                      "model": sim.spec["robot"]["menagerie_commit"]},
@@ -518,6 +530,8 @@ def run(args):
             names = list(dict.fromkeys(list(scenario.get("sensors", [])) + list(getattr(args, "sensor", None) or [])))
             helpers.append(launch_sensor_node(out, names or ["front_lidar"]))
         if getattr(args, "controller_node", False):
+            if sim.link_jitter is not None:
+                print("control_link의 통계적 지연은 같은 프로세스 실행 전용이다. 별도 노드는 실제 ROS2 지연을 쓴다 (무시)")
             # 보행 알고리즘을 별도 노드로: 로봇 상태 토픽만 보고 관절 명령 토픽을 낸다 (실제 탑재 소프트웨어 형태)
             bridge.enable_robot_io()
             sim.remote = bridge
@@ -709,6 +723,9 @@ def run(args):
         "est_yaw_err_end_deg": round(float(np.degrees(est_err_yaw[-1])), 2) if est_err_yaw else None,
         "cmd_latency_ms_mean": round(1000 * float(np.mean(cmd_latency)), 1) if cmd_latency else None,
         "cmd_latency_ms_max": round(1000 * float(np.max(cmd_latency)), 1) if cmd_latency else None,
+        # 실행한 명령이 기본 지연(latency_steps)보다 오래된 제어 주기 수 (sim.rt_link의 실시간 MOP와 같은 뜻)
+        "cmd_late_steps": int((np.array(cmd_latency) > sim.link_latency * ctrl_dt + 1e-6).sum()) if cmd_latency else None,
+        **(sim.link_jitter.mop() if sim.link_jitter is not None and sim.remote is None else {}),
         "touchdowns": touchdowns,
         "edge_touchdowns": edge_touchdowns,
         "late_control_steps": late if (args.realtime or viewer) else None,
