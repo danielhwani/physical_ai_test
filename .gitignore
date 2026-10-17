@@ -18,3 +18,4 @@ __pycache__/
 # MJX 학습: 경로 확인용 작은 정책, 학습 파라미터
 policies/*_smoke/
 policies/*/params.pkl
+policies/go2_mjx_flat/
