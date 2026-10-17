@@ -348,7 +348,7 @@ def _runner_vs_rt(scn, brains, tmp, extra_npz=()):
 
 def test_foot_soil_matches_runner():
     """무른 흙 (foot_soil, C++ 코어의 같은 알고리즘): 지형 패치 이벤트가 있는 rough_rut(세 두뇌 연결 방식)과
-    지형 창 + 실행 중 자국 추가, 지역마다 다른 흙(진흙 띠)이 sim.runner와 기록·MOP까지 비트 단위로 같다."""
+    지형 창 + 실행 중 자국 추가, 지역마다 다른 흙(진흙 띠), 실행 중 흙 바꾸기(set_soil)가 sim.runner와 기록·MOP까지 비트 단위로 같다."""
     import shutil
     import tempfile
     tmp = Path(tempfile.mkdtemp())
@@ -366,6 +366,12 @@ def test_foot_soil_matches_runner():
         strip = yaml.safe_load((ROOT / "scenarios/soil_strip.yaml").read_text())
         strip["duration"] = 8.0
         mc = _runner_vs_rt(strip, ("inproc",), tmp / "strip")                      # 지역마다 다른 흙 (진흙 띠)
+        from dis_console.protocol import SOIL_PRESETS
+        chg = yaml.safe_load((ROOT / "scenarios/flat_trot.yaml").read_text())     # 실행 중 흙 바꾸기 (DIS 콘솔 soil)
+        chg["duration"], chg["foot_soil"] = 6.0, {"preset": "firm"}
+        chg["events"] = chg["events"] + [{"t": 3.0, "action": "set_soil", "preset": "mud", "soil": dict(SOIL_PRESETS["mud"])}]
+        md = _runner_vs_rt(chg, ("inproc", "shm"), tmp / "chg")
+        assert md["foot_sink_max_m"] > 0.06, md                                     # 진흙으로 바뀐 뒤 깊이 빠진다 (보통 흙은 약 3.5 cm)
         assert ma["foot_sink_mean_m"] > 0.005 and mb["plow_work_j"] > 0 and mc["foot_sink_by_soil"]["mud_strip"]["stances"] > 0, (ma, mb, mc)
         print(f"    무른 흙 (C++ 코어 lockstep = sim.runner): rough_rut firm 침하 {100 * ma['foot_sink_mean_m']:.1f} cm, "
               f"지형 창 soft 쟁기질 {mb['plow_work_j']:.0f} J")

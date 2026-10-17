@@ -309,15 +309,45 @@ def test_entity_and_soil_with_chrono():
         assert np.array_equal(sim2.data.qpos, qpos) and list(sim2.cosim.vehicle["pos"]) == vpos
     finally:
         sim2.close()
-    sim = _sim()                                    # Chrono 없는 시나리오: 거부
+    sim = _sim()                                    # Chrono도 무른 흙도 없는 시나리오: 거부
     con = _console(sim)
     try:
         _drive(sim, con, con.request(P.CONNECT))
-        for line in ("spawn", "soil mud"):
+        for line, code in (("spawn", "NO_CHRONO"), ("soil mud", "NO_SOIL")):
             st, body = _drive(sim, con, con.request(*parse_command(line)))
-            assert st == "DENIED" and body["reason_code"] == "NO_CHRONO", (line, body)
+            assert st == "DENIED" and body["reason_code"] == code, (line, body)
     finally:
         con.close(); sim.dis.close(); sim.close()
+
+
+def test_soil_changes_robot_foot_soil():
+    """무른 흙(foot_soil) 시나리오: 콘솔 soil 명령이 로봇 발의 기본 흙을 바꾼다 (Chrono 없이). 지역 흙은 그대로이고,
+    기록(scenario_replay.yaml)으로 다시 돌리면 같다."""
+    sim = _sim(["foot_soil.preset=firm"])
+    con = _console(sim)
+    try:
+        _drive(sim, con, con.request(P.CONNECT))
+        _drive(sim, con, con.request(*parse_command("cmd 0.4")))
+        _step(sim, 100)                             # 2초 보통 흙
+        firm = sim.foot_soil.soils[0]["params"]["bekker_kphi"]
+        st, body = _drive(sim, con, con.request(*parse_command("soil mud")))
+        assert st == "COMPLETED", body
+        fs = sim.foot_soil
+        assert fs.soils[0]["name"] == "mud" and fs.soils[0]["params"]["bekker_kphi"] < firm and abs(fs.soils[0]["friction"] - 0.364) < 1e-3
+        n0, s0 = fs.stance_n, fs.sink_sum
+        _step(sim, 100)                             # 2초 진흙
+        mud_sink = (fs.sink_sum - s0) / max(fs.stance_n - n0, 1)
+        assert mud_sink > 2.5 * s0 / max(n0, 1), (mud_sink, s0 / max(n0, 1))
+        replay, qpos = sim.replay_scenario(), sim.data.qpos.copy()
+    finally:
+        con.close(); sim.dis.close(); sim.close()
+    sim2 = Simulation(yaml.safe_load(yaml.safe_dump(replay, allow_unicode=True)))
+    try:
+        while sim2.data.time < sim.data.time - 1e-9:
+            _step(sim2)
+        assert np.array_equal(sim2.data.qpos, qpos)
+    finally:
+        sim2.close()
 
 def test_stand_up_after_link_loss():
     """감쇠 모드로 1초(주저앉음), 3초(배를 대고 엎드림) 끊긴 뒤 일어서서 다시 걷는다. 넘어짐 판정 없음.

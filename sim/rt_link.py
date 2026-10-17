@@ -146,6 +146,18 @@ class RtLink:
         mp = sim.data.mocap_pos[sim.terrain_mocap] if sim.terrain_mocap >= 0 else (0.0, 0.0, 0.0)
         return self.terrain.write(sim.model.hfield_data[self.hfield], mp, apply_step)
 
+    def send_soil(self, idx, sd, apply_step):
+        """무른 흙: 실행 중 흙 바꾸기 (흙 번호 idx를 sd로, apply_step 스텝 시작부터). 반환: 판 번호."""
+        u = self.shm.soil_update
+        s = u.seq
+        u.seq = s + 1
+        n = len(sd["z_tab"])
+        u.apply_step, u.idx = apply_step, idx
+        u.damping_r, u.bekker_n, u.friction, u.p_coef = sd["damping_r"], sd["n"], sd["friction"], sd["p_coef"]
+        u.z_tab[:n], u.f_tab[:n], u.a_tab[:n] = sd["z_tab"], sd["f_tab"], sd["a_tab"]
+        u.seq = s + 2
+        return s + 2
+
     def fill_noise(self, ahead):
         """표본 번호 (지금 코어 스텝 + ahead)까지 잡음을 채운다 (sensors/proprio.py와 같은 난수)."""
         upto = min(self.shm.stats.steps + ahead, self.shm.stats.steps + R.NOISE_RING - 1)
@@ -404,8 +416,12 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
                 sim.cosim.near_event_sent = False
             elif e["action"] == "remove_entity":
                 sim.cosim.remove_vehicle()
-            elif e["action"] == "set_soil":
-                sim.cosim.set_soil(e["soil"])
+            elif e["action"] == "set_soil":                       # Chrono 흙과 무른 흙의 기본 흙 (sim.runner와 같다)
+                if sim.cosim is not None:
+                    sim.cosim.set_soil(e["soil"])
+                if sim.foot_soil is not None:
+                    sd = sim.foot_soil.set_base_soil(e["soil"], e.get("preset", "custom"))
+                    pending_apply.append(("soil", link.send_soil(0, sd, step_next), step_next))
             if verbose:
                 print(f"[t={t_next:6.2f}] event: {e['action']}" + (f" {e.get('fault', '')}" if "fault" in e else "")
                       + (f"  (DIS {e['request']})" if e.get("source") == "dis" else ""))
@@ -617,7 +633,7 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
             energy += e.energy
             while pending_apply:                                   # 고장·지형 변경이 실제로 걸린 스텝
                 kind, seq, want = pending_apply[0]
-                if (e.fault_seq if kind == "fault" else e.terrain_seq) < seq:
+                if {"fault": e.fault_seq, "terrain": e.terrain_seq, "soil": e.soil_seq}[kind] < seq:
                     break
                 pending_apply.pop(0)
                 if e.step > want:

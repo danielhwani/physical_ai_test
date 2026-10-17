@@ -54,7 +54,7 @@ for f in specs conformance control link_jitter foot_soil policy render_stream te
   python conformance/test_$f.py || echo "실패: test_$f"
 done
 ```
-마지막 전체 실행 (2026-10-17, 흙 지역 화면 표시·shm lockstep 경쟁 조건 수정 후, 로봇 경계 메시지 auto = `go2_rt_msgs` typed): **90개 모두 통과, 약 9분.**
+마지막 전체 실행 (2026-10-17, DIS 콘솔 `soil`로 로봇 발 흙 바꾸기 추가 후, 로봇 경계 메시지 auto = `go2_rt_msgs` typed): **91개 모두 통과, 약 9분.**
 
 | 시험 파일 | 개수 | 시간 | 다루는 것 |
 |---|---|---|---|
@@ -70,7 +70,7 @@ done
 | test_perception | 6 | 20 s | 높이 지도, 디딜 곳, height_scan 규약 |
 | test_ros_equivalence | 4 | 61 s | ROS 노드 = 같은 프로세스 (트롯, 정책 2종, 지형 인지) |
 | test_cosim | 7 | 50 s | Chrono 연동, 바퀴 자국, 로봇 발자국 |
-| test_dis_console | 12 | 111 s | DIS 콘솔, 고장, 제어권·인증, HMMWV·흙, 비트 단위 재실행 |
+| test_dis_console | 13 | 111 s | DIS 콘솔, 고장, 제어권·인증, HMMWV·흙, 무른 흙 시나리오의 흙 바꾸기, 비트 단위 재실행 |
 | test_rt_core | 13 | 196 s | C++ 코어: 비트 동일, 두뇌 연결 방식, 실시간, 콘솔 요청 재실행(예약·즉시), LiDAR, Chrono, 무른 흙 |
 
 - 2026-10-11 오전 재실행에서 `test_dis_console_on_rt_core`가 한 번 실패했다 (실시간 0.976 m, Python 재현 0.978 m, 늦은 명령 0).
@@ -560,6 +560,61 @@ python -m sim.sweep scenarios/footprints.yaml --param chrono.scm.soil.bekker_kph
 흙의 힘이 로봇 발에 돌아오게 하는 선택 기능이다. 시나리오에 `foot_soil` 절이 없으면 이전과 같은 단단한 접촉이다(결과 비트 동일).
 흙 값과 식은 Chrono SCM(HMMWV 흙)과 같은 이름·같은 식을 쓴다.
 
+**땅이 파이는 세 가지 경로** (헷갈리기 쉬워서 정리):
+
+| 땅이 파이는 원인 | 계산하는 곳 | 어떤 시나리오 |
+|---|---|---|
+| `rut` 명령, 시나리오 `add_patch` (홈 패치) | 지형 지도 서비스(`sim/terrain_service.py`)가 정해진 모양(폭, 깊이)을 지형에 그림. 물리 계산이 아니라 지형 편집. Chrono 없음 | 모든 시나리오 (예: `dis_console.yaml`에서 콘솔 `rut`) |
+| HMMWV 바퀴 자국 | Chrono SCM이 차 무게와 흙 값으로 계산해 지형에 넣음 | `chrono.vehicle`이 있는 시나리오 (`dis_chrono`, `vehicle_crossing`) |
+| 로봇 발자국 | Chrono SCM 대리 구(`chrono.robot_feet`) 또는 무른 흙 모듈(`foot_soil`) (아래 표) | `footprints`, `dis_footprints` / `foot_soil`을 켠 시나리오 |
+
+**로봇 발자국의 두 방식**:
+
+| | Chrono 발자국 (`chrono.robot_feet`) | 무른 흙 (`foot_soil`) |
+|---|---|---|
+| 만든 때 | 2026-10-06 | 2026-10-11 ~ |
+| 흙 계산 | Chrono SCM (별도 프로세스). MuJoCo가 발 위치·하중을 보내면 대리 구가 흙을 누름 | 이 프로젝트의 흙 모듈 (`sim/foot_soil.py`, C++ 코어 `FootSoil`). MuJoCo와 같은 프로세스에서 물리 스텝마다 계산. MuJoCo 내장 기능이 아니다 (발과 받침판의 접촉·마찰만 MuJoCo가 푼다) |
+| 흙 식 | SCM | SCM과 같은 Bekker 식을 직접 적분 (SCM 기준값과 2.5 mm 안) |
+| 흙 -> 로봇 발 | 모양만 늦게 (파인 지형이 MuJoCo 지형에 5 Hz로). 발은 빠지지 않음 | 힘으로: 발이 빠지고, 흙별 마찰, 쟁기질 저항 |
+| 구멍이 남는 곳 | MuJoCo 지형(heightfield) 자체 -> LiDAR도 봄 | 흙 모듈의 구멍 지도 -> 물리에 쓰고 화면에는 화면 전용 토픽으로만 (LiDAR는 안 봄) |
+| 무게 | 무거움 (2 cm 격자, 1 ms 스텝. HMMWV와 함께면 이 PC에서 실시간의 0.06배라 `dis_chrono`와 `dis_footprints`를 나눔) | 가벼움 (실시간 계산 시간이 오히려 줄었음) |
+| 시나리오 | `footprints.yaml`, `dis_footprints.yaml` | `--set foot_soil.preset=...`를 붙인 아무 시나리오, `soil_strip.yaml` |
+
+둘은 같은 흙을 두 번 계산하게 되어 같이 켤 수 없다. HMMWV 바퀴 자국은 Chrono로, 로봇 발이 빠지는 것은 `foot_soil`로 하는 조합은 된다
+(예: `python -m sim.rt_link scenarios/dis_chrono.yaml --dis-port 3000 --dis-wait --brain shm --rviz --set foot_soil.preset=firm`).
+
+**무엇을 라이브러리가 하고 무엇을 직접 만들었나** (`foot_soil`): MuJoCo는 단단한 물체끼리의 접촉·마찰을 푸는 엔진이라 흙이 눌려 파이고
+모양이 남는 변형 지면은 계산하지 않는다. Chrono SCM은 흙을 아래로 쏜 광선으로만 봐서 흙 속을 옆·위로 지나가는 저항이 없다.
+그래서 흙 쪽은 직접 만들고, 접촉·마찰만 MuJoCo에 맡겼다.
+
+| 하는 일 | 누가 |
+|---|---|
+| 발과 받침판 사이 접촉력, 마찰 (안정적으로 풀어야 하는 부분) | MuJoCo |
+| 받침판을 얼마나 내릴지 (발이 누르는 힘 vs 흙 지지력. Bekker 식 적분, 소성 침하) | 직접 코딩한 흙 모듈 |
+| 발을 든 자리에 구멍 남기기, 다시 디디면 구멍 바닥부터 받치기 | 흙 모듈 (구멍 지도) |
+| 흙 속을 지나가는 발의 저항 (쟁기질, 수평·위) | 흙 모듈 (MuJoCo 외력 칸에 넣음) |
+| 흙별 마찰, 지역별 흙, 실행 중 흙 바꾸기 | 흙 모듈 (받침판 마찰계수를 바꿈) |
+| 화면에 구멍 보이기 | 흙 모듈이 화면 전용 토픽으로 보냄 -> RViz·MuJoCo 화면이 그림 (MuJoCo 지형 자체는 파이지 않아 LiDAR는 안 봄) |
+
+흙 식의 모양과 흙 값 이름은 SCM을 따랐고, 맞는지는 Chrono SCM으로 잰 기준값으로 확인했다 (2.5 mm 안).
+처음에는 흙 힘을 발에 직접 거는 방식으로 만들었는데 2 ms 스텝에서 불안정해(단단한 흙에서도 걷지 못함), 어려운 접촉·마찰은 MuJoCo에
+맡기고 흙 모듈은 받침판 높이만 조절하는 지금 방식으로 바꿨다 (Chrono 발 대리 구와 같은 생각).
+
+쟁기질 (수평·위, 직접 코딩):
+
+| | 내용 |
+|---|---|
+| 언제 | 발이 흙 표면(구멍 포함) 아래로 잠긴 채 움직일 때 |
+| 수평 | 잠긴 부분의 정면 면적(원의 활꼴) × 그 깊이의 Bekker 압력 × `plow_ratio`, 수평 속도의 반대 방향 |
+| 위쪽 | 흙에 덮인 윗면을 위에서 본 면적 × 같은 압력 × `plow_ratio`, 올라가는 속도의 반대 방향. 자기 구멍 안에서 곧게 빼면 0 |
+| 아래쪽 | 쟁기질이 아니라 받침판(MuJoCo 접촉)이 맡음 |
+| 안정화 | 한 스텝에 그 방향 발 끝 속도를 0으로 만드는 힘(유효 질량 × 속도 / dt)을 넘지 않게 자름. 유효 질량은 MuJoCo 자코비안(`mj_jac`)과 질량행렬 풀이(`mj_solveM`)로 계산 |
+| 거는 방법 | 계산한 힘을 MuJoCo 외력 칸(`qfrc_applied`)에 넣어 다음 스텝에 반영 |
+
+바탕은 입상 매질 다리 운동의 저항력 이론(RFT)에서 "깊이에 따라 커지고 방향에 따라 다른 저항"이라는 꼴만 빌려 왔다. 크기를 정하는
+`plow_ratio`(기본 1)는 실측이나 다른 기준으로 맞추지 않았으므로 무른 흙 결과는 비율 0.25~1 범위로 보고한다 (아래).
+MuJoCo는 여기서도 계산 도구(자코비안, 질량행렬, 외력 칸)만 제공한다.
+
 ```bash
 python -m sim.runner scenarios/flat_trot.yaml --set foot_soil.preset=firm          # hard / firm / soft / mud (DIS 흙 프리셋과 같음)
 python -m sim.runner scenarios/rough_rut.yaml --set foot_soil.preset=soft --rviz
@@ -874,7 +929,7 @@ python -m dis_console.console --send "cmd 0.35" --send "rut 3.0 @12"
 | `Event_ClearFault` | `fault`, (`t_apply`) | 고장 해제. 걸려 있지 않으면 거부 `FAULT_NOT_ACTIVE` |
 | `Event_CreateEntity` | `entity_type`(HMMWV), `speed`, `cross_ahead`, (`t_apply`) | 개체 투입 (Chrono 시나리오, 아래 설명). `cross_ahead`: 로봇 앞을 지나가도록 출발 시각 자동 |
 | `Event_RemoveEntity` | `entity_type`, (`t_apply`) | 개체 제거: 제동하고 숨김 |
-| `Event_SetSoil` | `preset`(hard/firm/soft/mud) 또는 `soil`(SCM 값 8개), (`t_apply`) | 흙 상태 (Chrono SCM, 이후 생기는 변형에 적용) |
+| `Event_SetSoil` | `preset`(hard/firm/soft/mud) 또는 `soil`(SCM 값 8개), (`t_apply`) | 흙 상태 (Chrono SCM, 이후 생기는 변형에 적용. 무른 흙 `foot_soil`이면 로봇 발의 기본 흙도) |
 | `Event_Freeze` / `Event_Resume` | (`t_apply`) / – | 일시정지 / 재개. 재개는 바로 (정지 중에는 시뮬레이션 시각이 멈춤) |
 | `Event_Stop` | (`t_apply`) | 시험 종료: 기록과 MOP 저장 (`stopped_by_console`) |
 | `Report_SimStatus` (Data PDU, 0.2 s) | – | 시뮬레이션 시각, 로봇 위치·방향(시험 판정자 쪽 참값), 명령, 마지막 이벤트, 고장(남은 시간), 일시정지, 차량, 링크 상태 |
@@ -982,7 +1037,20 @@ RViz 정보판에 `FAULT:이름(남은 초)`가 빨간 글씨로 나온다. 센�
 - 흙: `soil hard|firm|soft|mud`. HMMWV 자국 깊이 약 1.8 / 5.5 / 15 cm, mud는 더 무르고 미끄럽다. 이후 생기는 변형부터 적용된다.
   확인: `soil soft` 뒤 투입한 HMMWV가 14.7 cm 자국을 남겼다.
 - 투입·흙 명령은 다음 Chrono 교환 구간(0.04 s)부터 적용된다. 교환 시각이 시뮬레이션 시각으로 정해져 있어 기록으로 다시 돌리면
-  로봇과 차량 위치가 비트 단위로 같다 (`test_entity_and_soil_with_chrono`). Chrono 없는 시나리오에서는 거부(`NO_CHRONO`).
+  로봇과 차량 위치가 비트 단위로 같다 (`test_entity_and_soil_with_chrono`). Chrono 없는 시나리오에서 투입은 거부(`NO_CHRONO`),
+  흙은 무른 흙(`foot_soil`)도 없을 때만 거부(`NO_SOIL`).
+- **무른 흙 시나리오에서 `soil`** (2026-10-17): 로봇 발의 기본 흙(지역 밖)을 바꾼다. 직접 정한 지역 흙(`regions`)은 그대로이고,
+  Chrono가 있으면 Chrono 흙도 함께 바뀐다. 다른 이벤트처럼 적용 스텝부터 (디딤 중인 발도 그 스텝부터 새 흙).
+  ```bash
+  python -m sim.rt_link scenarios/soil_strip.yaml --dis-port 3000 --dis-wait --brain shm --rviz --set 'events=[]'   # 터미널 1 (sim.runner도 된다)
+  python -m dis_console.console --sim 127.0.0.1:3000                                            # 터미널 2: cmd 0.4, soil soft, end @20
+  ```
+  `soil_strip.yaml`에는 1초에 걷기 시작하는 시나리오 이벤트가 있어 그대로 띄우면 콘솔 명령 없이도 걷는다 (`--dis-wait`는 접속할 때까지
+  시작만 미룬다). 콘솔로만 조종하려면 `--set 'events=[]'`로 이벤트를 비운다 (콘솔용 `dis_console.yaml`, `dis_chrono.yaml`은 처음부터 비어 있다).
+  C++ 코어에는 관리 프로세스가 새 흙의 지지력 표를 계산해 공유 메모리(`soil_update`, 규약 13판)로 그 스텝에 보낸다. 표 계산을 배열로 바꿔
+  9.8 -> 0.6 ms로 줄였다 (처음에는 실시간에서 1스텝 늦게 걸려 재실행과 달랐다: 1.141 vs 1.165 m). 지금은 실시간 콘솔로 바꿔도 늦게 걸린 변경 0,
+  재실행과 같다 (3번 확인). lockstep에서는 `sim.runner`와 비트 단위로 같다 (`test_foot_soil_matches_runner`, 3초에 진흙으로).
+  흙별 MOP(`foot_sink_by_soil`)의 기본 흙 항목은 바뀌기 전후를 합쳐 세고 이름은 마지막 흙이다 (흙 바꾼 시각은 기록의 이벤트에 남는다).
 - 이 PC에서 HMMWV가 달리는 동안은 실시간의 약 0.87배로 돈다.
 
 - **좌표**: 시뮬레이터 세계 좌표 (원점 = 로봇 출발점, +x = 처음 바라본 방향, +y = 왼쪽, m). `dis_console` 시나리오의 지형은 ±30 m이고,
@@ -1745,8 +1813,8 @@ python -m sim.rt_link scenarios/flat_trot.yaml --brain ros --remote-brain --ros-
 - 방법은 A(MuJoCo 안에서 흙 식)로 했다. B(Chrono 발 대리 구 쌍방향)는 두 엔진이 1~2 ms마다 주고받아 이 PC에서 너무 느리고,
   C(로봇 전체를 Chrono로)는 시험 환경 대부분을 다시 맞춰야 한다. SCM은 1단계 기준값을 만드는 데만 썼다.
 - 쟁기질(흙 속을 옆이나 위로 지나가는 발의 저항)도 넣었다 (2026-10-11).
-- 남은 것: 쟁기질 비율 맞추기(실측 또는 다른 기준), 탄성 되튐·Janosi 미끄럼, DIS 콘솔 `soil` 명령으로 로봇 발 흙 바꾸기.
-  발자국 화면 표시, C++ 실시간 코어(4단계), 지역마다 다른 흙(2026-10-17)은 했다.
+- 남은 것: 쟁기질 비율 맞추기(실측 또는 다른 기준), 탄성 되튐·Janosi 미끄럼.
+  발자국 화면 표시, C++ 실시간 코어(4단계), 지역마다 다른 흙, DIS 콘솔 `soil`로 로봇 발 흙 바꾸기(2026-10-17)는 했다.
 
 ## 검토 중인 아이디어 (결정 전)
 

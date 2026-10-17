@@ -264,8 +264,11 @@ class Simulation:
                 self.cosim.near_event_sent = False
             elif e["action"] == "remove_entity":
                 self.cosim.remove_vehicle()
-            elif e["action"] == "set_soil":
-                self.cosim.set_soil(e["soil"])
+            elif e["action"] == "set_soil":         # 흙 바꾸기: Chrono 흙(HMMWV)과 무른 흙 발 상호작용의 기본 흙
+                if self.cosim is not None:
+                    self.cosim.set_soil(e["soil"])
+                if self.foot_soil is not None:
+                    self.foot_soil.set_base_soil(e["soil"], e.get("preset", "custom"))
             elif e["action"] == "freeze":
                 self.frozen = True
             elif e["action"] == "stop":

@@ -11,7 +11,7 @@ import os
 import time
 from pathlib import Path
 
-MAGIC, VERSION = 0x47324F52, 12
+MAGIC, VERSION = 0x47324F52, 13
 NJ, NQ, NV, NOISE_DIM, NOISE_RING, TRUTH_RING, OP_RING = 12, 19, 18, 36, 4096, 1024, 32
 NBODY_MAX, SCAN_MAX_PTS = 16, 32768
 SOIL_TAB, STAMP_RING, MAX_SOILS, MAX_REGIONS = 600, 256, 4, 8
@@ -76,13 +76,19 @@ class TruthEntry(C.Structure):
                 ("fault_seq", C.c_uint64), ("terrain_seq", C.c_uint64),
                 ("soil_zp", arr(D, 4)), ("soil_xy", arr(D, 8)), ("plow_work", D), ("plow_work_up", D), ("sink_sum", D),
                 ("sink_max", D), ("slip_sum", D), ("stance_n", C.c_uint64), ("sink_by", arr(D, MAX_SOILS)),
-                ("n_by", arr(C.c_uint64, MAX_SOILS)),
+                ("n_by", arr(C.c_uint64, MAX_SOILS)), ("soil_seq", C.c_uint64),
                 ("body_xpos", arr(D, NBODY_MAX * 3)), ("body_xquat", arr(D, NBODY_MAX * 4))]
 
 
 class Stats(C.Structure):
     _fields_ = [("steps", C.c_uint64), ("overruns", C.c_uint64), ("noise_underruns", C.c_uint64), ("done", C.c_uint64),
                 ("locked", C.c_uint64), ("rt_ok", C.c_uint64), ("max_wake_us", D), ("max_compute_us", D)]
+
+
+class SoilUpdate(C.Structure):
+    _fields_ = [("seq", C.c_uint64), ("apply_step", C.c_int64), ("idx", C.c_int32), ("pad", C.c_int32), ("damping_r", D),
+                ("bekker_n", D), ("friction", D), ("p_coef", D), ("z_tab", arr(D, SOIL_TAB)), ("f_tab", arr(D, SOIL_TAB)),
+                ("a_tab", arr(D, SOIL_TAB))]
 
 
 class SoilStamp(C.Structure):
@@ -93,14 +99,15 @@ class Shm(C.Structure):
     _fields_ = [("magic", C.c_uint32), ("version", C.c_uint32), ("size", C.c_uint64), ("cfg", Config), ("ctl", Control),
                 ("stats", Stats), ("state", LowState), ("cmd", LowCmd), ("est", Estimate), ("op_head", C.c_uint64), ("op", arr(OpEntry, OP_RING)),
                 ("noise_head", C.c_uint64), ("noise", arr(NoiseEntry, NOISE_RING)), ("truth_head", C.c_uint64),
-                ("truth", arr(TruthEntry, TRUTH_RING)), ("stamp_head", C.c_uint64), ("stamp", arr(SoilStamp, STAMP_RING))]
+                ("truth", arr(TruthEntry, TRUTH_RING)), ("stamp_head", C.c_uint64), ("stamp", arr(SoilStamp, STAMP_RING)),
+                ("soil_update", SoilUpdate)]
 
 
 def layout():
     """rt_core --layout과 같은 형식의 위치·크기."""
     out = {name: [getattr(Shm, name).offset, getattr(Shm, name).size]
            for name in ("cfg", "ctl", "stats", "state", "cmd", "op_head", "op", "noise_head", "noise", "truth_head", "truth",
-                        "stamp_head", "stamp")}
+                        "stamp_head", "stamp", "soil_update")}
     sub = {"cfg.qpos0": (Shm.cfg, Config.qpos0), "cfg.torque_limit": (Shm.cfg, Config.torque_limit),
            "ctl.torque_scale": (Shm.ctl, Control.torque_scale), "state.foot_force": (Shm.state, LowState.foot_force),
            "cmd.tau_ff": (Shm.cmd, LowCmd.tau_ff), "truth[0].wake_us": (Shm.truth, TruthEntry.wake_us),

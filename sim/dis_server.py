@@ -206,8 +206,11 @@ class DisScenarioServer:
                 e["action"] == "inject_fault" and e["fault"] == p.body.get("fault") for e in self.sim.events):
             return self._reject(h, key, "DENIED", "FAULT_NOT_ACTIVE")
         cosim = self.sim.cosim
-        if p.type in (P.CREATE_ENTITY, P.REMOVE_ENTITY, P.SET_SOIL) and cosim is None:
-            return self._reject(h, key, "DENIED", "NO_CHRONO", "개체·흙은 Chrono 시나리오에서만 (예: scenarios/dis_chrono.yaml)")
+        if p.type in (P.CREATE_ENTITY, P.REMOVE_ENTITY) and cosim is None:
+            return self._reject(h, key, "DENIED", "NO_CHRONO", "개체는 Chrono 시나리오에서만 (예: scenarios/dis_chrono.yaml)")
+        if p.type == P.SET_SOIL and cosim is None and getattr(self.sim, "foot_soil", None) is None:
+            return self._reject(h, key, "DENIED", "NO_SOIL", "흙은 Chrono 시나리오나 무른 흙(foot_soil) 시나리오에서만 "
+                                                             "(예: scenarios/dis_chrono.yaml, scenarios/soil_strip.yaml)")
         if p.type in (P.CREATE_ENTITY, P.REMOVE_ENTITY):
             if not cosim.has_vehicle:
                 return self._reject(h, key, "DENIED", "NO_ENTITY_SLOT", "시나리오 chrono.vehicle이 없다")

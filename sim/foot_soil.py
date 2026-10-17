@@ -92,16 +92,24 @@ def soil_list(cfg):
     return soils, regions
 
 
-def bearing(z, r, soil):
-    """깊이 z(구 바닥 기준)까지 들어간 반지름 r 구의 Bekker 지지력 (N)과 접촉 면적 (m²)."""
-    if z <= 0:
-        return 0.0, 0.0
-    a = math.sqrt(max(2 * r * z - z * z, 0.0)) if z < r else r
+def bearing_table(zs, r, soil):
+    """깊이 zs(구 바닥 기준, 배열)까지 들어간 반지름 r 구의 Bekker 지지력 (N)과 접촉 면적 (m²) 배열. 깊이 전체를 한 번에 계산한다
+    (실시간 관리 프로세스가 콘솔 흙 바꾸기 때 한 주기 안에 새 표를 만들도록)."""
+    z = np.asarray(zs, float)[:, None]
+    a = np.where(z < r, np.sqrt(np.maximum(2 * r * z - z * z, 0.0)), r)
     rho = (np.arange(RINGS) + 0.5) / RINGS * a
     s = np.maximum(z - (r - np.sqrt(r * r - rho * rho)), 0.0)
     dA = 2 * math.pi * rho * (a / RINGS)
-    p = (soil["bekker_kc"] / (2 * a) + soil["bekker_kphi"]) * np.power(s, soil["bekker_n"])
-    return float(np.sum(p * dA)), float(np.sum(dA))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        p = (soil["bekker_kc"] / (2 * a) + soil["bekker_kphi"]) * np.power(s, soil["bekker_n"])
+    p = np.where(z > 0, p, 0.0)
+    return np.sum(p * dA, axis=1), np.where(z[:, 0] > 0, np.sum(dA, axis=1), 0.0)
+
+
+def bearing(z, r, soil):
+    """깊이 z 하나의 지지력 (N)과 접촉 면적 (m²)."""
+    f, area = bearing_table([z], r, soil)
+    return float(f[0]), float(area[0])
 
 
 def front_area(h, r):
@@ -151,13 +159,8 @@ class FootSoil:
         self.gpos = [float(v) for v in m.geom_pos[self.tgeom]]
         # 흙마다: 지지력 표 (깊이 -> 지지력, 면적. 단조 증가라 힘 -> 깊이도 보간으로), 마찰, 감쇠, 쟁기질 계수. 코어에는 그대로 넘긴다
         z = [float(v) for v in np.concatenate([np.linspace(0, 0.03, 301)[1:], np.linspace(0.03, 0.3, 271)[1:]])]
-        self.soils = []
-        for name, sp, ratio in soils:
-            tab = [bearing(v, self.r, sp) for v in z]
-            self.soils.append({"name": name, "params": sp, "z_tab": z, "f_tab": [t[0] for t in tab], "a_tab": [t[1] for t in tab],
-                               "friction": math.tan(math.radians(sp["friction_deg"])), "damping_r": sp["damping_r"],
-                               "n": sp["bekker_n"], "plow_ratio": ratio,
-                               "p_coef": ratio * (sp["bekker_kc"] / (2 * self.r) + sp["bekker_kphi"])})   # 쟁기질 압력 = p_coef·h^n
+        self.z_grid = z
+        self.soils = [self._soil_entry(name, sp, ratio) for name, sp, ratio in soils]
         self.soil = self.soils[0]["params"]                     # 기본 흙 (예전 이름)
         self.plow = any(sd["p_coef"] > 0 for sd in self.soils)
         self.area_min = math.pi * (0.25 * self.r) ** 2
@@ -184,6 +187,24 @@ class FootSoil:
         for i, g in enumerate(self.feet):    # 시작: 받침판을 발 아래 흙 표면에
             x, y, zc = (float(v) for v in sim.data.geom_xpos[g])
             self._place(i, x, y, zc - self.r + 0.001)
+
+    def _soil_entry(self, name, sp, ratio):
+        z = self.z_grid
+        f, area = bearing_table(z, self.r, sp)
+        return {"name": name, "params": sp, "z_tab": z, "f_tab": [float(v) for v in f], "a_tab": [float(v) for v in area],
+                "friction": math.tan(math.radians(sp["friction_deg"])), "damping_r": sp["damping_r"],
+                "n": sp["bekker_n"], "plow_ratio": ratio,
+                "p_coef": ratio * (sp["bekker_kc"] / (2 * self.r) + sp["bekker_kphi"])}   # 쟁기질 압력 = p_coef·h^n
+
+    def set_base_soil(self, soil, name):
+        """기본 흙(지역 밖)을 바꾼다 (DIS 콘솔 soil 명령 -> set_soil 이벤트). 지역 흙은 그대로. 디딤 중인 발도 다음 물리 스텝부터 새 흙.
+        흙별 MOP의 기본 흙 항목은 바뀌기 전후를 합쳐 센다 (이름은 마지막 흙)."""
+        sp = dict(self.soils[0]["params"])
+        sp.update({k: float(v) for k, v in soil.items()})
+        self.soils[0] = self._soil_entry(name, sp, self.soils[0]["plow_ratio"])
+        self.soil = sp
+        self.plow = any(sd["p_coef"] > 0 for sd in self.soils)
+        return self.soils[0]
 
     def region_name_at(self, x, y):
         """(x, y)의 지역 이름 (화면 정보판용), 지역 밖이면 기본 흙 이름."""

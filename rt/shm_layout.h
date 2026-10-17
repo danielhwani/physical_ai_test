@@ -9,7 +9,7 @@
 namespace rtshm {
 
 constexpr uint32_t MAGIC = 0x47324F52;   // "RO2G"
-constexpr uint32_t VERSION = 12;
+constexpr uint32_t VERSION = 13;
 constexpr int NJ = 12;
 constexpr int NQ = 19, NV = 18;           // Go2 (자유 관절 + 12)
 constexpr int NOISE_DIM = 36;             // sensors/proprio.py ProprioSensors.NOISE_DIM
@@ -123,6 +123,7 @@ struct TruthEntry {                       // 코어 -> 관리 프로세스 (판�
   uint64_t stance_n;
   double sink_by[MAX_SOILS];              // 흙별 끝난 디딤의 침하 합, 수
   uint64_t n_by[MAX_SOILS];
+  uint64_t soil_seq;                      // 이 스텝이 쓴 흙 바꾸기 판 (SoilUpdate.seq)
   double body_xpos[NBODY_MAX * 3];        // 바디 위치·자세 (스텝 직후 값, 센서 렌더러가 쓴다)
   double body_xquat[NBODY_MAX * 4];       // w, x, y, z
 };
@@ -135,6 +136,15 @@ struct Stats {
   uint64_t locked;                        // mlockall 성공
   uint64_t rt_ok;                         // SCHED_FIFO 성공
   double max_wake_us, max_compute_us;
+};
+
+struct SoilUpdate {                       // 실행 중 흙 바꾸기 (DIS 콘솔 soil -> set_soil 이벤트). seqlock, apply_step 스텝 시작부터
+  uint64_t seq;
+  int64_t apply_step;
+  int32_t idx;                            // 바꿀 흙 번호 (0 = 기본 흙)
+  int32_t pad;
+  double damping_r, bekker_n, friction, p_coef;
+  double z_tab[SOIL_TAB], f_tab[SOIL_TAB], a_tab[SOIL_TAB];
 };
 
 struct SoilStamp {                        // 발을 든 자리의 구멍 (x, y, 소성 침하)
@@ -158,6 +168,7 @@ struct Shm {
   TruthEntry truth[TRUTH_RING];
   uint64_t stamp_head;                    // 무른 흙: 코어가 남긴 구멍 개수
   SoilStamp stamp[STAMP_RING];
+  SoilUpdate soil_update;                 // 무른 흙: 실행 중 흙 바꾸기
 };
 
 // 지형 공유 메모리 (<이름>_terrain): 관리 프로세스가 지형 높이를 바꾸면 쓴다 (자국 이벤트, 5 Hz 반영, 지형 창 이동).

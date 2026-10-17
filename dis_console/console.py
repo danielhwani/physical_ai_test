@@ -43,7 +43,7 @@ HELP = """명령 (좌표는 세계 좌표 m: 원점 = 로봇 출발점, +x = 처
   spawn [속도]                   HMMWV 투입 (Chrono 시나리오에 선언한 경로로 바로 출발, 기본 속도는 시나리오 값)
   spawn ahead [간격] [속도]      차가 로봇 앞 (간격, 기본 2.5) m 지점을 먼저 지나가도록 시뮬레이터가 출발 시각을 맞춤
   despawn                        HMMWV 제거 (제동하고 숨김)
-  soil <hard|firm|soft|mud>      흙 상태 (Chrono SCM)
+  soil <hard|firm|soft|mud>      흙 상태 (Chrono SCM, 무른 흙 foot_soil이면 로봇 발의 기본 흙도. 지역 흙은 그대로)
   freeze / resume                일시정지 / 재개 (freeze는 @T 가능)
   end                            시험 종료 (기록·MOP 저장, @T 가능)
   release / take                 제어권 내놓기 (관찰 콘솔이 됨) / 다시 받기

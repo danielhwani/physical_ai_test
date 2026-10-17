@@ -133,7 +133,7 @@ double top_area(double h, double r) {
 }
 
 struct FootSoil {
-  const SoilConfig& c;
+  SoilConfig c;                                           // 실행 중 흙 바꾸기(SoilUpdate)로 바뀐다
   const Config& cfg;
   mjModel* m;                                             // 받침판 마찰계수를 흙에 맞춰 바꾼다
   mjData* d;
@@ -146,6 +146,8 @@ struct FootSoil {
   double sink_by[MAX_SOILS] = {0, 0, 0, 0};
   uint64_t n_by[MAX_SOILS] = {0, 0, 0, 0};
   bool any_plow = false;
+  uint64_t soil_seq = 0;                                  // 마지막으로 반영한 흙 바꾸기 판
+  SoilUpdate upd;                                         // 읽는 동안 쓸 임시 칸 (루프 안 할당 없음)
   PlasticMap plastic;
   std::vector<mjtNum> jac, ju, minv;
   double out6[6];
@@ -157,6 +159,24 @@ struct FootSoil {
       const double* p = d->geom_xpos + 3 * cfg.foot_geom[i];
       place(i, p[0], p[1], p[2] - c.r + 0.001);
     }
+  }
+
+  void poll_update(int64_t k) {                           // 실행 중 흙 바꾸기: 정한 스텝 시작부터 (지형 반영과 같은 seqlock 규칙)
+    const volatile SoilUpdate* u = &shm->soil_update;
+    uint64_t s1 = u->seq;
+    if ((s1 & 1) || s1 == soil_seq || u->apply_step > k) return;
+    barrier();
+    std::memcpy((void*)&upd, (const void*)u, sizeof(SoilUpdate));
+    barrier();
+    if (u->seq != s1 || upd.idx < 0 || upd.idx >= MAX_SOILS) return;
+    const int i = upd.idx;
+    c.damping_r[i] = upd.damping_r; c.bekker_n[i] = upd.bekker_n; c.friction[i] = upd.friction; c.p_coef[i] = upd.p_coef;
+    std::memcpy(c.z_tab[i], upd.z_tab, sizeof(upd.z_tab));
+    std::memcpy(c.f_tab[i], upd.f_tab, sizeof(upd.f_tab));
+    std::memcpy(c.a_tab[i], upd.a_tab, sizeof(upd.a_tab));
+    any_plow = false;
+    for (int j = 0; j < c.n_soil; j++) any_plow = any_plow || c.p_coef[j] > 0;
+    soil_seq = s1;
   }
 
   int soil_at(double x, double y) const {                 // 지역 목록에서 나중에 맞는 지역의 흙, 없으면 기본 흙 0
@@ -320,7 +340,7 @@ void print_layout() {
 #define F(field) std::printf("  \"%s\": [%zu, %zu],\n", #field, offsetof(Shm, field), sizeof(((Shm*)0)->field))
   std::printf("{\n");
   F(cfg); F(ctl); F(stats); F(state); F(cmd); F(op_head); F(op); F(noise_head); F(noise); F(truth_head); F(truth);
-  F(stamp_head); F(stamp);
+  F(stamp_head); F(stamp); F(soil_update);
   F(cfg.qpos0); F(cfg.torque_limit); F(ctl.torque_scale); F(state.foot_force); F(cmd.tau_ff); F(truth[0].wake_us);
   F(ctl.fault_seq); F(truth[0].terrain_seq); F(cfg.soil); F(truth[0].stance_n);
   std::printf("  \"total\": [0, %zu]\n}\n", sizeof(Shm));
@@ -453,6 +473,8 @@ int main(int argc, char** argv) {
       }
     }
 
+    if (soil) soil->poll_update(k);                       // 무른 흙: 실행 중 흙 바꾸기 (DIS 콘솔 soil)
+
     // 1. 로봇 상태 측정
     const volatile NoiseEntry& ne = shm->noise[k % NOISE_RING];
     double z[NOISE_DIM] = {0};
@@ -567,6 +589,7 @@ int main(int argc, char** argv) {
       te.sink_sum = soil->sink_sum; te.sink_max = soil->sink_max; te.slip_sum = soil->slip_sum;
       te.stance_n = soil->stance_n;
       for (int k = 0; k < MAX_SOILS; k++) { te.sink_by[k] = soil->sink_by[k]; te.n_by[k] = soil->n_by[k]; }
+      te.soil_seq = soil->soil_seq;
     }
     for (int b = 0; b < std::min((int)m->nbody, NBODY_MAX); b++) {
       for (int a = 0; a < 3; a++) te.body_xpos[3 * b + a] = d->xpos[3 * b + a];
