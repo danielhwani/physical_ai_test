@@ -636,6 +636,16 @@ foot_soil:
   볼 것: x 2.0~3.5 m 띠가 기본 흙색보다 짙고 위에 이름이 뜬다. 정보판이 `soil:firm`에서 띠에 들어서면 `soil:mud_strip`으로 바뀐다
   (MuJoCo 화면은 왼쪽 위 글 `soil mud_strip`). 띠에서 발자국이 깊어지고 몸통이 내려가며 거의 멈춘다. 마지막 명령은 띠 이름이 `soft_strip`,
   색은 진흙보다 조금 옅다 (색은 흙이 무를수록·미끄러울수록 짙다). 목록 값은 작은따옴표로 감싼다.
+  C++ 코어와 Python이 같은지, 시험:
+  ```bash
+  python -m sim.runner scenarios/soil_strip.yaml                 # 둘의 MOP(forward_x_m 약 2.6, foot_sink_by_soil firm 약 181번,
+  python -m sim.rt_link scenarios/soil_strip.yaml --lockstep     #   mud_strip 약 127번)가 똑같아야 한다
+  python conformance/test_foot_soil.py                           # 9개 (지역 규칙, 진흙 띠)
+  python conformance/test_render_stream.py                       # 7개 (흙 지역 화면 표시)
+  python conformance/test_rt_core.py                             # 13개, 약 3분 (진흙 띠 비트 동일, shm 두뇌 경쟁 조건 수정)
+  ```
+  공유 메모리 규약이 12판이라 예전에 띄운 `sim.rt_link`는 끄고 돌린다. `test_rt_core`의 shm 두뇌 시험은 다른 터미널에서 실시간 코어를
+  돌리는 중에도 통과해야 한다 (아래 "lockstep shm 두뇌가 부하에서 가끔 한 스텝 어긋나던 것").
 
 **화면 발자국** (`--rviz`, `--mjviz`): 발이 판 구멍(남은 구멍 + 지금 디딘 발)을 화면 전용 토픽 `/sim/terrain_overlay`로 보내고
 렌더러가 `지형 - 구멍 깊이`로 그린다 (약 10 Hz). 물리 지형, 센서(LiDAR)가 받는 지형 패치, 지형 인지 보행은 그대로다 (시험으로 확인).
