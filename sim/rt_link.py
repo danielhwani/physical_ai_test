@@ -119,15 +119,18 @@ class RtLink:
             from .foot_soil import LIFT_GAP, PLASTIC_CELL
             from .model_builder import PLATE_HALF
             sc = cfg.soil
-            if len(fs.z_tab) > R.SOIL_TAB:
-                raise ValueError(f"지지력 표가 규약보다 길다 ({len(fs.z_tab)} > {R.SOIL_TAB})")
-            sc.on, sc.n_tab = 1, len(fs.z_tab)
+            n = len(fs.soils[0]["z_tab"])
+            if n > R.SOIL_TAB or len(fs.soils) > R.MAX_SOILS or len(fs.regions) > R.MAX_REGIONS:
+                raise ValueError(f"무른 흙이 규약보다 크다 (표 {n}, 흙 {len(fs.soils)}, 지역 {len(fs.regions)})")
+            sc.on, sc.n_tab, sc.n_soil, sc.n_region = 1, n, len(fs.soils), len(fs.regions)
             sc.plate_geom[:], sc.plate_mocap[:], sc.foot_body[:] = fs.plates, fs.mocap, fs.bodies
-            sc.r, sc.damping_r, sc.bekker_n = fs.r, fs.soil["damping_r"], fs.soil["bekker_n"]
-            sc.p_coef = fs.p_coef if fs.plow_ratio > 0 else 0.0
-            sc.area_min, sc.lift_gap, sc.plastic_cell, sc.plate_half_z = fs.area_min, LIFT_GAP, PLASTIC_CELL, PLATE_HALF[2]
-            n = len(fs.z_tab)
-            sc.z_tab[:n], sc.f_tab[:n], sc.a_tab[:n] = fs.z_tab, fs.f_tab, fs.a_tab
+            sc.r, sc.area_min, sc.lift_gap, sc.plastic_cell, sc.plate_half_z = fs.r, fs.area_min, LIFT_GAP, PLASTIC_CELL, PLATE_HALF[2]
+            for k, sd in enumerate(fs.soils):
+                sc.damping_r[k], sc.bekker_n[k], sc.friction[k], sc.p_coef[k] = sd["damping_r"], sd["n"], sd["friction"], sd["p_coef"]
+                sc.z_tab[k][:n], sc.f_tab[k][:n], sc.a_tab[k][:n] = sd["z_tab"], sd["f_tab"], sd["a_tab"]
+            for k, (x0, y0, x1, y1, idx) in enumerate(fs.regions):
+                sc.region[k][:] = (x0, y0, x1, y1)
+                sc.region_soil[k] = idx
         s.ctl.torque_scale = 1.0
         self.noise_n = 0
         self.fill_noise(R.NOISE_RING // 2)
@@ -546,6 +549,8 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
             fs.on[i], fs.zp[i], fs.xy[i] = bool(e.soil_on >> i & 1), e.soil_zp[i], [e.soil_xy[2 * i], e.soil_xy[2 * i + 1]]
         fs.stance_n, fs.sink_sum, fs.sink_max, fs.slip_sum = int(e.stance_n), e.sink_sum, e.sink_max, e.slip_sum
         fs.plow_work, fs.plow_work_up = e.plow_work, e.plow_work_up
+        fs.n_by[:] = [int(e.n_by[k]) for k in range(len(fs.soils))]
+        fs.sink_by[:] = [e.sink_by[k] for k in range(len(fs.soils))]
     odom_offset = [None]
     viz_count = [0]
 
@@ -668,7 +673,8 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
                 print(f"DIS 시나리오 콘솔 대기: UDP {dis.get('host', '127.0.0.1')}:{dis_srv.port}{' (인증)' if dis.get('key') else ''}")
         if viz or brain == "ros":
             from .ros2_bridge import Ros2StreamPublisher, launch_mujoco_viewer, launch_rviz_stack
-            bridge = Ros2StreamPublisher(sim.model, sim.terrain, sim.cosim)
+            bridge = Ros2StreamPublisher(sim.model, sim.terrain, sim.cosim,
+                                         soil_regions=sim.foot_soil.display_regions() if sim.foot_soil is not None else None)
             if sim.foot_soil is not None:
                 from .stream import TerrainOverlayStream
                 footprints[0] = TerrainOverlayStream(sim.foot_soil.display_depth, sim.foot_soil.display.shape)
@@ -737,7 +743,7 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
                     ls = link.read_state()
                     br.on_state(ls)
                     t_end = time.monotonic() + 30
-                    while br.cmd_t() is None or br.cmd_t() < ls["t"] - 1e-9 or not br.est_ready(ls["t"]):   # 두뇌가 이 상태로 명령을 낼 때까지
+                    while (ct := br.cmd_t()) is None or ct < ls["t"] - 1e-9 or not br.est_ready(ls["t"]):   # 두뇌가 이 상태로 명령을 다 쓸 때까지
                         br.poll()
                         if time.monotonic() > t_end:
                             raise RuntimeError(f"두뇌가 응답하지 않는다 (t={ls['t']:.2f})")

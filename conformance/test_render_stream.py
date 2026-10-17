@@ -19,6 +19,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import numpy as np
+import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -155,6 +156,32 @@ def test_mujoco_overlay_path_segments():
         draw_overlays(scn, status, [np.array([x, 0, 0.3]) for x in np.linspace(0, 2, n)])
         caps = [scn.geoms[i] for i in range(scn.ngeom) if scn.geoms[i].type == mujoco.mjtGeom.mjGEOM_CAPSULE]
         assert len(caps) == min(n - 1, MAX_PATH) and min(g.size[2] for g in caps) > 0, n   # 길이 0 선분 금지
+
+
+def test_soil_regions_on_screen():
+    """무른 흙 지역(foot_soil.regions)은 매니페스트 soil_regions와 상태 soil로 나가고, 두 렌더러가 그린다 (화면 전용)."""
+    import mujoco
+    from sim.stream import build_status
+    from viz.mujoco_adapter import draw_overlays, status_text
+    from viz.rviz_adapter import status_lines
+    scn = yaml.safe_load((ROOT / "scenarios/soil_strip.yaml").read_text())
+    sim = Simulation(scn)
+    regions = sim.foot_soil.display_regions()
+    manifest = check_manifest(_roundtrip(build_manifest(sim.model, sim.terrain, soil_regions=regions)))
+    assert manifest["soil_regions"] == regions and regions[0]["name"] == "mud_strip" and regions[0]["region"] == [2.0, -10.0, 3.5, 10.0]
+    assert regions[0]["rgba"][0] < 0.45                              # 진흙은 기본 지형색(0.55)보다 짙다
+    st = build_status(sim, sim.data.qpos[:2].copy(), 0.0, 0)
+    assert st["soil"] == "firm"
+    sim.data.qpos[0] = 2.5
+    assert build_status(sim, sim.data.qpos[:2].copy(), 0.0, 0)["soil"] == "mud_strip"
+    assert any("soil:mud_strip" in ln for ln in status_lines(_roundtrip(build_status(sim, sim.data.qpos[:2].copy(), 0.0, 0)))[0])
+    assert "soil mud_strip" in status_text(build_status(sim, sim.data.qpos[:2].copy(), 0.0, 0))[1]
+    vs = mujoco.MjvScene(mujoco.MjModel.from_xml_string("<mujoco><worldbody/></mujoco>"), maxgeom=1000)
+    status = {"feet": {}, "base_pos": [2.5, 0, 0.3], "yaw": 0.0, "command": {"vx": 0.3}}
+    draw_overlays(vs, status, [], regions)
+    caps = [vs.geoms[i] for i in range(vs.ngeom) if vs.geoms[i].type == mujoco.mjtGeom.mjGEOM_CAPSULE]
+    assert len(caps) == 4 and min(g.size[2] for g in caps) > 0       # 테두리 네 변 (로봇 근처 ±3 m)
+    assert build_manifest(sim.model, sim.terrain)["soil_regions"] == []   # 무른 흙이 없으면 빈 목록
 
 
 if __name__ == "__main__":

@@ -11,10 +11,10 @@ import os
 import time
 from pathlib import Path
 
-MAGIC, VERSION = 0x47324F52, 11
+MAGIC, VERSION = 0x47324F52, 12
 NJ, NQ, NV, NOISE_DIM, NOISE_RING, TRUTH_RING, OP_RING = 12, 19, 18, 36, 4096, 1024, 32
 NBODY_MAX, SCAN_MAX_PTS = 16, 32768
-SOIL_TAB, STAMP_RING = 600, 256
+SOIL_TAB, STAMP_RING, MAX_SOILS, MAX_REGIONS = 600, 256, 4, 8
 D = C.c_double
 
 
@@ -23,10 +23,13 @@ def arr(t, n):
 
 
 class SoilConfig(C.Structure):
-    _fields_ = [("on", C.c_int32), ("n_tab", C.c_int32), ("plate_geom", arr(C.c_int32, 4)), ("plate_mocap", arr(C.c_int32, 4)),
-                ("foot_body", arr(C.c_int32, 4)), ("r", D), ("damping_r", D), ("bekker_n", D), ("p_coef", D), ("area_min", D),
-                ("lift_gap", D), ("plastic_cell", D), ("plate_half_z", D), ("z_tab", arr(D, SOIL_TAB)), ("f_tab", arr(D, SOIL_TAB)),
-                ("a_tab", arr(D, SOIL_TAB))]
+    _fields_ = [("on", C.c_int32), ("n_tab", C.c_int32), ("n_soil", C.c_int32), ("n_region", C.c_int32),
+                ("plate_geom", arr(C.c_int32, 4)), ("plate_mocap", arr(C.c_int32, 4)), ("foot_body", arr(C.c_int32, 4)),
+                ("region_soil", arr(C.c_int32, MAX_REGIONS)), ("r", D), ("area_min", D), ("lift_gap", D), ("plastic_cell", D),
+                ("plate_half_z", D), ("region", arr(arr(D, 4), MAX_REGIONS)), ("damping_r", arr(D, MAX_SOILS)),
+                ("bekker_n", arr(D, MAX_SOILS)), ("friction", arr(D, MAX_SOILS)), ("p_coef", arr(D, MAX_SOILS)),
+                ("z_tab", arr(arr(D, SOIL_TAB), MAX_SOILS)), ("f_tab", arr(arr(D, SOIL_TAB), MAX_SOILS)),
+                ("a_tab", arr(arr(D, SOIL_TAB), MAX_SOILS))]
 
 
 class Config(C.Structure):
@@ -72,7 +75,8 @@ class TruthEntry(C.Structure):
                 ("base_xmat", arr(D, 9)), ("foot_pos", arr(D, 12)), ("contact_bits", C.c_uint32), ("soil_on", C.c_uint32),
                 ("fault_seq", C.c_uint64), ("terrain_seq", C.c_uint64),
                 ("soil_zp", arr(D, 4)), ("soil_xy", arr(D, 8)), ("plow_work", D), ("plow_work_up", D), ("sink_sum", D),
-                ("sink_max", D), ("slip_sum", D), ("stance_n", C.c_uint64),
+                ("sink_max", D), ("slip_sum", D), ("stance_n", C.c_uint64), ("sink_by", arr(D, MAX_SOILS)),
+                ("n_by", arr(C.c_uint64, MAX_SOILS)),
                 ("body_xpos", arr(D, NBODY_MAX * 3)), ("body_xquat", arr(D, NBODY_MAX * 4))]
 
 
@@ -285,8 +289,14 @@ class ShmView:
         return None
 
     def cmd_t(self):
-        """마지막으로 쓴 명령이 계산된 상태 시각 (없으면 None)."""
-        return self.shm.cmd.t if self.shm.cmd.seq else None
+        """마지막으로 다 쓴 명령이 계산된 상태 시각 (없거나 쓰는 중이면 None). seqlock으로 읽는다:
+        t만 보고 판단하면 두뇌가 나머지 칸을 쓰는 도중에 lockstep이 다음 스텝으로 넘어가 코어가 직전 명령을 실행했다 (부하가 클 때)."""
+        c = self.shm.cmd
+        a = c.seq
+        if a == 0 or a & 1:
+            return None
+        t = c.t
+        return t if c.seq == a else None
 
     # ---- 운용자 이동 명령 (관리 프로세스 -> 별도 프로세스 두뇌) ----
     def push_op(self, t, vx, yaw_rate):

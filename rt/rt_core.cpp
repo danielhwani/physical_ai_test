@@ -6,9 +6,10 @@
 // 실시간 루프 규칙: 시작 전에 모든 메모리를 잡고(mlockall), 루프 안에서는 할당·입출력·잠금을 하지 않는다.
 // 제어 주기마다
 //   0. 지형이 바뀌었으면 반영 (heightfield 값, 지형 창 위치. 관리 프로세스가 sim.runner와 같은 규칙으로 계산)
-//   1. 로봇 상태 측정 (참값 + 센서 모델 + 관리 프로세스가 미리 만든 잡음) -> 공유 메모리 LowState
+//   1. 로봇 상태 측정 (참값 + 센서 모델 + 관리 프로세스가 미리 만든 잡음)
 //   2. 실행할 관절 명령 고르기: 직전 주기까지의 상태로 계산된 최신 명령 (연결 지연 한 주기, Python 실행과 같다).
-//      없으면 마지막 명령 유지 (처음이면 기본 자세). 링크 두절이면 마지막 명령 유지 또는 감쇠
+//      없으면 마지막 명령 유지 (처음이면 기본 자세). 링크 두절이면 마지막 명령 유지 또는 감쇠.
+//      그다음에 1의 상태를 공유 메모리 LowState로 내보낸다 (먼저 내보내면 두뇌가 명령 슬롯을 덮어쓸 수 있다)
 //   3. 물리 decim 스텝: 스텝마다 PD 토크 -> 토크 한계 -> mj_step (sim/robot_io.py와 같은 식, 같은 순서)
 //   4. 참값·타이밍 기록 -> 공유 메모리 참값 링
 // 같은 libmujoco를 쓰므로 같은 명령을 넣으면 Python 시뮬레이터와 물리가 비트 단위로 같다 (conformance/test_rt_core.py).
@@ -134,23 +135,35 @@ double top_area(double h, double r) {
 struct FootSoil {
   const SoilConfig& c;
   const Config& cfg;
-  const mjModel* m;
+  mjModel* m;                                             // 받침판 마찰계수를 흙에 맞춰 바꾼다
   mjData* d;
   volatile Shm* shm;
   bool on[4] = {false, false, false, false};
   double zp[4] = {0, 0, 0, 0}, xy[4][2] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}}, top[4] = {0, 0, 0, 0}, fn[4] = {0, 0, 0, 0};
   double plow_work = 0.0, plow_work_up = 0.0, sink_sum = 0.0, sink_max = 0.0, slip_sum = 0.0;
   uint64_t stance_n = 0;
+  int sidx[4] = {0, 0, 0, 0};                             // 지금 디딤의 흙 번호
+  double sink_by[MAX_SOILS] = {0, 0, 0, 0};
+  uint64_t n_by[MAX_SOILS] = {0, 0, 0, 0};
+  bool any_plow = false;
   PlasticMap plastic;
   std::vector<mjtNum> jac, ju, minv;
   double out6[6];
 
-  FootSoil(const Config& cfg_, const mjModel* m_, mjData* d_, volatile Shm* shm_)
+  FootSoil(const Config& cfg_, mjModel* m_, mjData* d_, volatile Shm* shm_)
       : c(cfg_.soil), cfg(cfg_), m(m_), d(d_), shm(shm_), jac(3 * m_->nv), ju(m_->nv), minv(m_->nv) {
+    for (int k = 0; k < c.n_soil; k++) any_plow = any_plow || c.p_coef[k] > 0;
     for (int i = 0; i < 4; i++) {                         // 시작: 받침판을 발 아래 흙 표면에
       const double* p = d->geom_xpos + 3 * cfg.foot_geom[i];
       place(i, p[0], p[1], p[2] - c.r + 0.001);
     }
+  }
+
+  int soil_at(double x, double y) const {                 // 지역 목록에서 나중에 맞는 지역의 흙, 없으면 기본 흙 0
+    int idx = 0;
+    for (int k = 0; k < c.n_region; k++)
+      if (c.region[k][0] <= x && x <= c.region[k][2] && c.region[k][1] <= y && y <= c.region[k][3]) idx = c.region_soil[k];
+    return idx;
   }
 
   double surface(double x, double y) const {              // MuJoCo 지형 heightfield의 쌍선형 보간
@@ -206,8 +219,12 @@ struct FootSoil {
   }
 
   void place(int i, double x, double y, double bottom) {
-    double t = on[i] ? surface(xy[i][0], xy[i][1]) - zp[i] : std::min(surface(x, y) - hole(x, y), bottom - 0.001);
+    double t;
+    int k;
+    if (on[i]) { t = surface(xy[i][0], xy[i][1]) - zp[i]; k = sidx[i]; }
+    else { t = std::min(surface(x, y) - hole(x, y), bottom - 0.001); k = soil_at(x, y); }
     top[i] = t;
+    m->geom_friction[3 * c.plate_geom[i]] = c.friction[k];   // 그 흙의 마찰
     double* mp = d->mocap_pos + 3 * c.plate_mocap[i];
     mp[0] = x; mp[1] = y; mp[2] = t - c.plate_half_z;
   }
@@ -228,27 +245,32 @@ struct FootSoil {
           sink_sum += zp[i];
           sink_max = std::max(sink_max, zp[i]);
           slip_sum += std::sqrt(dx * dx + dy * dy);
+          n_by[sidx[i]]++;
+          sink_by[sidx[i]] += zp[i];
           on[i] = false;
         }
       }
       if (!on[i] && f > 0) {                               // 디딤 시작
         on[i] = true;
         xy[i][0] = x; xy[i][1] = y;
+        sidx[i] = soil_at(x, y);
         zp[i] = std::max(surface(x, y) - top[i], 0.0);
       }
       if (on[i] && f > 0) {                                // 소성 침하
         const double z = zp[i];
-        double fb = z > c.z_tab[0] ? soil_interp(z, c.z_tab, c.f_tab, c.n_tab) : 0.0;
+        const int k = sidx[i];
+        const double *zt = c.z_tab[k], *ft = c.f_tab[k], *at = c.a_tab[k];
+        double fb = z > zt[0] ? soil_interp(z, zt, ft, c.n_tab) : 0.0;
         if (f > fb) {
-          double z_eq = soil_interp(f, c.f_tab, c.z_tab, c.n_tab);
-          double area = std::max(z > c.z_tab[0] ? soil_interp(z, c.z_tab, c.a_tab, c.n_tab) : 0.0, c.area_min);
-          double rate = (f - fb) / (c.damping_r * area);
+          double z_eq = soil_interp(f, ft, zt, c.n_tab);
+          double area = std::max(z > zt[0] ? soil_interp(z, zt, at, c.n_tab) : 0.0, c.area_min);
+          double rate = (f - fb) / (c.damping_r[k] * area);
           zp[i] = std::min(z + rate * dt, z_eq);
         }
       }
       place(i, x, y, zc - c.r);
     }
-    if (c.p_coef > 0) plow();
+    if (any_plow) plow();
   }
 
   void plow() {                                           // 흙 속을 옆이나 위로 지나가는 발의 저항 (다음 스텝 qfrc_applied)
@@ -260,7 +282,8 @@ struct FootSoil {
       const double x = p[0], y = p[1], zc = p[2];
       const double bottom = zc - c.r;
       const double h = surface(x, y) - hole(x, y) - bottom;
-      if (h <= 0) continue;
+      const int k = soil_at(x, y);                        // 지금 지나가는 곳의 흙
+      if (h <= 0 || c.p_coef[k] <= 0) continue;
       mjtNum point[3] = {x, y, bottom + 0.5 * std::min(h, 2 * c.r)};
       mj_jac(m, d, jac.data(), nullptr, point, c.foot_body[i]);
       double v[3];
@@ -269,7 +292,7 @@ struct FootSoil {
         for (int j = 0; j < nv; j++) s += jac[k * nv + j] * d->qvel[j];
         v[k] = s;
       }
-      const double pr = c.p_coef * std::pow(h, c.bekker_n);
+      const double pr = c.p_coef[k] * std::pow(h, c.bekker_n[k]);
       const double vh = std::sqrt(v[0] * v[0] + v[1] * v[1]);
       for (int up = 0; up < 2; up++) {
         double speed, u0 = 0.0, u1 = 0.0, u2 = 0.0, area;
@@ -456,9 +479,9 @@ int main(int argc, char** argv) {
     }
     for (int i = 0; i < 4; i++) ls.foot_force[i] = std::max(foot_force[i] + z[32 + i], 0.0);
     const uint64_t link = shm->ctl.link_mode;
-    if (link == 0) write_slot(&shm->state, ls);           // 링크 두절이면 상태가 보행 알고리즘에 가지 않는다
 
-    // 2. 실행할 명령
+    // 2. 실행할 명령 (상태를 내보내기 전에 고른다: 별도 프로세스 두뇌가 이번 상태로 곧바로 새 명령을 써서, 실행할 직전 상태의 명령을
+    //    한 칸짜리 명령 슬롯에서 덮어쓰기 전에. 부하가 클 때 lockstep shm 두뇌가 한 스텝 어긋난 적이 있다)
     LowCmd cmd;
     if (link == 2) {                                      // 링크 두절 + 감쇠: 위치 게인 0, 속도 게인만
       cmd = LowCmd{};
@@ -476,6 +499,7 @@ int main(int argc, char** argv) {
       cmd = applied;                                      // 새 명령이 없으면 마지막 명령 유지 (처음이면 기본 자세)
     }
     prev_state_t = t;
+    if (link == 0) write_slot(&shm->state, ls);           // 1의 로봇 상태를 내보낸다 (링크 두절이면 보행 알고리즘에 가지 않는다)
 
     // 3. 물리 (sim/robot_io.py RobotIO.apply와 같은 식)
     double energy = 0.0, fn[4] = {0, 0, 0, 0}, out6[6];
@@ -542,6 +566,7 @@ int main(int argc, char** argv) {
       te.plow_work = soil->plow_work; te.plow_work_up = soil->plow_work_up;
       te.sink_sum = soil->sink_sum; te.sink_max = soil->sink_max; te.slip_sum = soil->slip_sum;
       te.stance_n = soil->stance_n;
+      for (int k = 0; k < MAX_SOILS; k++) { te.sink_by[k] = soil->sink_by[k]; te.n_by[k] = soil->n_by[k]; }
     }
     for (int b = 0; b < std::min((int)m->nbody, NBODY_MAX); b++) {
       for (int a = 0; a < 3; a++) te.body_xpos[3 * b + a] = d->xpos[3 * b + a];

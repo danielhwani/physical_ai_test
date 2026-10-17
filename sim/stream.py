@@ -43,7 +43,7 @@ def export_meshes(model, mesh_dir=MESH_DIR):
 COSIM_ID_BASE = 1000     # 다른 물리엔진 바디의 id 시작값 (MuJoCo 바디 id와 겹치지 않게)
 
 
-def build_manifest(model, terrain, cosim=None, physics_source="MuJoCo", entity="go2"):
+def build_manifest(model, terrain, cosim=None, physics_source="MuJoCo", entity="go2", soil_regions=None):
     """cosim: 다른 물리엔진 연결(ChronoLink 등). 그 바디들도 같은 장면에 넣되 physics_source로 구분한다."""
     name = lambda t, i: mujoco.mj_id2name(model, t, i)  # noqa: E731
     meshes = export_meshes(model)
@@ -75,6 +75,7 @@ def build_manifest(model, terrain, cosim=None, physics_source="MuJoCo", entity="
         "asset_root": str(ROOT),
         "bodies": bodies,
         "visuals": visuals,
+        "soil_regions": soil_regions or [],      # 무른 흙 지역 (화면 표시용: 이름, [x0, y0, x1, y1], 흙, rgba)
         "terrain": {"half_size": [terrain.half_x, terrain.half_y], "nrow": terrain.nrow, "ncol": terrain.ncol,
                     "z_range": [terrain.z_min, terrain.z_max],
                     "layout": "row-major; row i -> y = -half_y + i*dy, col j -> x = -half_x + j*dx"},
@@ -165,6 +166,8 @@ def build_status(sim, start_xy, energy, late, final_mop=None):
         "event": {"t": sim.last_event[0], "desc": sim.last_event[1]} if sim.last_event else None,
         "faults": {n: (None if f["until"] is None else round(f["until"] - d.time, 2)) for n, f in getattr(sim, "faults", {}).items()},
         "frozen": bool(getattr(sim, "frozen", False)),
+        "soil": (sim.foot_soil.region_name_at(float(d.qpos[0]), float(d.qpos[1]))
+                 if getattr(sim, "foot_soil", None) is not None else None),   # 몸통 아래 흙 (무른 흙을 켰을 때)
         "final_mop": final_mop,
     }
 
@@ -175,7 +178,8 @@ class StreamTap:
 
     def __init__(self, sim):
         self.sim = sim
-        self.manifest = build_manifest(sim.model, sim.terrain, sim.cosim)
+        self.manifest = build_manifest(sim.model, sim.terrain, sim.cosim,
+                                       soil_regions=sim.foot_soil.display_regions() if getattr(sim, "foot_soil", None) else None)
         self.bodies = [(b["id"], b["name"]) for b in self.manifest["bodies"] if b["physics_source"] == "MuJoCo"]
         self.terrain = TerrainPatchStream(sim.terrain)
         self.started = False

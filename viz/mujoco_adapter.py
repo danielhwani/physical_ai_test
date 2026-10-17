@@ -106,6 +106,8 @@ def status_text(s):
              f"speed {s['speed_avg']:.2f} m/s  dist {s['distance']:.2f} m  CoT {cot}",
              "contact " + " ".join(n if f["contact"] else "--" for n, f in s["feet"].items()),
              f"late steps {s['late_steps']}"]
+    if s.get("soil"):
+        lines.append(f"soil {s['soil']}")
     for v in s.get("vehicles", []):
         lines.append(f"HMMWV dist {v['distance']:.1f} m  speed {v['speed']:.1f} m/s")
     ev = s.get("event")
@@ -114,8 +116,8 @@ def status_text(s):
     return "STATUS", "\n".join(lines)
 
 
-def draw_overlays(scn, status, path):
-    """발 접촉(구), 명령 화살표, 경로(선분)를 뷰어의 그리기 전용 영역(user_scn)에 그린다."""
+def draw_overlays(scn, status, path, soil_regions=()):
+    """발 접촉(구), 명령 화살표, 경로(선분), 흙 지역 테두리를 뷰어의 그리기 전용 영역(user_scn)에 그린다."""
     scn.ngeom = 0
 
     def add(gtype, size, pos, mat, rgba):
@@ -136,6 +138,22 @@ def draw_overlays(scn, status, path):
         if g is not None:
             p0 = b + [0, 0, 0.15]
             mujoco.mjv_connector(g, mujoco.mjtGeom.mjGEOM_ARROW, 0.015, p0, p0 + L * np.array([np.cos(yaw), np.sin(yaw), 0]))
+    for rg in soil_regions:                                     # 흙 지역 테두리 (로봇 근처 ±3 m만, 화면 전용)
+        x0, y0, x1, y1 = rg["region"]
+        if status:
+            bx, by = status["base_pos"][:2]
+            y0, y1 = max(y0, by - 3.0), min(y1, by + 3.0)
+            x0c, x1c = max(x0, bx - 3.0), min(x1, bx + 3.0)
+            if x0c > x1c or y0 > y1:
+                continue
+        else:
+            x0c, x1c = x0, x1
+        z = 0.01
+        corners = [(x0c, y0), (x1c, y0), (x1c, y1), (x0c, y1)]
+        for (ax, ay), (cx, cy) in zip(corners, corners[1:] + corners[:1]):
+            g = add(mujoco.mjtGeom.mjGEOM_CAPSULE, [0, 0, 0], [0, 0, 0], np.eye(3), [*rg["rgba"][:3], 0.9])
+            if g is not None:
+                mujoco.mjv_connector(g, mujoco.mjtGeom.mjGEOM_CAPSULE, 0.012, np.array([ax, ay, z]), np.array([cx, cy, z]))
     recent = path[-(MAX_PATH + 1):]
     for a, c in zip(recent[:-1], recent[1:]):                  # 연속한 두 점을 잇는 선분
         g = add(mujoco.mjtGeom.mjGEOM_CAPSULE, [0, 0, 0], [0, 0, 0], np.eye(3), [1.0, 0.85, 0.2, 0.9])
@@ -241,7 +259,7 @@ class MujocoViewerAdapter:
                     apply_poses(model, data, mocap, poses)
                     if base >= 0:
                         viewer.cam.lookat[:] = data.xpos[base]
-                    draw_overlays(viewer.user_scn, status, path)
+                    draw_overlays(viewer.user_scn, status, path, self.manifest.get("soil_regions", []))
                 if status:     # set_texts는 내부에서 뷰어 잠금을 잡으므로 viewer.lock() 밖에서 호출 (안에서 부르면 교착)
                     title, text = status_text(status)
                     viewer.set_texts((None, mujoco.mjtGridPos.mjGRID_TOPLEFT, title, text))

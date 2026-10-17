@@ -68,6 +68,8 @@ def status_lines(s):
              f"speed={s['speed_avg']:.2f}m/s|dist={s['distance']:.2f}m|CoT={cot}",
              "contact:" + ",".join(n if f["contact"] else "--" for n, f in s["feet"].items()),
              f"late_steps={s['late_steps']}"]
+    if s.get("soil"):
+        lines.append(f"soil:{s['soil']}")
     for v in s.get("vehicles", []):
         lines.append(f"{v['name']}:dist={v['distance']:.1f}m,speed={v['speed']:.1f}m/s")
     ev = s.get("event")
@@ -112,6 +114,8 @@ class RvizAdapter(Node):
         half = min(TERRAIN_HALF, max(1.0, np.floor(res * np.sqrt(MAX_CELLS) / 2)))
         self.window = TerrainWindow(t, half=half, max_cells=0)
         self.pub_desc.publish(String(data=build_urdf(self.manifest)))
+        self.soil_regions = self.manifest.get("soil_regions", [])
+        self.publish_soil_labels()
         self.get_logger().info(f"manifest: {len(self.manifest['bodies'])} bodies, {len(self.manifest['visuals'])} visuals")
         for p in self.pending:                      # 매니페스트보다 먼저 온 지형 패치
             self.grid.apply(p)
@@ -127,6 +131,19 @@ class RvizAdapter(Node):
             return
         self.grid.apply(patch)
         self.publish_terrain()
+
+    def publish_soil_labels(self):
+        """흙 지역 이름 (지역 가운데 위). 지역 색은 지형 메쉬에 칠한다 (publish_terrain)."""
+        if not self.soil_regions:
+            return
+        arr = MarkerArray()
+        for k, rg in enumerate(self.soil_regions):
+            x0, y0, x1, y1 = rg["region"]
+            m = self.marker("soil", k, Marker.TEXT_VIEW_FACING, (1.0, 0.85, 0.55, 1.0), (0, 0, 0.12))
+            m.pose.position.x, m.pose.position.y, m.pose.position.z = (x0 + x1) / 2, max(min(y1, 1.5), y0), 0.15
+            m.text = rg["name"] if rg["name"] == rg["soil"] else f"{rg['name']}({rg['soil']})"
+            arr.markers.append(m)
+        self.pub_terrain.publish(arr)
 
     def on_overlay(self, msg):
         patch = json.loads(msg.data)
@@ -173,7 +190,12 @@ class RvizAdapter(Node):
             tri = np.stack([a, b, e, a, e, d], 2).reshape(-1, 3)
             m = self.marker("terrain", tid, Marker.TRIANGLE_LIST, (*TERRAIN_RGB, 1.0), (1, 1, 1))
             m.points = [Point(x=x, y=y, z=z) for x, y, z in tri.tolist()]
-            rgb = np.clip(TERRAIN_RGB * np.clip(1.0 + tri[:, 2:3] / SHADE_M, 0.3, 1.5), 0.0, 1.0)
+            base = np.tile(TERRAIN_RGB, (len(tri), 1))
+            for rg in getattr(self, "soil_regions", []):          # 흙 지역은 그 흙 색 (화면 전용)
+                x0, y0, x1, y1 = rg["region"]
+                inside = (tri[:, 0] >= x0) & (tri[:, 0] <= x1) & (tri[:, 1] >= y0) & (tri[:, 1] <= y1)
+                base[inside] = rg["rgba"][:3]
+            rgb = np.clip(base * np.clip(1.0 + tri[:, 2:3] / SHADE_M, 0.3, 1.5), 0.0, 1.0)
             m.colors = [ColorRGBA(r=r, g=g, b=b, a=1.0) for r, g, b in rgb.tolist()]
             arr.markers.append(m)
         if arr.markers:

@@ -9,7 +9,7 @@
 namespace rtshm {
 
 constexpr uint32_t MAGIC = 0x47324F52;   // "RO2G"
-constexpr uint32_t VERSION = 11;
+constexpr uint32_t VERSION = 12;
 constexpr int NJ = 12;
 constexpr int NQ = 19, NV = 18;           // Go2 (자유 관절 + 12)
 constexpr int NOISE_DIM = 36;             // sensors/proprio.py ProprioSensors.NOISE_DIM
@@ -20,16 +20,20 @@ constexpr int SCAN_MAX_PTS = 32768;       // 스캔 공유 메모리의 최대 �
 constexpr int OP_RING = 32;               // 운용자 이동 명령 (관리 프로세스 -> 별도 프로세스 두뇌)
 constexpr int SOIL_TAB = 600;             // 무른 흙 지지력 표 최대 길이 (sim/foot_soil.py: 570)
 constexpr int STAMP_RING = 256;           // 무른 흙: 발을 든 자리에 남긴 구멍 (화면 발자국용)
+constexpr int MAX_SOILS = 4, MAX_REGIONS = 8;   // 무른 흙: 흙 종류(기본 포함), 지역 수 (sim/foot_soil.py와 같다)
 
 struct SoilConfig {                       // 무른 흙 발 상호작용 (sim/foot_soil.py와 같은 알고리즘). on이 0이면 단단한 접촉
   int32_t on;
-  int32_t n_tab;                          // 지지력 표 길이
+  int32_t n_tab;                          // 지지력 표 길이 (흙마다 같은 깊이 격자)
+  int32_t n_soil, n_region;               // 흙 종류 수 (0번 = 기본 흙), 지역 수
   int32_t plate_geom[4], plate_mocap[4], foot_body[4];
+  int32_t region_soil[MAX_REGIONS];       // 지역의 흙 번호 (겹치면 나중 지역이 이긴다)
   double r;                               // 발 구 반지름
-  double damping_r, bekker_n;
-  double p_coef;                          // 쟁기질 압력 = p_coef * h^n (0이면 쟁기질 끔)
   double area_min, lift_gap, plastic_cell, plate_half_z;
-  double z_tab[SOIL_TAB], f_tab[SOIL_TAB], a_tab[SOIL_TAB];   // 깊이 -> 지지력, 접촉 면적 (Python이 계산)
+  double region[MAX_REGIONS][4];          // x0, y0, x1, y1
+  double damping_r[MAX_SOILS], bekker_n[MAX_SOILS], friction[MAX_SOILS];
+  double p_coef[MAX_SOILS];               // 쟁기질 압력 = p_coef * h^n (0이면 그 흙에서 쟁기질 없음)
+  double z_tab[MAX_SOILS][SOIL_TAB], f_tab[MAX_SOILS][SOIL_TAB], a_tab[MAX_SOILS][SOIL_TAB];   // 깊이 -> 지지력, 접촉 면적
 };
 
 struct Config {                           // 관리 프로세스가 코어 시작 전에 쓴다
@@ -117,6 +121,8 @@ struct TruthEntry {                       // 코어 -> 관리 프로세스 (판�
   double soil_zp[4], soil_xy[8];
   double plow_work, plow_work_up, sink_sum, sink_max, slip_sum;
   uint64_t stance_n;
+  double sink_by[MAX_SOILS];              // 흙별 끝난 디딤의 침하 합, 수
+  uint64_t n_by[MAX_SOILS];
   double body_xpos[NBODY_MAX * 3];        // 바디 위치·자세 (스텝 직후 값, 센서 렌더러가 쓴다)
   double body_xquat[NBODY_MAX * 4];       // w, x, y, z
 };

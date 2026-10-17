@@ -534,7 +534,8 @@ def run(args):
     if args.ros2:
         from .ros2_bridge import (Ros2StreamPublisher, launch_controller_node, launch_mujoco_viewer, launch_rviz_stack,
                                   launch_sensor_node)
-        bridge = Ros2StreamPublisher(m, sim.terrain, sim.cosim)
+        bridge = Ros2StreamPublisher(m, sim.terrain, sim.cosim,
+                                     soil_regions=sim.foot_soil.display_regions() if sim.foot_soil is not None else None)
         if sim.foot_soil is not None:           # 무른 흙 발자국: 화면 전용 표시 깊이 (물리·센서에는 안 들어감)
             from .stream import TerrainOverlayStream
             footprints = TerrainOverlayStream(sim.foot_soil.display_depth, sim.foot_soil.display.shape)

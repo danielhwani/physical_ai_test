@@ -67,7 +67,7 @@ def launch_mujoco_viewer(log_dir):
 
 
 class Ros2StreamPublisher:
-    def __init__(self, model, terrain, cosim=None, frame="world"):
+    def __init__(self, model, terrain, cosim=None, frame="world", soil_regions=None):
         import rclpy
         from geometry_msgs.msg import TransformStamped, TwistStamped
         from rclpy.qos import DurabilityPolicy, QoSProfile
@@ -101,7 +101,7 @@ class Ros2StreamPublisher:
 
         self.cosim = cosim
         self.pub_scans = {}
-        self.pub_manifest.publish(String(data=json.dumps(build_manifest(model, terrain, cosim))))
+        self.pub_manifest.publish(String(data=json.dumps(build_manifest(model, terrain, cosim, soil_regions=soil_regions))))
         self.terrain_stream = TerrainPatchStream(terrain)
         self.pub_terrain.publish(String(data=json.dumps(self.terrain_stream.full())))
 

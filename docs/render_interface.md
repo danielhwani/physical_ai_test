@@ -68,6 +68,9 @@
 - 순서대로 적용하면 물리엔진이 쓰는 지형과 같아진다 (오차 < 1e-6 m, 계약 시험).
 - "물리엔진에 반영된" 지형이다. Terrain Map Service가 로봇 발 근처 셀을 보류하는 동안은 그 셀이 바뀌지 않는다.
 
+- 매니페스트의 `soil_regions` (무른 흙 지역, 없으면 빈 목록): `[{"name", "region": [x0, y0, x1, y1], "soil", "rgba"}]`.
+  렌더러는 지형을 그 색으로 칠하거나 테두리를 그린다 (화면 전용). 상태 `/sim/status`의 `soil`은 몸통 아래 흙 이름 (무른 흙이 없으면 null).
+
 #### 3-1. 화면 전용 지형 표시 깊이: `/sim/terrain_overlay` (std_msgs/String, JSON, transient local, depth 500)
 무른 흙(`foot_soil`)에서 발이 판 구멍처럼 화면에만 보일 깊이. 지형 패치와 같은 형식이고 `"kind": "display_depth"`,
 `heights`는 원래 지형에서 내려갈 깊이(m, 양수 = 아래). 렌더러는 `지형 - 표시 깊이`로 그린다 (RViz, MuJoCo 어댑터).

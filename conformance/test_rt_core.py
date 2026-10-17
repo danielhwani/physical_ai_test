@@ -335,7 +335,8 @@ def _runner_vs_rt(scn, brains, tmp, extra_npz=()):
             diff = [c for c in a.columns if len(a) != len(b) or not np.array_equal(a[c].to_numpy(), b[c].to_numpy(), equal_nan=True)]
             assert not diff, (brain, diff)
             for k in ("min_vehicle_distance_m", "deformed_cells", "deform_mean_m", "deform_max_m", "forward_x_m",
-                      "foot_sink_mean_m", "foot_sink_max_m", "foot_slip_mean_m", "plow_work_j", "plow_work_up_j"):
+                      "foot_sink_mean_m", "foot_sink_max_m", "foot_slip_mean_m", "plow_work_j", "plow_work_up_j",
+                      "foot_sink_by_soil"):
                 assert ma.get(k) == mb.get(k), (brain, k, ma.get(k), mb.get(k))
             for name in extra_npz:
                 la, lb = np.load(py_dir / f"{name}.npz"), np.load(tmp / brain / f"{name}.npz")
@@ -347,7 +348,7 @@ def _runner_vs_rt(scn, brains, tmp, extra_npz=()):
 
 def test_foot_soil_matches_runner():
     """무른 흙 (foot_soil, C++ 코어의 같은 알고리즘): 지형 패치 이벤트가 있는 rough_rut(세 두뇌 연결 방식)과
-    지형 창 + 실행 중 자국 추가가 sim.runner와 기록·MOP까지 비트 단위로 같다."""
+    지형 창 + 실행 중 자국 추가, 지역마다 다른 흙(진흙 띠)이 sim.runner와 기록·MOP까지 비트 단위로 같다."""
     import shutil
     import tempfile
     tmp = Path(tempfile.mkdtemp())
@@ -362,7 +363,10 @@ def test_foot_soil_matches_runner():
                           "patch": {"kind": "rut", "start": [1.0, -50.0], "end": [1.0, 50.0], "width": 0.25, "depth": 0.05,
                                     "profile": "box"}}]
         mb = _runner_vs_rt(win, ("inproc",), tmp / "win")
-        assert ma["foot_sink_mean_m"] > 0.005 and mb["plow_work_j"] > 0, (ma, mb)
+        strip = yaml.safe_load((ROOT / "scenarios/soil_strip.yaml").read_text())
+        strip["duration"] = 8.0
+        mc = _runner_vs_rt(strip, ("inproc",), tmp / "strip")                      # 지역마다 다른 흙 (진흙 띠)
+        assert ma["foot_sink_mean_m"] > 0.005 and mb["plow_work_j"] > 0 and mc["foot_sink_by_soil"]["mud_strip"]["stances"] > 0, (ma, mb, mc)
         print(f"    무른 흙 (C++ 코어 lockstep = sim.runner): rough_rut firm 침하 {100 * ma['foot_sink_mean_m']:.1f} cm, "
               f"지형 창 soft 쟁기질 {mb['plow_work_j']:.0f} J")
     finally:

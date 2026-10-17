@@ -19,10 +19,14 @@
 
 시나리오:
   foot_soil:
-    preset: firm              # hard / firm / soft / mud (dis_console/protocol.py SOIL_PRESETS) 또는
+    preset: firm              # 기본 흙 (지역 밖): hard / firm / soft / mud (dis_console/protocol.py SOIL_PRESETS) 또는
     soil: {bekker_kphi: 1.0e7, bekker_kc: 0, bekker_n: 1.1, cohesion: 0, friction_deg: 30, janosi_shear: 0.01,
            elastic_k: 4.0e7, damping_r: 3.0e4}   # preset 값을 덮어쓴다
     plow_ratio: 1.0           # 쟁기질 저항 비율 (0이면 끔)
+    regions:                  # 지역마다 다른 흙 (선택). 직사각형 [x0, y0, x1, y1] (m). 겹치면 목록에서 나중 지역이 이긴다
+      - {name: mud_strip, region: [2.0, -10, 3.5, 10], preset: mud}          # preset/soil/plow_ratio 중 준 것만 기본 흙을 덮어쓴다
+  디딤의 흙은 디딘 순간 발 위치로 정한다 (디디는 동안 그대로). 쟁기질은 발이 지금 지나가는 곳의 흙. 받침판 마찰계수는 그 흙의 tanφ로
+  바꾼다. 구멍 지도는 흙과 상관없이 하나다 (구멍은 모양). 흙은 최대 MAX_SOILS종류, 지역은 최대 MAX_REGIONS개 (C++ 코어 규약).
 없으면 이전과 같은 단단한 접촉이다 (결과 비트 동일).
 
 빠진 것 (SCM과 다른 점): 탄성 되튐(elastic_k), Janosi 전단 변위에 따른 미끄럼(마찰은 쿨롱), 점착력(cohesion), 경사·홈 벽의 옆 반력,
@@ -39,6 +43,7 @@ from dis_console.protocol import SOIL_PRESETS
 from .model_builder import PLATE_HALF, SOIL_PLATE
 
 RINGS = 24                 # 지지력 적분 고리 수
+MAX_SOILS, MAX_REGIONS = 4, 8   # 흙 종류(기본 포함), 지역 수 (rt/shm_layout.h와 같다)
 PLASTIC_CELL = 0.01        # 소성 지도 칸 (m)
 LIFT_GAP = 0.002           # 받침판에서 이만큼 떨어지면 발을 든 것으로 본다 (m)
 
@@ -55,6 +60,36 @@ def soil_params(cfg):
 
 def friction(cfg):
     return math.tan(math.radians(soil_params(cfg)["friction_deg"]))
+
+
+def soil_list(cfg):
+    """(흙 목록, 지역 목록). 흙 = (이름, 흙 값, plow_ratio), 0번이 기본 흙. 지역 = (x0, y0, x1, y1, 흙 번호).
+    지역의 흙은 기본 흙에서 시작해 preset, soil, plow_ratio로 덮어쓴다. 같은 흙은 하나로 합친다."""
+    base = soil_params(cfg)
+    ratio = float(cfg.get("plow_ratio", 1.0))
+    soils = [(cfg.get("preset") or "base", base, ratio)]
+    regions = []
+    for k, rg in enumerate(cfg.get("regions") or []):
+        x0, y0, x1, y1 = (float(v) for v in rg["region"])
+        if not (x0 < x1 and y0 < y1):
+            raise ValueError(f"foot_soil.regions[{k}].region: [x0, y0, x1, y1]이고 x0 < x1, y0 < y1 ({rg['region']})")
+        sp = dict(base)
+        if rg.get("preset"):
+            sp.update(SOIL_PRESETS[rg["preset"]])
+        sp.update(rg.get("soil") or {})
+        sp = {key: float(v) for key, v in sp.items()}
+        r = float(rg.get("plow_ratio", ratio))
+        idx = next((i for i, (_, s0, r0) in enumerate(soils) if s0 == sp and r0 == r), None)
+        if idx is None:
+            name = rg.get("name") or rg.get("preset") or f"region{k}"
+            if name in [n for n, _, _ in soils]:
+                name = f"{name}_{k}"
+            soils.append((name, sp, r))
+            idx = len(soils) - 1
+        regions.append((x0, y0, x1, y1, idx))
+    if len(soils) > MAX_SOILS or len(regions) > MAX_REGIONS:
+        raise ValueError(f"foot_soil: 흙은 {MAX_SOILS}종류, 지역은 {MAX_REGIONS}개까지 (흙 {len(soils)}, 지역 {len(regions)})")
+    return soils, regions
 
 
 def bearing(z, r, soil):
@@ -97,8 +132,9 @@ class FootSoil:
     (그래서 numpy 행렬 곱 대신 순서를 정한 반복문, hypot 대신 sqrt, np.interp 대신 interp를 쓴다)."""
 
     def __init__(self, sim, cfg):
-        self.sim, self.soil = sim, soil_params(cfg)
-        self.plow_ratio = float(cfg.get("plow_ratio", 1.0))
+        self.sim = sim
+        soils, self.regions = soil_list(cfg)
+        self.region_names = [rg.get("name") or rg.get("preset") or f"region{k}" for k, rg in enumerate(cfg.get("regions") or [])]
         m = sim.model
         self.feet = list(sim.foot_ids)
         self.bodies = [int(m.geom_bodyid[g]) for g in self.feet]
@@ -113,11 +149,17 @@ class FootSoil:
         self.hadr = int(m.hfield_adr[self.hid])
         self.hsize = [float(v) for v in m.hfield_size[self.hid][:3]]
         self.gpos = [float(v) for v in m.geom_pos[self.tgeom]]
-        # 지지력 표 (깊이 -> 지지력, 면적): 단조 증가라 힘 -> 깊이도 보간으로. 코어에는 이 표를 그대로 넘긴다
-        z = np.concatenate([np.linspace(0, 0.03, 301)[1:], np.linspace(0.03, 0.3, 271)[1:]])
-        tab = [bearing(v, self.r, self.soil) for v in z]
-        self.z_tab, self.f_tab, self.a_tab = [float(v) for v in z], [t[0] for t in tab], [t[1] for t in tab]
-        self.p_coef = self.plow_ratio * (self.soil["bekker_kc"] / (2 * self.r) + self.soil["bekker_kphi"])   # 쟁기질 압력 = p_coef·h^n
+        # 흙마다: 지지력 표 (깊이 -> 지지력, 면적. 단조 증가라 힘 -> 깊이도 보간으로), 마찰, 감쇠, 쟁기질 계수. 코어에는 그대로 넘긴다
+        z = [float(v) for v in np.concatenate([np.linspace(0, 0.03, 301)[1:], np.linspace(0.03, 0.3, 271)[1:]])]
+        self.soils = []
+        for name, sp, ratio in soils:
+            tab = [bearing(v, self.r, sp) for v in z]
+            self.soils.append({"name": name, "params": sp, "z_tab": z, "f_tab": [t[0] for t in tab], "a_tab": [t[1] for t in tab],
+                               "friction": math.tan(math.radians(sp["friction_deg"])), "damping_r": sp["damping_r"],
+                               "n": sp["bekker_n"], "plow_ratio": ratio,
+                               "p_coef": ratio * (sp["bekker_kc"] / (2 * self.r) + sp["bekker_kphi"])})   # 쟁기질 압력 = p_coef·h^n
+        self.soil = self.soils[0]["params"]                     # 기본 흙 (예전 이름)
+        self.plow = any(sd["p_coef"] > 0 for sd in self.soils)
         self.area_min = math.pi * (0.25 * self.r) ** 2
         self.plastic = {}                     # (ix, iy) -> 원래 표면 아래 소성 침하 (m)
         n = len(self.feet)
@@ -127,6 +169,9 @@ class FootSoil:
         self.top = [0.0] * n                  # 받침판 윗면 높이
         self.fn = np.zeros(n)                 # 직전 물리 스텝의 발 수직력
         self.stance_n, self.sink_sum, self.sink_max, self.slip_sum = 0, 0.0, 0.0, 0.0   # 끝난 디딤 통계
+        self.sidx = [0] * n                   # 지금 디딤의 흙 번호
+        self.n_by = [0] * len(self.soils)     # 흙별 끝난 디딤 수, 침하 합
+        self.sink_by = [0.0] * len(self.soils)
         self.plow_work = 0.0                  # 쟁기질로 흙에 준 일 (J)
         self.plow_work_up = 0.0               # 그중 위로 움직인 성분 (발을 빼며 흙을 들어 올린 일)
         self.stamps = []                      # 남긴 구멍 [(x, y, zp)] (화면 발자국)
@@ -139,6 +184,34 @@ class FootSoil:
         for i, g in enumerate(self.feet):    # 시작: 받침판을 발 아래 흙 표면에
             x, y, zc = (float(v) for v in sim.data.geom_xpos[g])
             self._place(i, x, y, zc - self.r + 0.001)
+
+    def region_name_at(self, x, y):
+        """(x, y)의 지역 이름 (화면 정보판용), 지역 밖이면 기본 흙 이름."""
+        name = self.soils[0]["name"]
+        for (x0, y0, x1, y1, _), n in zip(self.regions, self.region_names):
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                name = n
+        return name
+
+    def display_regions(self):
+        """화면용 흙 지역 (매니페스트 soil_regions): 이름, 직사각형, 흙 이름, 색 (무를수록·미끄러울수록 짙은 갈색)."""
+        out = []
+        for (x0, y0, x1, y1, k), n in zip(self.regions, self.region_names):
+            sp = self.soils[k]["params"]
+            soft = min(max((math.log10(2.0e7) - math.log10(sp["bekker_kphi"])) / (math.log10(2.0e7) - math.log10(5.0e5)), 0.0), 1.0)
+            wet = min(max((30.0 - sp["friction_deg"]) / 10.0, 0.0), 1.0)
+            t = min(soft + 0.3 * wet, 1.0)
+            rgb = [round(a + (b - a) * t, 3) for a, b in zip((0.66, 0.60, 0.50), (0.28, 0.20, 0.13))]
+            out.append({"name": n, "region": [x0, y0, x1, y1], "soil": self.soils[k]["name"], "rgba": rgb + [1.0]})
+        return out
+
+    def soil_at(self, x, y):
+        """(x, y)의 흙 번호: 지역 목록에서 나중에 맞는 지역, 없으면 기본 흙 0 (C++ 코어 soil_at과 같다)."""
+        idx = 0
+        for x0, y0, x1, y1, k in self.regions:
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                idx = k
+        return idx
 
     # ---- 흙 표면 ----
     def surface(self, x, y):
@@ -233,16 +306,18 @@ class FootSoil:
         공중의 발이 아직 흙 표면 아래(깊은 구멍에서 나오는 중)면 발 바로 아래에 둔다 (발을 안쪽에서 치지 않게)."""
         if self.on[i]:
             top = self.surface(self.xy[i][0], self.xy[i][1]) - self.zp[i]
+            k = self.sidx[i]
         else:
             top = min(self.surface(x, y) - self._hole(x, y), bottom - 0.001)
+            k = self.soil_at(x, y)
         self.top[i] = top
+        self.sim.model.geom_friction[self.plates[i], 0] = self.soils[k]["friction"]   # 그 흙의 마찰
         self.sim.data.mocap_pos[self.mocap[i]] = (x, y, top - PLATE_HALF[2])
 
     # ---- 물리 스텝마다 ----
     def update(self):
         """mj_step 뒤에 부른다: 이번 스텝의 접촉력(이번 스텝 접촉과 일치)으로 침하를 갱신하고, 다음 스텝의 받침판 높이를 정한다."""
         d = self.sim.data
-        S = self.soil
         for i, g in enumerate(self.feet):
             x, y, zc = (float(v) for v in d.geom_xpos[g])
             fn = self._foot_force(i)
@@ -256,26 +331,30 @@ class FootSoil:
                     self.sink_sum += self.zp[i]
                     self.sink_max = max(self.sink_max, self.zp[i])
                     self.slip_sum += math.sqrt(dx * dx + dy * dy)
+                    self.n_by[self.sidx[i]] += 1
+                    self.sink_by[self.sidx[i]] += self.zp[i]
                     self.on[i] = False
             if not self.on[i] and fn > 0:                            # 디딤 시작: 받침판이 있던 깊이부터 (구멍 바닥 또는 발이 들어가 있던 깊이)
                 self.on[i] = True
                 self.xy[i] = [x, y]
+                self.sidx[i] = self.soil_at(x, y)
                 self.zp[i] = max(self.surface(x, y) - self.top[i], 0.0)
             if self.on[i] and fn > 0:                                # 소성 침하: 지지력보다 세게 누르면 받침판이 내려간다
-                zp = self.zp[i]
-                fb = interp(zp, self.z_tab, self.f_tab) if zp > self.z_tab[0] else 0.0
+                zp, sd = self.zp[i], self.soils[self.sidx[i]]
+                zt, ft, at = sd["z_tab"], sd["f_tab"], sd["a_tab"]
+                fb = interp(zp, zt, ft) if zp > zt[0] else 0.0
                 if fn > fb:
-                    z_eq = interp(fn, self.f_tab, self.z_tab)
-                    area = max(interp(zp, self.z_tab, self.a_tab) if zp > self.z_tab[0] else 0.0, self.area_min)
-                    rate = (fn - fb) / (S["damping_r"] * area)
+                    z_eq = interp(fn, ft, zt)
+                    area = max(interp(zp, zt, at) if zp > zt[0] else 0.0, self.area_min)
+                    rate = (fn - fb) / (sd["damping_r"] * area)
                     self.zp[i] = min(zp + rate * self.dt, z_eq)
             self._place(i, x, y, zc - self.r)
-        if self.plow_ratio > 0:
+        if self.plow:
             self._plow()
 
     def _plow(self):
         """흙 속을 옆이나 위로 지나가는 발의 저항. 다음 물리 스텝에 걸 힘을 qfrc_applied에 쓴다."""
-        m, d, S = self.sim.model, self.sim.data, self.soil
+        m, d = self.sim.model, self.sim.data
         nv = m.nv
         qf, qv = d.qfrc_applied, d.qvel
         qf[:] = 0.0
@@ -284,7 +363,8 @@ class FootSoil:
             x, y, zc = (float(v) for v in d.geom_xpos[g])
             bottom = zc - self.r
             h = self.surface(x, y) - self._hole(x, y) - bottom      # 흙 표면(구멍 포함) 아래 잠긴 깊이
-            if h <= 0:
+            sd = self.soils[self.soil_at(x, y)]                     # 지금 지나가는 곳의 흙
+            if h <= 0 or sd["p_coef"] <= 0:
                 continue
             point = np.array([x, y, bottom + 0.5 * min(h, 2 * self.r)])
             mujoco.mj_jac(m, d, jac, None, point, self.bodies[i])
@@ -294,7 +374,7 @@ class FootSoil:
                 for j in range(nv):
                     s += float(jac[k, j]) * float(qv[j])
                 v[k] = s
-            p = self.p_coef * h ** S["bekker_n"]
+            p = sd["p_coef"] * h ** sd["n"]
             vh = math.sqrt(v[0] * v[0] + v[1] * v[1])
             # 수평 (정면 활꼴)과 위 (흙에 덮인 윗면)를 따로: 각 방향 속도의 반대로, 각자의 면적으로
             for up in (False, True):
@@ -326,6 +406,10 @@ class FootSoil:
     def mop(self):
         """디딤 통계 (끝난 디딤 기준): 침하(발자국 깊이)와 디딘 자리에서 미끄러진 거리. 합계로 세어 C++ 코어와 같다."""
         plow = {"plow_work_j": round(self.plow_work, 2), "plow_work_up_j": round(self.plow_work_up, 2)}
+        if len(self.soils) > 1:                  # 흙별 디딤 수와 평균 침하
+            plow["foot_sink_by_soil"] = {sd["name"]: {"stances": self.n_by[k],
+                                                      "sink_mean_m": round(self.sink_by[k] / self.n_by[k], 4) if self.n_by[k] else None}
+                                         for k, sd in enumerate(self.soils)}
         if not self.stance_n:
             return {"foot_sink_mean_m": None, "foot_sink_max_m": None, "foot_slip_mean_m": None, **plow}
         return {"foot_sink_mean_m": round(self.sink_sum / self.stance_n, 4), "foot_sink_max_m": round(self.sink_max, 4),

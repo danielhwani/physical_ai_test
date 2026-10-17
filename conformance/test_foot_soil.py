@@ -11,6 +11,8 @@
 6. 화면 발자국: 구멍은 화면 전용 토픽으로만 나가고, 물리 지형과 센서가 받는 지형은 그대로다
 7. 쟁기질 (흙 속을 옆이나 위로 지나가는 발의 저항): 무른 흙에서 전진이 줄고 흙에 준 일이 생긴다 (발을 빼며 위로 든 일 포함).
    끄면(plow_ratio 0) 저항 없이 더 멀리 간다. 단단한 흙은 발이 반지름보다 얕게 빠져 위에 덮인 흙이 없으므로 위쪽 저항이 거의 0이다
+8. 지역마다 다른 흙: 겹치면 나중 지역, 경계 포함, 같은 흙은 합침, 개수 상한. 진흙 띠(soil_strip)에서 띠 안 디딤이 더 깊고,
+   받침판 마찰이 그 흙의 tanφ로 바뀐다
 C++ 실시간 코어와 같은 결과인지는 conformance/test_rt_core.py test_foot_soil_matches_runner (lockstep 비트 동일)
 """
 import contextlib
@@ -160,6 +162,48 @@ def test_footprints_shown_on_screen_only():
     assert np.array_equal(sim.terrain.applied, applied0)           # 물리 지형은 그대로
     assert np.array_equal(terrain.heights, applied0.astype(np.float32))   # 센서가 받는 지형에도 구멍 없음
     print(f"    화면 발자국: 격자 점 {(depth > 0).sum()}개, 가장 깊은 곳 {100 * depth.max():.1f} cm")
+
+
+def test_soil_regions():
+    from sim.foot_soil import MAX_REGIONS, soil_list
+    cfg = {"preset": "firm", "regions": [{"region": [0, 0, 2, 2], "preset": "mud"}, {"region": [1, 1, 3, 3], "preset": "soft"},
+                                         {"name": "again", "region": [5, 5, 6, 6], "preset": "mud"},
+                                         {"region": [7, 7, 8, 8], "soil": {"bekker_kphi": 2.0e6}}]}
+    soils, regions = soil_list(cfg)
+    assert [n for n, _, _ in soils] == ["firm", "mud", "soft", "region3"], soils      # 같은 흙(mud 두 번)은 하나
+    assert soils[3][1]["friction_deg"] == 30.0 and soils[3][1]["bekker_kphi"] == 2.0e6     # 지역은 기본 흙에서 덮어쓴다
+    scn = copy.deepcopy(BASE)
+    scn["foot_soil"] = cfg
+    fs = Simulation(scn).foot_soil
+    assert [fs.soil_at(*p) for p in ((-1, -1), (0.5, 0.5), (1.5, 1.5), (2.0, 2.0), (3.0, 3.0), (5.5, 5.5))] == [0, 1, 2, 2, 2, 1]
+    for bad in ({"preset": "firm", "regions": [{"region": [1, 0, 0, 1], "preset": "mud"}]},
+                {"preset": "firm", "regions": [{"region": [k, 0, k + 1, 1], "preset": "mud"} for k in range(MAX_REGIONS + 1)]},
+                {"preset": "firm", "regions": [{"region": [k, 0, k + 1, 1], "soil": {"bekker_kphi": 1e6 + k}} for k in range(4)]}):
+        try:
+            soil_list(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"잘못된 지역 설정을 받았다: {bad}")
+
+
+def test_mud_strip():
+    scn = yaml.safe_load((ROOT / "scenarios/soil_strip.yaml").read_text())
+    scn["duration"] = 10.0
+    seen = set()
+
+    def each(sim):
+        fs = sim.foot_soil
+        for i, g in enumerate(fs.feet):
+            k = fs.sidx[i] if fs.on[i] else fs.soil_at(*sim.data.geom_xpos[g][:2])
+            assert sim.model.geom_friction[fs.plates[i], 0] == fs.soils[k]["friction"]
+            seen.add(k)
+    sim = _run(scn, 10.0, each)
+    by = sim.foot_soil.mop()["foot_sink_by_soil"]
+    assert seen == {0, 1} and by["firm"]["stances"] > 20 and by["mud_strip"]["stances"] > 10, by
+    assert by["mud_strip"]["sink_mean_m"] > 3 * by["firm"]["sink_mean_m"], by
+    assert sim.data.qpos[0] > 2.0                                   # 띠까지는 간다
+    print(f"    진흙 띠: 보통 흙 디딤 {by['firm']['stances']}번 평균 {100 * by['firm']['sink_mean_m']:.1f} cm, "
+          f"진흙 {by['mud_strip']['stances']}번 {100 * by['mud_strip']['sink_mean_m']:.1f} cm, 전진 {sim.data.qpos[0]:.2f} m")
 
 
 if __name__ == "__main__":
