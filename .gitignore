@@ -14,3 +14,7 @@ Screenshot*.png
 __pycache__/
 *.pyc
 .venv/
+
+# MJX 학습: 경로 확인용 작은 정책, 학습 파라미터
+policies/*_smoke/
+policies/*/params.pkl

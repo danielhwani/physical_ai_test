@@ -33,7 +33,8 @@ def main(card_path):
             k = 0
             while sim.data.time < 10.0:
                 sim.step_control()
-                if k % 10 == 0:
+                # 일어서기 복구 중에는 정책이 아니라 복구 동작이 행동을 낸다 (관측과 정책 출력의 짝이 맞지 않으므로 건너뛴다)
+                if k % 10 == 0 and sim.controller.recovery is None:
                     obs.append(sim.obs.copy()); act.append(sim.ctrl.last_raw.copy())
                 k += 1
     out = card["_dir"] / "io_reference.npz"

@@ -1149,6 +1149,23 @@ python3 -m siman_r.player recordings/sim_session.jsonl --target 127.0.0.1:3000 -
 
 ## 강화학습 준비 (GPU 장비에서)
 
+**이 PC에서 MJX 학습 실험** (2026-10-17, 실험적): GTX 1650(4 GB)이 있다. NVIDIA 드라이버는 RT 커널에서 올라가지 않으므로(PREEMPT_RT 미지원,
+모듈이 일반 커널용으로만 빌드됨) 학습은 일반 커널(`6.8.0-138-generic`, 부팅 메뉴 Advanced options)로 부팅해서 한다.
+conda 환경 `mjx` (Python 3.11, JAX 0.8.2 CUDA 12, MuJoCo 3.5.0 + MJX, Brax 0.14.2. JAX 0.10은 Brax 0.14와 맞지 않음).
+
+```bash
+JAX_PLATFORMS=cpu ~/miniconda3/envs/mjx/bin/python -m train.train_mjx --smoke        # RT 커널(GPU 없음): 전체 경로 확인 (약 3분)
+~/miniconda3/envs/mjx/bin/python -m train.train_mjx --envs 1024 --steps 20000000     # 일반 커널 + GPU
+```
+- `train/mjx_env.py`: 평지 걷기. actor = 배치용 관측 47개 + 잡음 + 연결 지연 0~2주기 (JAX 관측 함수는 `obs_reference.npz`와 최대 5e-7),
+  critic = 참 몸통 속도·높이·발 접촉 추가 (비대칭). 행동은 카드 규칙(기본 자세 + 0.25 × action), 정책 출력 −1~1 × 2. PD kp 40, kd 1.
+- `train/train_mjx.py`: Brax PPO -> ONNX(관측 정규화 포함, 저장 전에 Brax 추론과 비교) -> 정책 카드. 그다음 mj_ros에서
+  `make_policy_reference.py`, `test_policy.py`, `sim.runner --policy`.
+- CPU 확인 (RT 커널): 환경 16개, 2560스텝 학습 180초, ONNX = Brax 최대 차이 0, 시뮬레이터에 탑재되고 `test_policy` 4개 통과
+  (학습량이 아주 적어 걷지는 못함). 학습 안 된 정책이 일어서기 복구를 자주 불러 입출력 기준이 어긋나던 것을 고쳤다
+  (`make_policy_reference.py`가 복구 중인 스텝을 건너뜀).
+- 다음: 일반 커널에서 환경 수별 처리량, 4 GB에 들어가는 환경 수, 짧은 실제 학습.
+
 이 PC(GPU 없음)에서는 처리량이 나오지 않아 학습은 다른 장비에서 한다. 이 저장소는 **학습 결과(ONNX + 카드)를 받아 시험하는 쪽**이다.
 학습 쪽이 맞춰야 할 것과 이미 준비된 것:
 
