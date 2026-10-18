@@ -52,12 +52,31 @@ def launch_sensor_node(log_dir, sensors):
 
 def launch_controller_node(log_dir, scenario_path=None, policy=None, viz=False):
     """보행 알고리즘 ROS2 노드 (control/ros_node.py): 로봇 상태 토픽만 보고 관절 명령 토픽을 낸다."""
-    cmd = [sys.executable, "-m", "control.ros_node"] + (["--viz"] if viz else [])
+    cmd = [sys.executable, "-m", "control.ros_node"] + (["--publish-perception"] if viz else [])
     if policy:
         cmd += ["--policy", str(policy)]
     if scenario_path:
         cmd += ["--scenario", str(scenario_path)]
     return subprocess.Popen(cmd, cwd=ROOT, stdout=open(log_dir / "controller_node.log", "w"), stderr=subprocess.STDOUT)
+
+
+GODOT_BIN = os.environ.get("GODOT_BIN", str(Path.home() / "Applications/godot/Godot_v4.7.2-stable_linux.x86_64"))
+GODOT_PORT = 4243
+
+
+def launch_godot(log_dir, port=GODOT_PORT, points=False):
+    """Godot 4 렌더러: 중계기(중립 스트림 -> TCP)와 Godot 프로젝트(godot/). (godot, 중계기) 프로세스를 반환.
+    points: LiDAR 점군과 알고리즘 지형 지도도 그린다 (--godot-lidar).
+    GODOT_BIN으로 실행 파일을, GODOT_ARGS로 Godot 쪽 추가 인자(예: 시험용 --shot=경로 --shot-frames=N)를 바꾼다."""
+    bridge = subprocess.Popen([sys.executable, "-m", "viz.godot_bridge", "--port", str(port), *(["--points"] if points else [])],
+                              cwd=ROOT,
+                              stdout=open(log_dir / "godot_bridge.log", "w"), stderr=subprocess.STDOUT)
+    if not Path(GODOT_BIN).exists():
+        raise SystemExit(f"Godot 실행 파일이 없다: {GODOT_BIN} (README \"Godot 4 렌더러\", 또는 GODOT_BIN)")
+    extra = os.environ.get("GODOT_ARGS", "").split()
+    godot = subprocess.Popen([GODOT_BIN, "--path", str(ROOT / "godot"), "--", f"--port={port}", *extra], cwd=ROOT,
+                             stdout=open(log_dir / "godot.log", "w"), stderr=subprocess.STDOUT)
+    return godot, bridge
 
 
 def launch_mujoco_viewer(log_dir):
@@ -268,6 +287,19 @@ class Ros2StreamPublisher:
         if self._viz_n % 5 == 0:
             self.pub_map.publish(cloud)
         self._viz_n += 1
+
+    def publish_brain_config(self, scn, policy=None, viz=False):
+        """두뇌 설정 (/robot/brain_config, std_msgs/String JSON, 늦게 붙어도 받음): --set까지 반영한 시나리오의 controller 절,
+        정책 카드(저장소 기준 경로), 로봇 메시지 형식, 렌더러가 켜졌는지(viz: 두뇌가 지형 인지 상태를 화면용으로 발행할지).
+        다른 PC의 두뇌 노드가 시나리오 파일·옵션 없이 같은 설정으로 뜨게 한다."""
+        from rclpy.qos import DurabilityPolicy, QoSProfile
+        if policy:
+            p = Path(policy).resolve()
+            policy = str(p.relative_to(ROOT)) if p.is_relative_to(ROOT) else str(policy)
+        self.pub_brain = self.node.create_publisher(self._String, "/robot/brain_config",
+                                                    QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.pub_brain.publish(self._String(data=json.dumps({"scenario": scn.get("name"), "controller": scn.get("controller"),
+                                                             "policy": policy, "ros_msg": self.codec.mode, "viz": bool(viz)})))
 
     def publish_status(self, status):
         self.pub_status.publish(self._String(data=json.dumps(status)))

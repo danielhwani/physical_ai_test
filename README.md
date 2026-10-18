@@ -64,7 +64,7 @@ done
 | test_link_jitter | 5 | 5 s | 통계적 명령 지연: 시드 결정성, 분포, 로봇 쪽 규칙, C++ 경로 거부 |
 | test_foot_soil | 9 | 30 s | 무른 흙: 지지력 식 = SCM 기준, 서 있는 침하, 구멍, 흙별 걷기, 쟁기질(수평·위), 화면 전용 발자국, 지역마다 다른 흙(진흙 띠), 옵션 끄면 모델 그대로 |
 | test_policy | 4 | 3 s | 정책 카드, ONNX 입출력, 결정성, 추론 지연 |
-| test_render_stream | 7 | 8 s | 스트림만으로 장면 재구성, 흙 지역 화면 표시 |
+| test_render_stream | 9 | 8 s | 스트림만으로 장면 재구성, 흙 지역 화면 표시, Godot 중계기 메시지·점군 |
 | test_terrain_window | 4 | 13 s | 움직이는 지형 창, 바뀐 셀만 보는 지형 반영 = 전체 비교 규칙 |
 | test_lidar | 5 | 56 s | LiDAR 재현, 지형 표면, 자기 몸 제외 |
 | test_perception | 6 | 20 s | 높이 지도, 디딜 곳, height_scan 규약 |
@@ -473,6 +473,53 @@ LiDAR를 켜면 같은 프로세스 실행이 약 5배 느려진다 (스캔 계�
 
 **시나리오 `rut_crossing`**: vehicle_crossing의 바퀴 자국(평평한 바닥, 가파른 벽)을 Chrono 없이 MuJoCo 지형 패치(`rut`, `profile: box`)로
 재현했다. 빠르게 돌릴 수 있어 학습과 반복 시험에 쓴다. 지형을 모르는 트롯은 첫 자국에서 막히고 지형 인지 트롯은 통과한다.
+
+## Godot 4 렌더러 (`--godot`, 2026-10-18)
+
+RViz, MuJoCo 화면과 같은 중립 렌더 스트림을 받는 세 번째 렌더러다. 시뮬레이터는 바꾸지 않았다.
+
+```bash
+python -m sim.runner scenarios/flat_trot.yaml --godot                       # Python
+python -m sim.rt_link scenarios/soil_strip.yaml --brain shm --godot         # C++ 코어 (실시간)
+python -m sim.runner scenarios/vehicle_crossing.yaml --godot                # HMMWV (Chrono)
+python -m sim.rt_link scenarios/rut_crossing.yaml --brain shm --godot-lidar  # + LiDAR 점군
+python conformance/test_render_stream.py                                    # 중계기 메시지 시험 포함
+```
+
+```
+[시뮬레이터] ── ROS2 중립 스트림 ──▶ viz/godot_bridge.py ── TCP 127.0.0.1:4243 (한 줄에 JSON) ──▶ godot/ (Godot 4 프로젝트)
+ (그대로)      매니페스트, 지형 패치,    (중계기, mj_ros)                                      GDScript main.gd: 메시, 지형,
+               화면 발자국, TF, 상태                                                         발자국, 흙 지역, 정보판, 카메라
+```
+- **설치**: Godot 4.7.2 공식 바이너리를 `~/Applications/godot`에 둔다 (공식 SHA512 확인). 다른 위치면 `GODOT_BIN`.
+  `--godot`이 중계기와 Godot를 함께 띄우고, 창을 닫으면 끝난다 (RViz와 같다).
+- **왜 중계기**: GDScript는 ROS2를 직접 받지 못한다. 중계기가 받아 Godot가 바로 쓸 형태로 TCP로 넘긴다 (Godot 기본 TCP만 써서 추가 패키지 없음).
+  지형 창(로봇 주변 6 m, 2 m 벗어나면 옮김), 화면 발자국(지형 - 깊이), 흙 지역 색, 높이 명암은 RViz 어댑터와 같은 규칙으로 중계기에서 계산하고,
+  Godot는 받은 격자로 메시만 만든다 (약 4 Hz, 바뀌었을 때만). 포즈는 약 30 Hz.
+- **좌표**: 스트림은 ROS(REP-103: x 앞, y 왼쪽, z 위). Godot 장면 맨 위 노드 하나를 X축 -90° 돌려(ROS (x, y, z) -> Godot (x, z, -y))
+  그 아래에서는 ROS 좌표를 그대로 쓴다. 두 좌표계 모두 오른손 좌표계라 회전만 하면 되고, 변환하는 곳이 이 한 군데다.
+  OBJ는 Godot가 직접 읽는다 (같은 PC). 법선은 원래 감김(바깥이 반시계)으로 구하고, 삼각형 순서는 Godot 앞면(시계)으로 뒤집는다.
+- **그리는 것**: 로봇·HMMWV 메시, 지형(패치·지형 창·화면 발자국), 흙 지역 색과 이름, 발 접촉 구, 경로, 명령 화살표, 정보판(끝나면 최종 MOP),
+  몸통을 따라가는 카메라.
+- **카메라 조작** (바라보는 점 둘레를 도는 궤도 카메라. 화면 아래에 안내 문구):
+  왼쪽 끌기 = 돌리기, 휠 = 줌 인/아웃(0.5~60 m), 오른쪽·가운데 끌기 = 옮기기, F = 몸통 따라가기 켜기/끄기, R = 처음 시점.
+  끄는 중인지는 마우스가 움직일 때 눌린 버튼으로 판단한다 (창 밖에서 버튼을 떼도 계속 돌아가지 않는다).
+  처음 시점은 `GODOT_ARGS="--cam=방위,내려다보는각,거리"`(도, 도, m)로 바꿀 수 있다. 기본은 `-45,22.7,3.37`(왼쪽 뒤 위).
+- **점군** (`--godot-lidar`, 선택): `--godot`에 더해 LiDAR 점군(`/sensors/<이름>/points`, 높이 색: 낮음 파랑 -> 높음 빨강)과
+  알고리즘 지형 지도(`/control/terrain_map`, 지도 자기 색, 큰 점)를 그린다. 센서가 없으면 `front_lidar`를 켠다. L = 점군 보이기/숨기기.
+  중계기(`--points`)가 점군 토픽을 찾아 구독하고, 센서 좌표계 -> 월드 변환(/tf)을 해서 약 10 Hz로 넘긴다.
+  지형 지도는 알고리즘이 같은 프로세스일 때만 나온다 (`sim.runner`, `sim.rt_link --brain inproc`. RViz와 같다).
+  `sim.runner`는 LiDAR를 같은 프로세스에서 계산해 실시간보다 느리다 (아래 "rut_crossing + LiDAR" 표). 실시간으로 보려면 `sim.rt_link --brain shm`.
+  확인: rough_rut + 지형 인지(`sim.runner`, 점군과 지도), rut_crossing(`sim.rt_link --brain shm`, 점군, 늦은 스텝 0).
+  `test_godot_bridge_points`: 센서 좌표 -> 월드 변환, 높이 색, TF 전에는 보내지 않음.
+- **렌더러**: 호환 렌더러(OpenGL 3.3). 일반 커널에서는 GTX 1650으로 돈다. RT 커널에서는 NVIDIA 드라이버가 없어 소프트웨어 렌더링이 되며,
+  느릴 것으로 보지만 아직 확인하지 않았다.
+- **확인** (일반 커널, 시험용 스크린샷 `GODOT_ARGS="--shot=경로 --shot-frames=N"`: N프레임 뒤 PNG로 저장하고 끝냄):
+  flat_trot(`sim.runner`, `sim.rt_link`), soil_strip(진흙 띠 색과 이름, 발자국 두 줄, 정보판 `soil mud_strip`),
+  vehicle_crossing(HMMWV 메시, 바퀴 자국, 차와 거리). 메시 방향·면·조명이 맞게 나왔다.
+  `test_godot_bridge_messages`: 지형 메시지의 높이 = 스트림 지형 - 발자국 깊이, 진흙 띠 색이 짙음, 정보판 문구.
+  `test_viz_does_not_depend_on_physics`: 중계기는 MuJoCo도 sim도 불러오지 않는다.
+- **아직 없는 것**: 디딜 곳 표시(`/control/footholds`, RViz에만 있음), 같은 PC 밖의 Godot (중계기는 127.0.0.1만).
 
 ## 넓은 지형: 로봇을 따라다니는 지형 창
 
@@ -1402,7 +1449,27 @@ python conformance/test_rt_core.py                             # 규약 일치, 
   (shm: 공유 메모리 명령 링, ros: `/cmd_vel_stamped`). 고장(배터리, IMU, 링크 두절)은 코어가 처리한다.
 - 명령에 "어느 시각의 상태로 계산했는지"(시뮬레이션 시각)가 실려 있어, 두 PC의 시계를 맞추지 않아도 지연을 잰다.
 - 다른 PC: `python -m sim.rt_link <시나리오> --brain ros --remote-brain`으로 띄우면 노드를 기다린다. 두뇌 PC에서 같은
-  `ROS_DOMAIN_ID`로 `python -m control.ros_node --scenario <같은 시나리오 파일>`. (이 PC 안에서만 시험했다)
+  `ROS_DOMAIN_ID`로 `python -m control.ros_node` (어느 쪽을 먼저 띄워도 된다). (이 PC 안에서만 시험했다)
+  시나리오 파일은 보내지 않아도 된다: 시뮬레이터가 `--set`까지 반영한 controller 절, 정책 카드(저장소 기준 경로), 로봇 메시지 형식을
+  `/robot/brain_config`(std_msgs/String JSON, 늦게 붙어도 받는 토픽)로 내고, `--scenario` 없는 노드는 이걸 받아 같은 설정으로 뜬다.
+  화면에 렌더러(`--rviz`, `--mjviz`, `--godot`)가 켜져 있으면 그것도 알려, 두뇌가 지형 인지 상태(`/control/terrain_map`,
+  `/control/footholds`, 화면용이고 로봇 동작과 무관)를 알아서 발행한다. 두뇌 쪽에서 정하려면 `--publish-perception` / `--no-publish-perception`
+  (예전 이름 `--viz`도 받는다).
+  정책 카드와 ONNX는 두뇌 PC의 저장소에도 있어야 한다. `--scenario`/`--policy`/`--ros-msg`를 주면 그 값이 우선한다.
+  확인 (같은 PC, 두뇌를 먼저 띄움): rough_rut + 지형 인지(`--set controller.perception.sensor=front_lidar`)가 노드에 그대로 전달됐고,
+  flat_trot + `--policy policies/go2_trot_bc/card.yaml`이 ONNX 정책으로 떴다. 렌더러를 켜면 두뇌가 "렌더러 켬"을 받아 지형 지도를 발행하고
+  (Godot 중계기가 `/control/terrain_map`을 구독), 끄면 그 토픽이 생기지 않았다. `test_ros_equivalence` 4개 통과.
+  같은 PC에서 두 PC처럼 띄우기 (두 터미널 모두 `export ROS_DOMAIN_ID=77`처럼 같은 번호):
+  ```bash
+  python -m control.ros_node                                                    # 터미널 2 (두뇌), 먼저 띄워도 됨
+  python -m sim.rt_link scenarios/rough_rut.yaml --brain ros --remote-brain --godot-lidar --set controller.perception.sensor=front_lidar   # 터미널 1
+  ```
+  두뇌 노드는 실행 한 번에 설정을 한 번 받는다 (시뮬레이션을 다시 돌리면 두뇌도 다시 띄운다).
+  **실시간 결과가 실행마다 크게 다르다** (rough_rut + 지형 인지, ROS 두뇌 실시간 15초): 같은 조건에서 전진 2.2, 3.5, 4.4 m
+  (다른 실행 4.05, 4.21, 4.15, 1.91 m). 두뇌의 화면용 발행 여부와는 관계없었다 (켬 2.2, 4.4 m / 끔 3.5 m).
+  같은 프로세스 실행은 1.9~2.3 m였다 (`sim.runner` 1.888 m, `sim.rt_link --brain shm` 2.293 m, 각 한 번).
+  lockstep에서는 ROS 두뇌도 같은 프로세스와 비트 단위로 같다 (`test_perceptive_trot_ros_node_matches_in_process`).
+  원인은 아직 조사하지 않았다 (LiDAR 스캔과 명령이 네트워크로 오가는 시점이 매번 달라서일 수 있다. 늦은 주기 2~34개, 스캔 버림 4~6개).
 - lockstep: 세 방식이 Python 시뮬레이터와 비트 단위로 같다. 링크 두절(감쇠·유지), 배터리 저하가 섞여도 같다 (복구 뒤 일어서기 포함).
   링크 두절이 풀린 직후에는 두절 전에 계산된 명령을 실행하지 않고 직전에 실행한 명령을 유지한다 (Python과 같게 맞춤).
 - 실시간 15초 (750주기): 명령 지연 평균/최대, 한 주기보다 늦게 실행된 주기 수
@@ -1909,8 +1976,9 @@ ros2 interface show go2_rt_msgs/msg/LowState
 python -m sim.rt_link scenarios/flat_trot.yaml --brain ros --ros-msg json --rviz
 
 # 5. 두뇌를 따로 띄우기 (다른 PC 흉내). 터미널 1: 두뇌 노드, 터미널 2: 시뮬레이터 (노드를 기다림)
-python -m control.ros_node --ros-msg typed --scenario scenarios/flat_trot.yaml
+python -m control.ros_node                          # 시나리오 설정·메시지 형식은 시뮬레이터에서 받는다 (/robot/brain_config)
 python -m sim.rt_link scenarios/flat_trot.yaml --brain ros --remote-brain --ros-msg typed --rviz
+#    파일로 주려면: python -m control.ros_node --ros-msg typed --scenario scenarios/flat_trot.yaml
 #    두뇌 노드를 --ros-msg json으로 띄우면 시뮬레이터가 바로 "두뇌 노드의 메시지 형식이 다르다 ... --ros-msg typed로 띄울 것"
 #    (이때 빈 실행 폴더 runs/flat_trot_rt_<시각>가 생길 수 있다). 노드는 Ctrl+C로 끝낸다
 ```

@@ -44,6 +44,7 @@ def _imported_roots(modules):
 
 def test_viz_does_not_depend_on_physics():
     assert _imported_roots("viz.stream_decode, viz.rviz_adapter") == "[]", "RViz 경로가 MuJoCo/sim을 불러옴"
+    assert _imported_roots("viz.godot_bridge") == "[]", "Godot 중계기가 MuJoCo/sim을 불러옴"
     assert _imported_roots("viz.mujoco_adapter") == "['mujoco']", "MuJoCo 렌더러가 물리 시뮬레이션(sim/)을 불러옴"
 
 
@@ -182,6 +183,61 @@ def test_soil_regions_on_screen():
     caps = [vs.geoms[i] for i in range(vs.ngeom) if vs.geoms[i].type == mujoco.mjtGeom.mjGEOM_CAPSULE]
     assert len(caps) == 4 and min(g.size[2] for g in caps) > 0       # 테두리 네 변 (로봇 근처 ±3 m)
     assert build_manifest(sim.model, sim.terrain)["soil_regions"] == []   # 무른 흙이 없으면 빈 목록
+
+
+def test_godot_bridge_messages():
+    """Godot 중계기: 매니페스트·지형 패치·발자국으로 만든 지형 메시지가 스트림의 지형과 같고, 흙 지역은 그 색, 정보판 문구가 나온다.
+    Godot 쪽(godot/main.gd)은 이 메시지로 메시만 만든다."""
+    import base64
+    import rclpy
+    from sim.stream import TerrainPatchStream, build_status
+    from std_msgs.msg import String
+    from viz.godot_bridge import GodotBridge, status_lines
+    scn = yaml.safe_load((ROOT / "scenarios/soil_strip.yaml").read_text())
+    sim = Simulation(scn)
+    sim.foot_soil.display[200, 240] = 0.05                       # 화면 발자국 깊이 하나 (격자점)
+    from sim.stream import TerrainOverlayStream
+    over = TerrainOverlayStream(sim.foot_soil.display_depth, sim.foot_soil.display.shape).update()
+    rclpy.init()
+    try:
+        br = GodotBridge(0)                                       # 포트 0: 빈 포트
+        br.on_manifest(String(data=json.dumps(build_manifest(sim.model, sim.terrain, soil_regions=sim.foot_soil.display_regions()))))
+        br.on_patch(String(data=json.dumps(TerrainPatchStream(sim.terrain).full())))
+        br.on_overlay(String(data=json.dumps(over)))
+        t = br.terrain_msg()
+        H = np.frombuffer(base64.b64decode(t["h"]), "<f4").reshape(t["nrow"], t["ncol"])
+        rgb = np.frombuffer(base64.b64decode(t["rgb"]), "<f4").reshape(t["nrow"], t["ncol"], 3)
+        xs = t["x0"] + np.arange(t["ncol"]) * t["dx"]
+        ys = t["y0"] + np.arange(t["nrow"]) * t["dy"]
+        r, c = int(np.argmin(np.abs(ys - sim.terrain.ys[200]))), int(np.argmin(np.abs(xs - sim.terrain.xs[240])))
+        assert abs(H[r, c] - (sim.terrain.applied[200, 240] - 0.05)) < 1e-6        # 지형 - 발자국 깊이
+        mud = rgb[:, (xs >= 2.0) & (xs <= 3.5)].mean(axis=(0, 1))
+        firm = rgb[:, xs < 1.5].mean(axis=(0, 1))
+        assert mud[0] < firm[0] - 0.15, (mud, firm)               # 진흙 띠는 짙다
+        lines, alert = status_lines(_roundtrip(build_status(sim, sim.data.qpos[:2].copy(), 0.0, 0)))
+        assert any(ln.startswith("soil firm") for ln in lines) and not alert
+        br.destroy_node()
+    finally:
+        rclpy.shutdown()
+
+
+def test_godot_bridge_points():
+    """Godot 중계기 점군: 센서 좌표계 PointCloud2 + world -> 센서 TF를 월드 좌표로 바꾸고, 높이 색은 낮을수록 파랑."""
+    import mujoco
+    from viz.godot_bridge import cloud_to_world
+    from viz.ros_msgs import scan_to_msgs
+    rng = np.random.default_rng(0)
+    R = np.empty(9)
+    mujoco.mju_quat2Mat(R, np.array([0.9, 0.1, -0.2, 0.3]) / np.linalg.norm([0.9, 0.1, -0.2, 0.3]))
+    R = R.reshape(3, 3)
+    p = np.array([1.0, -2.0, 0.3])
+    pts = rng.normal(0, 2, (50, 3))
+    msg, tf = scan_to_msgs("front_lidar", {"t": 1.0, "points": pts, "ring": np.zeros(50), "label": np.zeros(50), "p": p, "R": R})
+    tr, q = tf.transform.translation, tf.transform.rotation
+    xyz, rgb = cloud_to_world(msg, {"front_lidar": [tr.x, tr.y, tr.z, q.x, q.y, q.z, q.w]})
+    assert np.abs(xyz - (pts @ R.T + p)).max() < 1e-5
+    assert rgb[np.argmin(xyz[:, 2])][2] == 1.0 and rgb[np.argmax(xyz[:, 2])][0] == 1.0
+    assert cloud_to_world(msg, {}) is None                      # TF를 아직 모르면 보내지 않는다
 
 
 if __name__ == "__main__":

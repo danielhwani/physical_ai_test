@@ -19,3 +19,6 @@ __pycache__/
 policies/*_smoke/
 policies/*/params.pkl
 policies/go2_mjx_flat/
+
+# Godot 편집기·가져오기 캐시
+godot/.godot/

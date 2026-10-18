@@ -283,6 +283,7 @@ class RosBrain(InprocBrain):
         self.link, self.remote = link, remote
         self.bridge = bridge or Ros2StreamPublisher(sim.model, sim.terrain, sim.cosim)
         self.bridge.enable_robot_io()
+        self.bridge.publish_brain_config(sim.scn, policy, viz)    # 다른 PC 두뇌는 --scenario 없이 이걸 받는다
         self.proc = None if remote else launch_controller_node(log_dir or ROOT / "build/rt", scn_path, policy, viz=viz)
         self.forwarded = None
 
@@ -326,7 +327,7 @@ class RosBrain(InprocBrain):
 def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inproc", policy=None, remote=False,
         viz=(), out_dir=None, variant="cpu", overrides=(), dis=None, chrono_max_lag=CHRONO_MAX_LAG):
     """시나리오를 C++ 코어로 실행하고 (MOP, 끝 qpos)를 돌려준다.
-    viz: ("rviz", "mjviz") 중 고른 것. out_dir: 기록 폴더 (timeseries.parquet, summary.json, 로그. 없으면 남기지 않음).
+    viz: ("rviz", "mjviz", "godot", "godot_lidar") 중 고른 것. out_dir: 기록 폴더 (timeseries.parquet, summary.json, 로그. 없으면 남기지 않음).
     variant: 모델 설정 (cpu / mjx, sim.runner --variant와 같다).
     dis: DIS 콘솔 설정 {port, host, key(bytes), wait, comm_lost} (실시간 전용).
     chrono_max_lag: 실시간에서 Chrono가 이보다(s) 뒤처지면 코어를 멈춰 기다린다 (0: 상한 없음)."""
@@ -699,6 +700,10 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
             displays.append(("RViz", rviz)); helpers.append(adapter)
         if "mjviz" in viz:
             displays.append(("MuJoCo viewer", launch_mujoco_viewer(log_dir)))
+        if "godot" in viz:
+            from .ros2_bridge import launch_godot
+            godot, godot_bridge = launch_godot(log_dir, points="godot_lidar" in viz)
+            displays.append(("Godot", godot)); helpers.append(godot_bridge)
         if displays:
             if verbose:
                 print(f"{', '.join(n for n, _ in displays)} 시작 대기 중...")
@@ -722,8 +727,7 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
             if remote and time.monotonic() >= next_note:
                 next_note += 10
                 print(f"두뇌 노드를 기다린다: 다른 PC에서 ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', 0)} "
-                      f"python -m control.ros_node --ros-msg {br.bridge.codec.mode} --scenario <이 시나리오 파일 복사본> "
-                      f"(시나리오: {scn_path})")
+                      f"python -m control.ros_node  (시나리오 설정·정책·메시지 형식·화면 발행 여부는 /robot/brain_config로 받는다)")
             if time.monotonic() - t0 > (3600 if remote else 30):
                 raise RuntimeError("두뇌가 붙지 않았다")
             time.sleep(0.05)
@@ -902,6 +906,9 @@ def main():
                     help=f"실시간 Chrono가 이보다 뒤처지면 세계를 멈춰 기다린다 (기본 {CHRONO_MAX_LAG}, 0: 상한 없음)")
     ap.add_argument("--rviz", action="store_true", help="RViz로 보기 (sim.runner --rviz와 같은 화면)")
     ap.add_argument("--mjviz", action="store_true", help="MuJoCo 렌더러로 보기")
+    ap.add_argument("--godot", action="store_true", help="Godot 4 렌더러로 보기 (viz/godot_bridge.py + godot/)")
+    ap.add_argument("--godot-lidar", action="store_true",
+                    help="--godot + LiDAR 점군과 알고리즘 지형 지도 (시나리오에 센서가 없으면 front_lidar를 켠다)")
     ap.add_argument("--cpu", type=int, default=5, help="코어를 고정할 CPU (-1: 고정 안 함)")
     ap.add_argument("--priority", type=int, default=80, help="SCHED_FIFO 우선순위 (0: 일반)")
     ap.add_argument("--set", action="append", metavar="KEY=VALUE")
@@ -915,9 +922,13 @@ def main():
         print(json.dumps(layout(), indent=2))
     if a.scenario:
         scn = apply_overrides(load_yaml(a.scenario), a.set)
+        if a.godot_lidar:
+            a.godot = True
+            if not scn.get("sensors"):
+                scn["sensors"] = ["front_lidar"]
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         out = ROOT / "runs" / f"{scn['name']}_rt_{stamp}"          # 기록기가 만든다 (지원하지 않는 시나리오면 만들지 않음)
-        viz = tuple(v for v in ("rviz", "mjviz") if getattr(a, v))
+        viz = tuple(v for v in ("rviz", "mjviz", "godot", "godot_lidar") if getattr(a, v))
         dis = None
         if a.dis_port is not None:
             if a.lockstep:

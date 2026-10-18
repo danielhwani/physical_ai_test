@@ -104,9 +104,10 @@
 | `viz/sensor_renderer.py` (+ `sensor_node.py`) | `--sensor`, `--sensor-node` | 센서 출력 (LiDAR 점군 `/sensors/<이름>/points`). 같은 스트림으로 장면을 재구성해 레이캐스트 |
 | `viz/rviz_adapter.py` | `--rviz` | URDF(RobotModel), 지형 타일 마커, 정보판 마커. MuJoCo도 import하지 않음 |
 | `viz/mujoco_adapter.py` | `--mjviz` | 매니페스트로 만든 **그리기 전용** MuJoCo 모델 (모든 바디 mocap, 물리 계산 없음) + 뷰어. MuJoCo를 그리기 라이브러리로만 사용 |
+| `viz/godot_bridge.py` + `godot/` | `--godot` | 중계기가 스트림을 TCP(127.0.0.1, 한 줄에 JSON)로 Godot 4에 넘김. 지형 창·발자국·흙 색은 중계기, 메시·화면은 GDScript. 좌표는 장면 맨 위 노드 X축 -90° 한 곳에서 |
 | UE5 어댑터 | (계획) | `docs/ue5_integration.md` |
 
-`--rviz`와 `--mjviz`는 함께 켤 수 있다. 렌더러는 `sim/`(물리 시뮬레이션)을 import하지 않는다.
+`--rviz`와 `--mjviz`는 함께 켤 수 있다 (`--godot`과 함께 켜는 것은 아직 확인하지 않았다). 렌더러는 `sim/`(물리 시뮬레이션)을 import하지 않는다.
 
 세계 지형이 크면 렌더러는 로봇 주변 창만 그린다 (`viz/stream_decode.py`의 `TerrainWindow`: 상태의 `base_pos`를 따라
 1 m 단위로 이동). 물리 쪽 MuJoCo 창과는 독립이며, 스트림은 항상 세계 좌표의 전체 지형을 기준으로 한다.

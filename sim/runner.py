@@ -552,6 +552,11 @@ def run(args):
             helpers.append(rviz_adapter)
         if args.mjviz:
             displays.append(("MuJoCo viewer", launch_mujoco_viewer(out)))
+        if getattr(args, "godot", False):
+            from .ros2_bridge import launch_godot
+            godot, godot_bridge = launch_godot(out, points=getattr(args, "godot_lidar", False))
+            displays.append(("Godot", godot))
+            helpers.append(godot_bridge)
         if sensor_node:
             names = list(dict.fromkeys(list(scenario.get("sensors", [])) + list(getattr(args, "sensor", None) or [])))
             helpers.append(launch_sensor_node(out, names or ["front_lidar"]))
@@ -817,6 +822,10 @@ def main():
                     help="RViz로 가시화 (--ros2, --realtime 자동 적용. conda 환경에서 바로 실행 가능)")
     ap.add_argument("--mjviz", action="store_true",
                     help="MuJoCo 렌더러 어댑터로 가시화 (중립 스트림만 사용. HMMWV 등 다른 물리엔진 바디도 표시)")
+    ap.add_argument("--godot", action="store_true",
+                    help="Godot 4 렌더러로 가시화 (viz/godot_bridge.py + godot/. --ros2, --realtime 자동)")
+    ap.add_argument("--godot-lidar", action="store_true",
+                    help="--godot + LiDAR 점군과 알고리즘 지형 지도 표시 (센서가 없으면 front_lidar를 켠다)")
     ap.add_argument("--policy", help="정책 카드 경로 (예: policies/go2_trot_bc/card.yaml). 없으면 트롯 보행기")
     ap.add_argument("--variant", choices=["cpu", "mjx"], default="cpu",
                     help="mjx: specs/go2_mjx_override.yaml 적용 모델 (CPU MuJoCo로 실행)")
@@ -842,7 +851,11 @@ def main():
     args = ap.parse_args()
     from control.robot_msgs import set_mode
     set_mode(getattr(args, "ros_msg", None))
-    if args.rviz or args.mjviz or args.sensor_node or args.controller_node:
+    if args.godot_lidar:
+        args.godot = True
+        if not args.sensor:
+            args.sensor = ["front_lidar"]       # 시나리오에 센서가 이미 있으면 이름만 겹친다 (중복은 Simulation이 없앤다)
+    if args.rviz or args.mjviz or args.godot or args.sensor_node or args.controller_node:
         args.ros2 = args.realtime = True
     run(args)
 
