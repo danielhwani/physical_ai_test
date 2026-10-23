@@ -104,6 +104,7 @@ Chrono 시나리오의 MOP에는 지면 변형량(`deformed_cells`, `deform_mean
 | `viz/` | 렌더러 쪽 (물리 시뮬레이션 `sim/` import 금지). `stream_decode.py` 공용 디코더, `rviz_adapter.py` 중립 스트림 -> RViz, `mujoco_adapter.py` 중립 스트림 -> 그리기 전용 MuJoCo 모델 -> 뷰어 | §6, §8 |
 | `config/go2.rviz` | RViz 설정 (로봇, 지형, 정보, 카메라가 몸통 추적). 시뮬레이션 시각을 쓰므로 `use_sim_time:=true` 필요 | – |
 | `docs/render_interface.md` | 렌더 인터페이스 계약 (메시지, 규약, 어댑터 추가 방법, 계약 시험) | §8 |
+| `docs/map_server.md` | 맵 서버 설계 초안 (타일, 바탕 배포 + 변경 동기화, 여러 물리엔진·렌더러가 같은 지형. 아직 구현 안 함) | §5.1 |
 | `sim/chrono_link.py` | Chrono 연동 (러너 쪽): 프로세스 실행, 격자 정합 검사, 파이프라인 동기, 지형/차량 반영, 근접 판정 | §5 |
 | `sensors/` | 엔진 무관 센서 모델 (`lidar.py` LiDAR, `proprio.py` 관절·IMU·발 힘 잡음). 명세는 `specs/go2_sensors.yaml` | §8 |
 | `viz/sensor_renderer.py`, `viz/sensor_node.py` | 센서 렌더러 (중립 스트림 -> 장면 -> 레이캐스트 -> 점군)와 ROS2 별도 프로세스 노드 | §8 |
