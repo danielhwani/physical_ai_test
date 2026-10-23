@@ -17,6 +17,7 @@ const CAM_DIST_MAX := 60.0
 const ORBIT_DEG_PER_PX := 0.3
 const ZOOM_STEP := 1.12              # 휠 한 칸에 거리 ×/÷
 const HINT := "drag: rotate   wheel: zoom   right/middle drag: pan   F: follow on/off   R: reset view"
+const L_HINT := "   L: points/footholds on/off"
 
 var host := "127.0.0.1"
 var port := 4243
@@ -47,9 +48,12 @@ var cam_follow := true               # F: 몸통 따라가기 켜고 끄기
 var label: Label
 var hint: Label
 var clouds := {}                     # 점군 토픽 -> MeshInstance3D (중계기 --points일 때만 온다)
-var clouds_visible := true           # L: 점군 보이기/숨기기
+var clouds_visible := true           # L: 점군·디딜 곳 보이기/숨기기
+var foothold_root: Node3D            # 디딜 곳 (구 + 옮긴 선분). 처음 받을 때 만든다
+var foothold_spheres := []
+var foothold_lines: MeshInstance3D
 var frames := 0
-var stats := {"scene": 0, "poses": 0, "terrain": 0, "status": 0, "points": 0}
+var stats := {"scene": 0, "poses": 0, "terrain": 0, "status": 0, "points": 0, "markers": 0}
 
 
 func _ready() -> void:
@@ -222,6 +226,8 @@ func _unhandled_input(event: InputEvent) -> void:
 			clouds_visible = not clouds_visible
 			for mi in clouds.values():
 				mi.visible = clouds_visible
+			if foothold_root != null:
+				foothold_root.visible = clouds_visible
 
 
 func _handle(msg: Dictionary) -> void:
@@ -245,6 +251,58 @@ func _handle(msg: Dictionary) -> void:
 			_update_status(msg)
 		"points":
 			_build_points(msg)
+		"markers":
+			_update_footholds(msg)
+
+
+func _update_footholds(msg: Dictionary) -> void:
+	# 디딜 곳 (월드 = ROS 좌표): 구는 다시 쓰고 모자라면 더 만든다. 선분은 매번 새로 그린다
+	if foothold_root == null:
+		foothold_root = Node3D.new()
+		foothold_root.visible = clouds_visible
+		world.add_child(foothold_root)
+		foothold_lines = MeshInstance3D.new()
+		var lm := StandardMaterial3D.new()
+		lm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		lm.vertex_color_use_as_albedo = true
+		lm.no_depth_test = true                  # 다리에 가려도 보이게
+		foothold_lines.material_override = lm
+		foothold_root.add_child(foothold_lines)
+		if not hint.text.ends_with(L_HINT):
+			hint.text = HINT + L_HINT
+	var spheres: Array = msg["spheres"]
+	while foothold_spheres.size() < spheres.size():
+		var s := MeshInstance3D.new()
+		var sm := SphereMesh.new()
+		sm.radius = 0.5
+		sm.height = 1.0
+		sm.radial_segments = 12
+		sm.rings = 6
+		s.mesh = sm
+		var m := StandardMaterial3D.new()
+		m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		s.material_override = m
+		foothold_root.add_child(s)
+		foothold_spheres.append(s)
+	for i in foothold_spheres.size():
+		var s: MeshInstance3D = foothold_spheres[i]
+		s.visible = i < spheres.size()
+		if s.visible:
+			var v: Array = spheres[i]
+			s.position = Vector3(v[0], v[1], v[2])
+			s.scale = Vector3.ONE * float(v[3])
+			(s.material_override as StandardMaterial3D).albedo_color = Color(v[4], v[5], v[6], v[7])
+	var lines: Array = msg["lines"]
+	var im := ImmediateMesh.new()
+	if lines.size() > 0:
+		im.surface_begin(Mesh.PRIMITIVE_LINES)
+		for v in lines:
+			im.surface_set_color(Color(v[6], v[7], v[8], v[9]))
+			im.surface_add_vertex(Vector3(v[0], v[1], v[2]))
+			im.surface_add_vertex(Vector3(v[3], v[4], v[5]))
+		im.surface_end()
+	foothold_lines.mesh = im
 
 
 func _build_points(msg: Dictionary) -> void:
@@ -261,7 +319,7 @@ func _build_points(msg: Dictionary) -> void:
 		mi.visible = clouds_visible
 		world.add_child(mi)
 		clouds[name] = mi
-		hint.text = HINT + "   L: points on/off"
+		hint.text = HINT + L_HINT
 	var xyz := Marshalls.base64_to_raw(msg["xyz"]).to_float32_array()
 	var rgb := Marshalls.base64_to_raw(msg["rgb"]).to_float32_array()
 	var n: int = msg["n"]

@@ -64,7 +64,7 @@ done
 | test_link_jitter | 5 | 5 s | 통계적 명령 지연: 시드 결정성, 분포, 로봇 쪽 규칙, C++ 경로 거부 |
 | test_foot_soil | 9 | 30 s | 무른 흙: 지지력 식 = SCM 기준, 서 있는 침하, 구멍, 흙별 걷기, 쟁기질(수평·위), 화면 전용 발자국, 지역마다 다른 흙(진흙 띠), 옵션 끄면 모델 그대로 |
 | test_policy | 4 | 3 s | 정책 카드, ONNX 입출력, 결정성, 추론 지연 |
-| test_render_stream | 9 | 8 s | 스트림만으로 장면 재구성, 흙 지역 화면 표시, Godot 중계기 메시지·점군 |
+| test_render_stream | 10 | 8 s | 스트림만으로 장면 재구성, 흙 지역 화면 표시, Godot 중계기 메시지·점군·디딜 곳 |
 | test_terrain_window | 4 | 13 s | 움직이는 지형 창, 바뀐 셀만 보는 지형 반영 = 전체 비교 규칙 |
 | test_lidar | 5 | 56 s | LiDAR 재현, 지형 표면, 자기 몸 제외 |
 | test_perception | 6 | 20 s | 높이 지도, 디딜 곳, height_scan 규약 |
@@ -512,6 +512,27 @@ python conformance/test_render_stream.py                                    # �
   `sim.runner`는 LiDAR를 같은 프로세스에서 계산해 실시간보다 느리다 (아래 "rut_crossing + LiDAR" 표). 실시간으로 보려면 `sim.rt_link --brain shm`.
   확인: rough_rut + 지형 인지(`sim.runner`, 점군과 지도), rut_crossing(`sim.rt_link --brain shm`, 점군, 늦은 스텝 0).
   `test_godot_bridge_points`: 센서 좌표 -> 월드 변환, 높이 색, TF 전에는 보내지 않음.
+- **디딜 곳** (2026-10-24, 지형 인지 보행기일 때 저절로): 두뇌의 `/control/footholds`(RViz와 같은 MarkerArray)를 중계기가 찾아 구독하고
+  odom -> 월드로 옮겨 약 10 Hz로 넘긴다. 다리마다 고른 곳(공중 다리 주황 큰 구, 디딘 다리 하늘색), 원래 자리(회색 작은 구), 옮긴 만큼의 흰 선분.
+  선분은 다리에 가려도 보이게 그린다. L로 점군과 함께 끄고 켠다. 지형 지도처럼 알고리즘이 같은 프로세스이거나(`sim.runner`,
+  `sim.rt_link --brain inproc`) 다른 프로세스 두뇌가 발행할 때(`--brain ros`, 렌더러가 켜져 있으면 저절로) 나온다. `--brain shm`에서는 안 나온다.
+  확인: rut_crossing + 지형 인지(`sim.runner`, `sim.rt_link --brain inproc`, `--brain ros`)에서 구와 선분이 다리 아래에 나왔다
+  (ros 실시간: 넘어짐 없음, 늦은 명령 3, 디딜 곳 메시지 67개). 디딘 다리의 구는 발 접촉 표시(초록 구)와 거의 같은 자리라 겹쳐 보인다.
+  `test_godot_bridge_footholds`: odom -> 월드, 구 크기·선분 끝점, TF 전에는 보내지 않음.
+  (`sim.rt_link --brain inproc` 실시간 지형 인지는 늦은 명령 45개에 넘어졌다. 실시간 지형 인지는 shm/ros 두뇌를 쓴다)
+  **`--brain shm`에서 안 나오는 이유**: 지형 지도와 디딜 곳은 두뇌 안에만 있는 상태다. inproc은 `rt_link`가 같은 프로세스의 두뇌 상태
+  (`perception_snapshot()`)를 읽어 발행하고, ros 두뇌(`control/ros_node.py`)는 ROS2 노드라 직접 발행한다. shm 두뇌(`control/rt_brain.py`)는
+  ROS2 없이 공유 메모리만 쓰고, 공유 메모리 규약에는 로봇 상태·관절 명령·이동 명령·LiDAR 스캔 칸만 있어 내보낼 길이 없다
+  (같은 PC 최소 지연용으로 연결을 최소로 뒀다). 필요하면: (1) shm 두뇌가 렌더러가 켜졌을 때만 ROS2로 직접 발행 (단순, 실시간 두뇌에 ROS2가 들어감),
+  (2) 공유 메모리에 지형 인지 칸을 더해 `rt_link`가 발행 (규약 v14, C++ 배치도 맞춤). 아직 하지 않았다. 지금은 화면이 필요하면 inproc이나 ros 두뇌를 쓴다.
+  ```bash
+  python -m sim.runner scenarios/rut_crossing.yaml --godot --set controller.perception.sensor=front_lidar                      # Python
+  python -m sim.rt_link scenarios/rut_crossing.yaml --brain ros --godot --set controller.perception.sensor=front_lidar          # 실시간
+  python -m sim.rt_link scenarios/rut_crossing.yaml --brain ros --godot-lidar --set controller.perception.sensor=front_lidar    # + 점군·지형 지도
+  python -m sim.rt_link scenarios/rut_crossing.yaml --brain shm --godot --set controller.perception.sensor=front_lidar          # 비교: 안 나옴
+  ```
+  휠로 줌 인하고 낮은 각도로 돌려 보면 잘 보인다. 바퀴 자국 가장자리 근처에서 흰 선이 길어진다 (가장자리를 피해 옮김).
+  안 나오면 실행 폴더 `godot_bridge.log`에 `디딜 곳 구독: /control/footholds`가 있는지 본다.
 - **렌더러**: 호환 렌더러(OpenGL 3.3). 일반 커널에서는 GTX 1650으로 돈다. RT 커널에서는 NVIDIA 드라이버가 없어 소프트웨어 렌더링이 되며,
   느릴 것으로 보지만 아직 확인하지 않았다.
 - **확인** (일반 커널, 시험용 스크린샷 `GODOT_ARGS="--shot=경로 --shot-frames=N"`: N프레임 뒤 PNG로 저장하고 끝냄):
@@ -519,7 +540,7 @@ python conformance/test_render_stream.py                                    # �
   vehicle_crossing(HMMWV 메시, 바퀴 자국, 차와 거리). 메시 방향·면·조명이 맞게 나왔다.
   `test_godot_bridge_messages`: 지형 메시지의 높이 = 스트림 지형 - 발자국 깊이, 진흙 띠 색이 짙음, 정보판 문구.
   `test_viz_does_not_depend_on_physics`: 중계기는 MuJoCo도 sim도 불러오지 않는다.
-- **아직 없는 것**: 디딜 곳 표시(`/control/footholds`, RViz에만 있음), 같은 PC 밖의 Godot (중계기는 127.0.0.1만).
+- **아직 없는 것**: 같은 PC 밖의 Godot (중계기는 127.0.0.1만).
 
 ## 넓은 지형: 로봇을 따라다니는 지형 창
 

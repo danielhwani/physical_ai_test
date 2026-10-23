@@ -240,6 +240,26 @@ def test_godot_bridge_points():
     assert cloud_to_world(msg, {}) is None                      # TF를 아직 모르면 보내지 않는다
 
 
+def test_godot_bridge_footholds():
+    """Godot 중계기 디딜 곳: perception_markers가 만든 MarkerArray(odom 좌표)를 world -> odom TF로 옮겨 구와 선분으로 넘긴다."""
+    from builtin_interfaces.msg import Time
+    from control.ros_viz import perception_markers
+    from viz.godot_bridge import markers_to_world
+    legs = [{"leg": i, "swing": i % 2 == 0, "chosen": [0.3 * i, 0.1, -0.02], "nominal": [0.3 * i - 0.05, 0.12, -0.02]}
+            for i in range(4)]
+    snap = {"cells": np.zeros((1, 3)), "h_ref": 0.0, "legs": legs}
+    _, feet = perception_markers(snap, Time())
+    off = [0.5, -0.2, 0.01]
+    spheres, lines = markers_to_world(feet, {"odom": [*off, 0.0, 0.0, 0.0, 1.0]})
+    assert len(spheres) == 8 and len(lines) == 4                   # 다리마다 고른 곳 + 원래 자리, 옮긴 선분
+    chosen = [s for s in spheres if s[3] >= 0.035]
+    for leg, sph in zip(legs, chosen):
+        assert np.allclose(sph[:3], np.add(leg["chosen"], off), atol=1e-6)
+        assert np.isclose(sph[3], 0.05 if leg["swing"] else 0.035)
+    assert np.allclose(lines[0][:6], [*np.add(legs[0]["nominal"], off), *np.add(legs[0]["chosen"], off)], atol=1e-6)
+    assert markers_to_world(feet, {}) == ([], [])                  # odom TF를 아직 모르면 보내지 않는다
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

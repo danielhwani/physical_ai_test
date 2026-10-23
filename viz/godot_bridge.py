@@ -12,6 +12,8 @@ Godot 쪽에서 장면 맨 위 노드 하나를 X축 -90° 돌려(ROS (x, y, z) 
         {"type": "status", ...}   상태 JSON + 정보판 문구
         {"type": "points", ...}   --points일 때: 점군을 월드 좌표로 (LiDAR /sensors/<이름>/points는 높이 색,
                                   알고리즘 지형 지도 /control/terrain_map은 자기 rgb). 약 10 Hz, base64 float32
+        {"type": "markers", ...}  디딜 곳 (/control/footholds, 지형 인지 보행기가 있을 때): 구 [x, y, z, 지름, r, g, b, a]와
+                                  선분 [x1, y1, z1, x2, y2, z2, r, g, b, a] (월드 좌표). 약 10 Hz
 물리엔진은 import하지 않는다 (viz 규칙).
 """
 import argparse
@@ -30,6 +32,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile
 from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import String
 from tf2_msgs.msg import TFMessage
+from visualization_msgs.msg import Marker, MarkerArray
 
 from .stream_decode import TerrainGrid, TerrainWindow, check_manifest
 
@@ -40,6 +43,7 @@ MAX_CELLS = 100_000         # 표시 셀 수 상한 (넘으면 성기게)
 TERRAIN_RGB = np.array([0.55, 0.50, 0.42])
 SHADE_M = 0.08
 POSE_HZ, TERRAIN_HZ, POINTS_HZ = 30.0, 4.0, 10.0
+MARKER_TOPIC = "/control/footholds"
 CLOUD_TOPIC = re.compile(r"^/sensors/[^/]+/points$|^/control/terrain_map$")   # RViz 설정(config/go2.rviz)과 같은 점군
 
 
@@ -107,6 +111,37 @@ def cloud_to_world(msg, poses):
     return xyz[ok], height_colors(xyz[ok, 2])
 
 
+def frame_transform(frame, poses):
+    """world -> frame (R, p), 모르면 None."""
+    if frame in ("world", ""):
+        return np.eye(3), np.zeros(3)
+    if frame not in poses:
+        return None
+    x, y, z, qx, qy, qz, qw = poses[frame]
+    return quat_matrix(qx, qy, qz, qw), np.array([x, y, z])
+
+
+def markers_to_world(msg, poses):
+    """MarkerArray의 SPHERE와 LINE_LIST -> (구 목록, 선분 목록) 월드 좌표. 좌표계 포즈를 모르는 마커는 건너뛴다."""
+    spheres, lines = [], []
+    for m in msg.markers:
+        T = frame_transform(m.header.frame_id, poses)
+        if T is None or m.action != Marker.ADD:
+            continue
+        R, p = T
+        o = m.pose.orientation
+        Rm = R @ quat_matrix(o.x, o.y, o.z, o.w)
+        pm = R @ [m.pose.position.x, m.pose.position.y, m.pose.position.z] + p
+        rgba = [m.color.r, m.color.g, m.color.b, m.color.a]
+        if m.type == Marker.SPHERE:
+            spheres.append([*map(float, pm), float(m.scale.x), *map(float, rgba)])
+        elif m.type == Marker.LINE_LIST:
+            pts = [Rm @ [q.x, q.y, q.z] + pm for q in m.points]
+            for a, b in zip(pts[0::2], pts[1::2]):
+                lines.append([*map(float, a), *map(float, b), *map(float, rgba)])
+    return spheres, lines
+
+
 class GodotBridge(Node):
     def __init__(self, port, points=False):
         super().__init__("godot_bridge")
@@ -129,6 +164,7 @@ class GodotBridge(Node):
         self.client = None
         self.points = points
         self.clouds, self.cloud_subs = {}, {}           # 토픽 -> 아직 안 보낸 최신 PointCloud2
+        self.markers, self.marker_sub = None, None      # 아직 안 보낸 최신 디딜 곳 MarkerArray
         self.get_logger().info(f"Godot 대기: 127.0.0.1:{port}" + ("  (점군 포함)" if points else ""))
 
     # ---- 스트림 입력 ----
@@ -175,9 +211,14 @@ class GodotBridge(Node):
         if self.window is not None and self.window.recenter(*self.status["base_pos"][:2], WINDOW_TRIGGER):
             self.terrain_dirty = True
 
-    def find_clouds(self):
-        """점군 토픽을 찾아 구독한다 (센서 이름을 미리 몰라도 된다)."""
+    def find_topics(self):
+        """디딜 곳과 (--points일 때) 점군 토픽을 찾아 구독한다 (센서 이름을 미리 몰라도 된다)."""
         for topic, types in self.get_topic_names_and_types():
+            if topic == MARKER_TOPIC and self.marker_sub is None and "visualization_msgs/msg/MarkerArray" in types:
+                self.marker_sub = self.create_subscription(MarkerArray, topic, lambda m: setattr(self, "markers", m), 5)
+                self.get_logger().info(f"디딜 곳 구독: {topic}")
+            if not self.points:
+                continue
             if topic not in self.cloud_subs and CLOUD_TOPIC.match(topic) and "sensor_msgs/msg/PointCloud2" in types:
                 self.cloud_subs[topic] = self.create_subscription(
                     PointCloud2, topic, lambda m, t=topic: self.clouds.__setitem__(t, m), 5)
@@ -192,6 +233,12 @@ class GodotBridge(Node):
             xyz, rgb = got
             self.send({"type": "points", "name": topic, "kind": "map" if topic == "/control/terrain_map" else "lidar",
                        "n": len(xyz), "xyz": b64(xyz), "rgb": b64(rgb)})
+
+    def send_markers(self):
+        spheres, lines = markers_to_world(self.markers, self.poses)
+        if spheres or lines:
+            self.markers = None
+            self.send({"type": "markers", "name": MARKER_TOPIC, "spheres": spheres, "lines": lines})
 
     # ---- Godot로 ----
     def send(self, obj):
@@ -244,13 +291,13 @@ class GodotBridge(Node):
         self.terrain_dirty = self.poses_dirty = self.status_dirty = True
 
     def run(self):
-        next_pose = next_terrain = next_points = next_find = 0.0
+        next_pose = next_terrain = next_points = next_find = next_markers = 0.0
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.005)
             self.accept()
             now = time.monotonic()
-            if self.points and now >= next_find:
-                self.find_clouds()
+            if now >= next_find:
+                self.find_topics()
                 next_find = now + 1.0
             if self.client is None:
                 continue
@@ -269,6 +316,9 @@ class GodotBridge(Node):
             if self.clouds and now >= next_points:
                 self.send_clouds()
                 next_points = now + 1.0 / POINTS_HZ
+            if self.markers is not None and now >= next_markers:
+                self.send_markers()
+                next_markers = now + 1.0 / POINTS_HZ
 
 
 def main():
