@@ -23,7 +23,7 @@ sys.path.insert(0, str(ROOT))
 from sim.stream import STREAM_VERSION, encode_heights  # noqa: E402
 
 NAMES = ["1", "2", "3", "4"]      # 화면에는 번호만 (뜻은 docs/img/scm_injection.png 범례: 1 새 흙, 2 높이만 3 cm 낮춤,
-                                  # 3 실제로 다진 자리, 4 3의 높이만 베낌). Godot 기본 글꼴에 한글이 없어 한글을 쓰면 화면이 멈춘다
+                                  # 3 이어 누른 자리, 4 3의 높이만 베낌). Godot 기본 글꼴에 한글이 없어 한글을 쓰면 화면이 멈춘다
 TINTS = [(0.52, 0.62, 0.78), (0.80, 0.60, 0.48), (0.48, 0.72, 0.60), (0.82, 0.70, 0.42)]   # 흙색에 섞은 범주 색
 
 

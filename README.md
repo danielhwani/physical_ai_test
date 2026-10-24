@@ -45,6 +45,8 @@ python conformance/test_render_stream.py                 # 렌더 스트림 계�
 python conformance/compare_variants.py [--policy card.yaml]   # cpu vs mjx 설정의 MOP 분포 비교
 python conformance/probe_scm_injection.py [--plot docs/img/scm_injection.png]   # (어느 환경이든: chrono 환경으로 다시 실행) SCM에 바깥 높이 넣기: 접촉은 따라가고 다짐 이력은 안 넘어감 (docs/map_server.md 5.5, 그림)
 python conformance/replay_scm_probe.py [--speed 0.5] [--loop]   # 위 시험을 Godot로 재생 (기록 없으면 시험부터. mj_ros 환경)
+python conformance/probe_scm_compaction.py [--plot docs/img/scm_compaction.png]   # 다짐 -> 단단한 흙 콜백: kphi ×25로 다짐 흉내 (docs/map_server.md 5.5, 약 1분)
+python conformance/probe_scm_virtual_compaction.py [--plot docs/img/scm_virtual_compaction.png]   # 가상 다짐: 한 번 눌러 두면 SCM이 다짐을 기억 (세 방법 비교, 약 35초)
 python conformance/make_obs_reference.py                 # (관측 명세를 바꾼 경우) 기준 벡터 재생성
 python conformance/make_policy_reference.py <card.yaml>  # (ONNX를 바꾼 경우) 정책 입출력 기준 재생성
 ```
