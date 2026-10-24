@@ -28,7 +28,8 @@ from sim.stream import STREAM_VERSION, encode_heights  # noqa: E402
 sys.path.insert(0, str(ROOT / "conformance"))
 import scm_record  # noqa: E402
 
-PROBES = {"press": ("probe_scm_injection.py", "build/scm_press.npz"), "rolling": ("probe_scm_rolling.py", "build/scm_rolling.npz")}
+PROBES = {"press": ("probe_scm_injection.py", "build/scm_press.npz"), "rolling": ("probe_scm_rolling.py", "build/scm_rolling.npz"),
+          "wheel": ("probe_scm_wheel.py", "build/scm_wheel.npz")}
 
 
 def sphere_obj(path, r, nu=32, nv=16):
@@ -47,18 +48,57 @@ def sphere_obj(path, r, nu=32, nv=16):
     path.write_text("\n".join(lines) + "\n")
 
 
+def cylinder_obj(path, r, w, n=48):
+    """원통 OBJ, 축은 y (바깥이 반시계 감김). 옆면과 두 뚜껑은 꼭짓점을 따로 둔다 (같이 쓰면 godot/main.gd가 꼭짓점 법선을 평균 내
+    모서리가 둥근 덩어리처럼 보인다)."""
+    v, f = [], []
+
+    def ring(y):
+        start = len(v) + 1
+        for k in range(n):
+            a = 2 * math.pi * k / n
+            v.append(f"v {r * math.cos(a):.5f} {y:.5f} {r * math.sin(a):.5f}")
+        return start
+    lo, hi = ring(-w / 2), ring(w / 2)                       # 옆면용
+    for k in range(n):
+        k1 = (k + 1) % n
+        a, b, c, d = lo + k, lo + k1, hi + k1, hi + k
+        f += [f"f {a} {d} {c}", f"f {a} {c} {b}"]           # 옆면 (바깥 = 반지름 방향)
+    for y, sign in ((-w / 2, -1), (w / 2, 1)):              # 뚜껑용 (따로)
+        start = ring(y)
+        v.append(f"v 0 {y:.5f} 0")
+        cen = len(v)
+        for k in range(n):
+            k1 = (k + 1) % n
+            f.append(f"f {cen} {start + k} {start + k1}" if sign < 0 else f"f {cen} {start + k1} {start + k}")
+    path.write_text("\n".join(v + f) + "\n")
+
+
+def shape_of(rec):
+    return json.loads(str(rec["shape"])) if "shape" in rec else {"kind": "sphere", "radius": float(rec["radius"])}
+
+
 def manifest(rec, asset_dir):
     W, H = rec["size"]
     nrow, ncol = rec["heights"].shape[1:]
     regions = [dict(rg, soil=rg["name"]) for rg in json.loads(str(rec["regions"]))]
     r = float(rec["radius"])
+    shp = shape_of(rec)
+    if shp["kind"] == "cylinder":                         # 바퀴: 양 옆면에 표시점 (구르는 회전이 보이게)
+        hw = shp["width"] / 2 + 0.01
+        marks = [{"body": "ball", "mesh": "mark.obj", "pos": [0.7 * r, sy * hw, 0], "quat": [0, 0, 0, 1], "rgba": [0.85, 0.25, 0.20, 1.0]}
+                 for sy in (-1, 1)] + \
+                [{"body": "ball", "mesh": "mark.obj", "pos": [0, sy * hw, 0.7 * r], "quat": [0, 0, 0, 1], "rgba": [0.15, 0.15, 0.18, 1.0]}
+                 for sy in (-1, 1)]
+    else:
+        marks = [{"body": "ball", "mesh": "mark.obj", "pos": [0, 0, r], "quat": [0, 0, 0, 1], "rgba": [0.15, 0.15, 0.18, 1.0]},
+                 {"body": "ball", "mesh": "mark.obj", "pos": [r, 0, 0], "quat": [0, 0, 0, 1], "rgba": [0.85, 0.25, 0.20, 1.0]}]
     return {"stream_version": STREAM_VERSION, "frame": "world",
             "conventions": {"coordinates": "REP-103 (x forward, y left, z up, right-handed)", "units": "m", "quaternion": "x,y,z,w"},
             "asset_root": str(asset_dir),
             "bodies": [{"id": 1, "name": "ball", "parent": "world", "physics_source": "Chrono", "entity": "probe_ball"}],
             "visuals": [{"body": "ball", "mesh": "ball.obj", "pos": [0, 0, 0], "quat": [0, 0, 0, 1], "rgba": [0.78, 0.78, 0.80, 1.0]},
-                        {"body": "ball", "mesh": "mark.obj", "pos": [0, 0, r], "quat": [0, 0, 0, 1], "rgba": [0.15, 0.15, 0.18, 1.0]},
-                        {"body": "ball", "mesh": "mark.obj", "pos": [r, 0, 0], "quat": [0, 0, 0, 1], "rgba": [0.85, 0.25, 0.20, 1.0]}],
+                        *marks],
             "soil_regions": regions,
             "terrain": {"half_size": [W / 2, H / 2], "nrow": int(nrow), "ncol": int(ncol), "z_range": [-0.2, 0.2],
                         "layout": "row-major; row i -> y = -half_y + i*dy, col j -> x = -half_x + j*dx"}}
@@ -72,7 +112,7 @@ def patch(version, grid, r0, r1, c0, c1):
 def info_lines(rec, k):
     now = f"sinkage {rec['sink'][k] * 100:.2f} cm"
     if "force" in rec:
-        now += f"   rolling resistance {rec['force'][k]:.1f} N"
+        now += f"   {str(rec['force_label']) if 'force_label' in rec else 'rolling resistance'} {rec['force'][k]:.1f} N"
     return [str(rec["title"]), f"[{rec['phase'][k]}]", now, *json.loads(str(rec["result_lines"]))]
 
 
@@ -98,7 +138,11 @@ def main():
         rec = scm_record.load(rec_path)
     out = ROOT / "build/scm_probe_replay"
     out.mkdir(parents=True, exist_ok=True)
-    sphere_obj(out / "ball.obj", float(rec["radius"]))
+    shp = shape_of(rec)
+    if shp["kind"] == "cylinder":
+        cylinder_obj(out / "ball.obj", shp["radius"], shp["width"])
+    else:
+        sphere_obj(out / "ball.obj", float(rec["radius"]))
     sphere_obj(out / "mark.obj", 0.022, nu=12, nv=6)        # 구 표면의 표시점 (구르는 회전이 보이게)
 
     import rclpy

@@ -48,8 +48,9 @@ python conformance/probe_scm_compaction.py [--record build/scm_compaction.npz]  
 python conformance/probe_scm_virtual_compaction.py [--record build/scm_virtual_compaction.npz] [--offset sinkage|iterate]   # 가상 다짐: 자국 전 높이를 넣고 한 번 다시 누르면 단일 SCM과 같음 (세 방법 비교, 약 35초)
 python conformance/probe_scm_rolling.py [--record build/scm_rolling.npz]   # 구르는 구: 높이만 / 굴려서 가상 다짐 vs 단일 SCM (침하, 구름 저항, 약 30초)
 python conformance/probe_scm_offset_compare.py [--record build/scm_offset_compare.npz]   # 가상 다짐 두 보정 비교: 되풀이 vs sinkage (약 1분 20초)
+python conformance/probe_scm_wheel.py [--record build/scm_wheel.npz]   # 구동 바퀴: 미끄럼률, 여러 번 지나간 자리 (네 경우, 약 2분 30초. 기록 없이는 한 경우)
 python conformance/plot_scm_probe.py build/scm_<시험>.npz [-o PNG]   # 기록에서 분석 그래프 (시뮬레이션 없이, 기본 docs/img/scm_*.png)
-python conformance/replay_scm_probe.py [--probe press|rolling] [--speed 0.5] [--loop]   # 같은 기록을 Godot로 재생 (기록 없으면 시험부터. mj_ros 환경)
+python conformance/replay_scm_probe.py [--probe press|rolling|wheel] [--speed 0.5] [--loop]   # 같은 기록을 Godot로 재생 (기록 없으면 시험부터. mj_ros 환경)
 python conformance/make_obs_reference.py                 # (관측 명세를 바꾼 경우) 기준 벡터 재생성
 python conformance/make_policy_reference.py <card.yaml>  # (ONNX를 바꾼 경우) 정책 입출력 기준 재생성
 ```
@@ -2057,8 +2058,9 @@ python -m sim.rt_link scenarios/flat_trot.yaml --brain ros --remote-brain --ros-
   1. ~~가상 다짐의 높이 보정 계산식~~ (2026-10-25 풀림): 앞쪽 SCM의 노드 `sinkage`만큼 올려 넣으면(= 자국 전 높이) 되풀이 없이
      단일 SCM과 같아진다 (누르기·굴리기 모두, `docs/map_server.md` 5.5 "높이 보정 = 앞쪽 SCM의 sinkage"). 넘길 것: 지금 높이, sinkage,
      자국을 만든 하중·물체·경로.
-  2. **실제 바퀴로 가상 다짐**: 구 대신 바퀴 모양, 구동 토크와 미끄러짐. HMMWV 바퀴 자국을 넘겨받는 실제 경우.
-     여러 번 지나간 자리(순서대로 되풀이)도 함께 본다.
+  2. ~~실제 바퀴로 가상 다짐~~ (2026-10-25, 단단한 원통 구동 바퀴로 함): 이력을 알면 바퀴로도 단일 SCM과 같다. 넘길 이력에
+     **미끄럼률**이 있어야 견인력이 맞는다 (없으면 33 ~ 35 % 작음). 여러 번 지나간 자리는 순서대로 되풀이하면 같다
+     (`docs/map_server.md` 5.5 "구동 바퀴 시험"). 남은 것: 타이어 변형·트레드, HMMWV 바퀴 자국을 실제로 넘겨받기.
   3. **맵 서버 1단계 구현**: 같은 프로세스 안 모드. 모든 시나리오가 지금과 비트 단위로 같아야 한다 (설계 문서 8절).
   4. **타당성 확인**: 지금 결과는 모두 단일 SCM과의 일관성이다. 실제 흙과 비교하려면 판 재하 시험이나 반복 주행 시험의 실측 자료와
      그에 맞춘 흙 매개변수가 필요하다. 자료를 구하는 것부터 정한다.

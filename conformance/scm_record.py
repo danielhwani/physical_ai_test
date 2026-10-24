@@ -2,12 +2,14 @@
 읽는다 (시뮬레이션은 한 번). pychrono 없이 읽고 쓴다.
 
   kind      시험 종류: "press" (probe_scm_injection), "compaction" (probe_scm_compaction),
-            "virtual_compaction" (probe_scm_virtual_compaction), "rolling" (probe_scm_rolling), "offset_compare" (probe_scm_offset_compare)
+            "virtual_compaction" (probe_scm_virtual_compaction), "rolling" (probe_scm_rolling), "offset_compare" (probe_scm_offset_compare),
+            "wheel" (probe_scm_wheel)
   format    이 규약의 판 (FORMAT)
   config    시험 설정 (JSON): 흙, 구 반지름, 격자, 하중 등
   analysis  분석 데이터 (JSON): 표의 숫자와 그래프용 곡선
   렌더용 (누르기·굴리기를 --record로 돌렸을 때만): heights (프레임, 행, 열), center (프레임, 3), [quat (프레임, 4) xyzw], phase,
-            sink, [force], hold, dt, size, radius, regions (JSON), title, result_lines (JSON). 화면 글자는 영어와 숫자만.
+            sink, [force, force_label], hold, dt, size, radius, [shape (JSON: kind sphere/cylinder, radius, width)], regions (JSON),
+            title, result_lines (JSON). 화면 글자는 영어와 숫자만.
 """
 import json
 

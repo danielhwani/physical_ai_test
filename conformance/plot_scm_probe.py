@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 INK, INK2, MUTED, SURFACE, GRID = "#0b0b0b", "#52514e", "#8f8d86", "#fcfcfb", "#e4e3df"
 DEFAULT_PNG = {"press": "docs/img/scm_injection.png", "compaction": "docs/img/scm_compaction.png",
                "virtual_compaction": "docs/img/scm_virtual_compaction.png", "rolling": "docs/img/scm_rolling.png",
-               "offset_compare": "docs/img/scm_offset_compare.png"}
+               "offset_compare": "docs/img/scm_offset_compare.png", "wheel": "docs/img/scm_wheel.png"}
 
 
 OFFSET_LABEL = {"sinkage": " (sinkage 보정)", "iterate": " (되풀이 보정)"}
@@ -340,8 +340,81 @@ def plot_offset_compare(rec, path):
     fig.savefig(path, dpi=130, bbox_inches="tight")
 
 
+WHEEL_CASE_NAMES = {"base": "이력을 앎", "slip_unknown": "미끄럼률 모름\n(다짐은 미끄럼 0)",
+                    "two_passes": "두 번 지난 자리\n두 번 되풀이", "two_passes_one_replay": "두 번 지난 자리\n한 번만 (근사)"}
+WHEEL_MASS_COLORS = ["#e87ba4", "#6250d6"]                       # 하중 (dataviz 범주 색 5, 7: 위 A/B/C 색과 겹치지 않게)
+
+
+def plot_wheel(rec, path):
+    """probe_scm_wheel.py: 위는 기본 경우 두 번째 지나감을 x로 따라간 추가 침하·견인력, 아래는 경우마다 가상 다짐(C)의 기준(A) 대비 차이."""
+    plt = _pyplot()
+    a, cfg = rec["analysis"], rec["config"]
+    MID = tuple(cfg["mid"])
+    masses = a["masses"]
+    cases = a["cases"]
+    fig, axs = plt.subplots(2, 2, figsize=(12.5, 8.6), gridspec_kw={"hspace": 0.62, "wspace": 0.24})
+    (ax, fx), (sx, rx) = axs
+    names = ["A 이어 지나간 줄 (단일 SCM 기준)", "B 높이만 베낀 줄", "C 가상 다짐 줄 (sinkage 보정)"]
+    for k, tr in enumerate(a["traces"]):
+        x, bot, before, f, _ = (np.array(v) for v in zip(*tr))
+        style = dict(color=ROLL_COLORS[k], lw=3.5 if k == 0 else 1.8, label=names[k], zorder=3 + k, ls=(0, (4, 3)) if k == 2 else "-")
+        ax.plot(x, (before - bot) * 100, **style)
+        fx.plot(x, -f, **style)
+    for a_ in (ax, fx):
+        a_.axvspan(*MID, color=GRID, alpha=0.5, lw=0, zorder=0)
+        a_.set_xlabel("x (m)")
+        a_.grid(axis="y", color=GRID, lw=0.6)
+    m0 = a["trace_mass"]
+    ax.set_ylabel("추가 침하 (cm)")
+    ax.set_title(f"두 번째 지나감 ({m0:.0f} kg, 이력을 앎): 지나가기 전 표면 - 바퀴 바닥", loc="left", color=INK, fontsize=10.5)
+    ax.legend(loc="center right", bbox_to_anchor=(1.0, 0.6), frameon=False, fontsize=8.5)
+    fx.set_ylabel("견인력 (N, 바퀴가 밀고 나가는 힘)")
+    fx.set_title(f"두 번째 지나감 ({m0:.0f} kg): 견인력", loc="left", color=INK, fontsize=10.5)
+    order = [c for c in WHEEL_CASE_NAMES if c in cases]
+    xs = np.arange(len(order))
+    w = 0.34
+    for j, mass in enumerate(masses):
+        ds, dfp = [], []
+        for c in order:
+            r = cases[c]["results"][str(mass)] if str(mass) in cases[c]["results"] else cases[c]["results"][f"{mass}"]
+            ds.append((r["C"]["sink"] - r["A"]["sink"]) * 100)
+            dfp.append(((-r["C"]["force"]) - (-r["A"]["force"])) / abs(r["A"]["force"]) * 100)
+        pos = xs + (j - 0.5) * w
+        for axis, vals, fmt in ((sx, ds, "{:+.2f}"), (rx, dfp, "{:+.0f}%")):
+            vals = [0.0 if abs(v) < 0.005 else v for v in vals]
+            axis.bar(pos, vals, w * 0.9, color=WHEEL_MASS_COLORS[j % 2], label=f"두 번째 지나감 {mass:.0f} kg", zorder=2)
+            zero = [p_ for p_, v in zip(pos, vals) if v == 0.0]
+            axis.plot(zero, [0.0] * len(zero), ls="none", marker="D", ms=6, color=WHEEL_MASS_COLORS[j % 2], zorder=3)
+            for p_, v in zip(pos, vals):
+                axis.text(p_, v, fmt.format(v), ha="center", va="bottom" if v >= 0 else "top", fontsize=8.5, color=INK)
+    for axis, unit, title, key in ((sx, "cm", "가상 다짐(C) - 기준(A): 추가 침하", "sink"), (rx, "%", "가상 다짐(C) - 기준(A): 견인력", "force")):
+        axis.axhline(0, color=INK2, lw=0.8)
+        axis.set_xticks(xs)
+        axis.set_xticklabels([WHEEL_CASE_NAMES[c] for c in order], fontsize=8.5)
+        axis.set_ylabel(f"기준 대비 차이 ({unit})")
+        axis.grid(axis="y", color=GRID, lw=0.6, zorder=0)
+        axis.set_title(title, loc="left", color=INK, fontsize=10.5)
+        lo, hi = axis.get_ylim()
+        span = max(abs(lo), abs(hi)) * 1.6
+        axis.set_ylim(-span, span)
+        bnotes = []
+        for c in ("base", "two_passes"):
+            r = cases[c]["results"][f"{masses[0]}"]
+            d = (r["B"]["sink"] - r["A"]["sink"]) * 100 if key == "sink" else ((-r["B"]["force"]) - (-r["A"]["force"])) / abs(r["A"]["force"]) * 100
+            bnotes.append(f"{'한 번' if c == 'base' else '두 번'} 지나간 자리 {d:+.2f} cm" if key == "sink" else
+                          f"{'한 번' if c == 'base' else '두 번'} 지나간 자리 {d:+.0f}%")
+        axis.text(0.01, 0.03, f"비교: 높이만(B) - 기준, {masses[0]:.0f} kg: " + ", ".join(bnotes), transform=axis.transAxes,
+                  ha="left", va="bottom", color=INK2, fontsize=8.5)
+    sx.legend(loc="upper left", frameon=False, fontsize=8.5)
+    fig.text(0.01, 0.0, f"단단한 원통 바퀴 (반지름 {cfg['wheel']['radius']:.2f} m, 폭 {cfg['wheel']['width']:.2f} m)를 0.3 m/s로 끌며 목표 미끄럼률 "
+             f"{cfg['slip']:.2f}로 돌림 (실제 0.17 ~ 0.19). 첫 지나감 {cfg['compact_mass']:.0f} kg. 견인력 = 바퀴가 밀고 나가는 힘.\n"
+             "A = 같은 SCM에서 이어 지나감 (단일 SCM 기준, 실측 아님), B = 자국 높이만 새 흙에, C = 자국 전 높이(높이 + sinkage)를 넣고 "
+             "바퀴로 다시 지나가 다진 뒤. Chrono SCM, kphi 5e6, 2 cm 격자 (conformance/probe_scm_wheel.py)", color=INK2, fontsize=8, va="top")
+    fig.savefig(path, dpi=130, bbox_inches="tight")
+
+
 PLOTTERS = {"press": plot_press, "compaction": plot_compaction, "virtual_compaction": plot_virtual, "rolling": plot_rolling,
-            "offset_compare": plot_offset_compare}
+            "offset_compare": plot_offset_compare, "wheel": plot_wheel}
 
 
 def plot(record, png=None):
