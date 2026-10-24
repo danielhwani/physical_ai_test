@@ -216,6 +216,7 @@ def test_godot_bridge_messages():
         assert mud[0] < firm[0] - 0.15, (mud, firm)               # 진흙 띠는 짙다
         lines, alert = status_lines(_roundtrip(build_status(sim, sim.data.qpos[:2].copy(), 0.0, 0)))
         assert any(ln.startswith("soil firm") for ln in lines) and not alert
+        assert status_lines({"info_lines": ["probe", "1"]}) == (["probe", "1"], False)   # 로봇이 아닌 출처 (replay_scm_probe)
         br.destroy_node()
     finally:
         rclpy.shutdown()

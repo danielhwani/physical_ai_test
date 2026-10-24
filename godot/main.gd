@@ -45,6 +45,7 @@ var cam_pitch := CAM_PITCH0
 var cam_dist := CAM_DIST0
 var cam_pan := Vector3.ZERO          # 오른쪽 끌기로 옮긴 만큼 (따라가는 점에서 떨어진 양)
 var cam_follow := true               # F: 몸통 따라가기 켜고 끄기
+var follow_name := "base"            # 따라갈 바디: base(로봇 몸통), 없으면 장면의 첫 바디
 var label: Label
 var hint: Label
 var clouds := {}                     # 점군 토픽 -> MeshInstance3D (중계기 --points일 때만 온다)
@@ -177,8 +178,8 @@ func _process(delta: float) -> void:
 			tcp = StreamPeerTCP.new()
 			tcp.connect_to_host(host, port)
 	# 카메라: 몸통을 부드럽게 따라가고(F로 끔), 마우스로 돈 각도·거리·옮긴 양을 더한다 (Godot 좌표)
-	if cam_follow and bodies.has("base"):
-		var target: Vector3 = bodies["base"].global_position
+	if cam_follow and bodies.has(follow_name):
+		var target: Vector3 = bodies[follow_name].global_position
 		cam_target = cam_target.lerp(target, clamp(delta * 4.0, 0.0, 1.0))
 	_place_camera()
 	if shot_path != "" and frames >= shot_frames:
@@ -344,7 +345,9 @@ func _build_scene(msg: Dictionary) -> void:
 	for b in bodies.values():
 		b.queue_free()
 	bodies.clear()
-	for name in msg["bodies"]:
+	var names: Array = msg["bodies"]
+	follow_name = "base" if names.has("base") or names.is_empty() else str(names[0])
+	for name in names:
 		var n := Node3D.new()
 		n.name = name
 		world.add_child(n)
@@ -477,7 +480,7 @@ func _build_terrain(msg: Dictionary) -> void:
 func _update_status(msg: Dictionary) -> void:
 	label.text = "\n".join(msg["lines"])
 	label.add_theme_color_override("font_color", Color(1.0, 0.4, 0.35) if msg["alert"] else Color(1, 1, 1))
-	var f: Dictionary = msg["feet"]
+	var f: Dictionary = msg.get("feet", {})
 	for i in 4:
 		var name: String = FOOT_NAMES[i]
 		if f.has(name):
@@ -485,6 +488,8 @@ func _update_status(msg: Dictionary) -> void:
 			feet[i].visible = true
 			feet[i].position = Vector3(p[0], p[1], p[2])
 			feet[i].material_override.albedo_color = Color(0.2, 0.9, 0.3, 0.9) if f[name]["contact"] else Color(0.6, 0.6, 0.6, 0.5)
+	if not msg.has("command"):            # 로봇이 아닌 출처: 경로와 명령 화살표는 그리지 않는다
+		return
 	var b: Array = msg["base_pos"]
 	var bp := Vector3(b[0], b[1], b[2] - 0.22)
 	if path_pts.is_empty() or path_pts[path_pts.size() - 1].distance_to(bp) > 0.03:

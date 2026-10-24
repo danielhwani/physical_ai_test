@@ -52,7 +52,9 @@ def b64(a):
 
 
 def status_lines(s):
-    """정보판 문구 (Godot Label)."""
+    """정보판 문구 (Godot Label). 로봇 시험이 아닌 출처(예: conformance/replay_scm_probe.py)는 info_lines로 문구를 직접 준다."""
+    if "info_lines" in s:
+        return list(s["info_lines"]), bool(s.get("alert", False))
     m = s.get("final_mop")
     if m:
         state = "FELL" if m["fell"] else ("INTERRUPTED" if m.get("interrupted") else "FINISHED")
@@ -208,7 +210,8 @@ class GodotBridge(Node):
     def on_status(self, msg):
         self.status = json.loads(msg.data)
         self.status_dirty = True
-        if self.window is not None and self.window.recenter(*self.status["base_pos"][:2], WINDOW_TRIGGER):
+        if self.window is not None and "base_pos" in self.status and \
+                self.window.recenter(*self.status["base_pos"][:2], WINDOW_TRIGGER):
             self.terrain_dirty = True
 
     def find_topics(self):
@@ -307,8 +310,8 @@ class GodotBridge(Node):
             if self.status_dirty and self.status is not None:
                 lines, alert = status_lines(self.status)
                 s = self.status
-                self.send({"type": "status", "lines": lines, "alert": alert, "base_pos": s["base_pos"], "yaw": s["yaw"],
-                           "command": s["command"], "feet": s["feet"]})
+                self.send({"type": "status", "lines": lines, "alert": alert,
+                           **{k: s[k] for k in ("base_pos", "yaw", "command", "feet") if k in s}})
                 self.status_dirty = False
             if self.terrain_dirty and self.window is not None and now >= next_terrain:
                 self.send(self.terrain_msg())

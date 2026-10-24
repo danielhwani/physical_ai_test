@@ -43,6 +43,8 @@ python conformance/compare_link_timing.py <시나리오> --seeds 30   # 실시�
 python conformance/test_foot_soil.py                     # 무른 흙 발 상호작용 (SCM 기준 침하, 흙별 걷기)
 python conformance/test_render_stream.py                 # 렌더 스트림 계약 (스트림만으로 장면 재구성 = 시뮬레이터)
 python conformance/compare_variants.py [--policy card.yaml]   # cpu vs mjx 설정의 MOP 분포 비교
+python conformance/probe_scm_injection.py [--plot docs/img/scm_injection.png]   # (어느 환경이든: chrono 환경으로 다시 실행) SCM에 바깥 높이 넣기: 접촉은 따라가고 다짐 이력은 안 넘어감 (docs/map_server.md 5.5, 그림)
+python conformance/replay_scm_probe.py [--speed 0.5] [--loop]   # 위 시험을 Godot로 재생 (기록 없으면 시험부터. mj_ros 환경)
 python conformance/make_obs_reference.py                 # (관측 명세를 바꾼 경우) 기준 벡터 재생성
 python conformance/make_policy_reference.py <card.yaml>  # (ONNX를 바꾼 경우) 정책 입출력 기준 재생성
 ```
@@ -541,6 +543,12 @@ python conformance/test_render_stream.py                                    # �
   vehicle_crossing(HMMWV 메시, 바퀴 자국, 차와 거리). 메시 방향·면·조명이 맞게 나왔다.
   `test_godot_bridge_messages`: 지형 메시지의 높이 = 스트림 지형 - 발자국 깊이, 진흙 띠 색이 짙음, 정보판 문구.
   `test_viz_does_not_depend_on_physics`: 중계기는 MuJoCo도 sim도 불러오지 않는다.
+- **화면 글자는 영어와 숫자만**: Godot 기본 글꼴에 한글이 없어, 정보판이나 이름표에 한글을 쓰면 바뀔 때마다 시스템 대체 글꼴을 찾느라
+  화면이 거의 멈춘다 (2026-10-24 확인: 같은 상태 메시지가 영어면 정상, 한글이면 150프레임을 20초 안에 못 그림). 한글이 필요하면
+  한글 글꼴을 프로젝트에 넣어 기본 글꼴로 지정해야 한다 (하지 않음).
+- **로봇이 아닌 출처도 그린다**: 상태에 `info_lines`가 있으면 그 문구를 정보판에 쓰고, `command`가 없으면 경로와 명령 화살표를 생략한다.
+  `base` 바디가 없으면 카메라는 장면의 첫 바디를 따라간다. 예: `conformance/replay_scm_probe.py` (SCM 높이 넣기 시험 재생:
+  Chrono 기록 -> 중립 스트림 -> Godot. 자리 이름표는 번호 1~4, 뜻은 `docs/img/scm_injection.png` 범례).
 - **아직 없는 것**: 같은 PC 밖의 Godot (중계기는 127.0.0.1만).
 
 ## 넓은 지형: 로봇을 따라다니는 지형 창
