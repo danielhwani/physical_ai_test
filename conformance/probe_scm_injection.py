@@ -15,6 +15,7 @@
 --record: 흙 높이 격자와 구 위치를 약 30 Hz로 기록 (Godot 재생: conformance/replay_scm_probe.py).
 """
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -119,11 +120,20 @@ class Probe:
         self.frames.append((grid, np.array(center, np.float32), self.phase + (f" | {phase_note}" if phase_note else ""),
                             float(sink), float(hold)))
 
-    def save(self, path, results):
+    def render(self, results):
+        """렌더용 기록 (scm_record.py 규약): 프레임마다 흙 높이 격자, 구 중심, 단계, 가라앉은 양, 멈춤.
+        장면 설명(지역, 제목, 결과 줄)도 함께 싣는다. 화면 글자는 영어와 숫자만 (Godot 기본 글꼴에 한글 없음)."""
         g, c, ph, sk, hd = zip(*self.frames)
-        np.savez_compressed(path, heights=np.stack(g), center=np.stack(c), phase=np.array(ph), sink=np.array(sk),
-                            hold=np.array(hd), dt=REC_EVERY * STEP, size=np.array(SIZE), delta=DELTA, radius=R,
-                            spots=np.array([SPOTS[k] for k in (1, 2, 3, 4)]), half=HALF, results=np.array(results))
+        h = HALF * DELTA
+        tints = [(0.52, 0.62, 0.78), (0.80, 0.60, 0.48), (0.48, 0.72, 0.60), (0.82, 0.70, 0.42)]   # 흙색에 섞은 범주 색
+        regions = [{"name": str(k), "region": [x - h, y - h, x + h, y + h], "rgba": [*tints[k - 1], 1.0]}
+                   for k, (x, y) in SPOTS.items()]
+        s1, off2, s3, s4 = results
+        lines = [f"result (cm):  1 {s1 * 100:.2f}   2 {s1 * 100:.2f} (bottom {(off2 - s1) * 100:+.2f})   3 {s3 * 100:.2f}   "
+                 f"4 {s4 * 100:.2f}"]
+        return dict(heights=np.stack(g), center=np.stack(c), phase=np.array(ph), sink=np.array(sk), hold=np.array(hd),
+                    dt=REC_EVERY * STEP, size=np.array(SIZE), radius=R, regions=json.dumps(regions),
+                    title="SCM probe: press (Chrono SCM -> render stream replay)", result_lines=json.dumps(lines))
 
     def info(self, xy):
         i = self.ter.GetNodeInfo(chrono.ChVector3d(*xy, 0))
@@ -143,8 +153,8 @@ def node(xy):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--plot", metavar="PNG", help="그림으로 저장")
-    ap.add_argument("--record", metavar="NPZ", help="Godot 재생용 기록 (conformance/replay_scm_probe.py)")
+    ap.add_argument("--plot", metavar="PNG", help="그림으로 저장 (기록을 저장한 뒤 plot_scm_probe.py로 그림)")
+    ap.add_argument("--record", metavar="NPZ", help="시험 기록: 분석 데이터 + Godot 재생용 프레임 (scm_record.py)")
     a = ap.parse_args()
     p = Probe()
     if a.record:
@@ -196,76 +206,19 @@ def main():
               ("높이만 넣은 자리는 다짐 이력이 없음 (4 추가 침하 > 3의 10배)", s4 > 10 * max(s3, 1e-4))]
     for desc, ok in checks:
         print(("OK   " if ok else "FAIL ") + desc)
-    if a.record:
-        p.save(a.record, [s1, b2 - b1, s3, s4])
-        print(f"기록: {a.record} ({len(p.frames)}장)")
-    if a.plot:
-        # p.trace: 1, 2, 3(첫 누름), 3(다시 누름), 4 -> 그림에는 1, 2, 3 다시 누름, 4
-        plot(a.plot, [p.trace[i] for i in (0, 1, 3, 4)], prof)
-        print(f"그림: {a.plot}")
+    if a.record or a.plot:
+        import scm_record
+        config = {"soil": SOIL, "radius": R, "mass": MASS, "delta": DELTA, "hole": HOLE, "spots": SPOTS}
+        analysis = {"traces": [list(p.trace[i]) for i in (0, 1, 3, 4)],      # 1, 2, 3 다시 누름, 4 (3의 첫 누름은 뺌)
+                    "prof": {k: [*v[0], *v[1], v[2], v[3]] for k, v in prof.items()},
+                    "results": {"s1": s1, "b1": b1, "b2": b2, "s3": s3, "s4": s4}, "checks": [[d, ok] for d, ok in checks]}
+        path = a.record or str(Path(__file__).resolve().parent.parent / "build/scm_press_plot.npz")
+        scm_record.save(path, "press", config, analysis, p.render([s1, b2 - b1, s3, s4]) if a.record else None)
+        print(f"기록: {path}" + (f" ({len(p.frames)}장)" if a.record else ""))
+        if a.plot:
+            from plot_scm_probe import plot
+            print(f"그림: {plot(path, a.plot)}")
     sys.exit(0 if all(ok for _, ok in checks) else 1)
-
-
-LABELS = {1: "1 새 흙", 2: f"2 높이만 {HOLE * 100:.0f} cm 낮춤", 3: "3 이어 누른 자리", 4: "4 3의 높이만 베낌"}
-COLORS = {1: "#2a78d6", 2: "#eb6834", 3: "#1baf7a", 4: "#eda100"}      # 범주 순서 고정 (dataviz 기본 팔레트 1~4)
-INK, INK2, MUTED, SURFACE, GRID = "#0b0b0b", "#52514e", "#8f8d86", "#fcfcfb", "#e4e3df"
-
-
-def plot(path, traces, prof):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    plt.rcParams.update({"font.family": ["Noto Sans CJK KR", "NanumGothic", "sans-serif"], "font.size": 10,
-                         "axes.edgecolor": GRID, "axes.labelcolor": INK2, "xtick.color": INK2, "ytick.color": INK2,
-                         "axes.facecolor": SURFACE, "figure.facecolor": SURFACE, "axes.spines.top": False,
-                         "axes.spines.right": False})
-    fig = plt.figure(figsize=(11, 7.2))
-    gs = fig.add_gridspec(2, 4, height_ratios=[1.2, 1], hspace=0.55, wspace=0.08)
-    ax = fig.add_subplot(gs[0, :])
-    for k, (t, z) in zip((1, 2, 3, 4), traces):      # 2는 1과 겹치므로 점선으로 위에 그린다
-        ax.plot(t, -z * 100, color=COLORS[k], lw=3.5 if k == 1 else 2, label=LABELS[k], zorder=3 if k == 2 else 2,
-                ls=(0, (4, 3)) if k == 2 else "-")
-        if k != 2:
-            ax.annotate(("1, 2: " if k == 1 else "") + f"{-z[-1] * 100:.2f} cm", (t[-1], -z[-1] * 100), xytext=(6, 0),
-                        textcoords="offset points", va="center", color=INK, fontsize=9)
-    ax.invert_yaxis()
-    ax.set_xlim(0, traces[0][0][-1] * 1.15)
-    ax.set_xlabel("누른 시간 (s)")
-    ax.set_ylabel("가라앉은 양 (cm)")
-    ax.grid(axis="y", color=GRID, lw=0.8)
-    ax.legend(loc="upper right", bbox_to_anchor=(0.87, 0.9), frameon=False, ncol=2)
-    ax.set_title("같은 무게(60 kg 구)로 눌렀을 때 가라앉은 양: 1과 2는 겹친다 (넣은 높이를 접촉이 따라감), 4는 3의 약 70배",
-                 loc="left", color=INK, fontsize=11)
-    lo = min(min(a[1].min(), bot) for (b, a, bot, _) in prof.values()) * 100 - 2.2
-    th = np.linspace(0, 2 * np.pi, 200)
-    for k in (1, 2, 3, 4):
-        (xb, hb), (xa, ha), bot, steps = prof[k]
-        sx = fig.add_subplot(gs[1, k - 1])
-        sx.axhline(0, color=GRID, lw=1, zorder=0)                                       # 처음 흙 (평평)
-        sx.fill_between(xa * 100, hb * 100, ha * 100, where=ha < hb - 1e-5, color=COLORS[k], alpha=0.45, lw=0,
-                        interpolate=True)                                               # 이번 누름이 더 판 부분
-        sx.plot(xb * 100, hb * 100, color=INK2, lw=1.3, ls=(0, (3, 2)))
-        sx.plot(xa * 100, ha * 100, color=COLORS[k], lw=2)
-        sx.plot((R * np.cos(th)) * 100, (bot + R + R * np.sin(th)) * 100, color=MUTED, lw=1)   # 멈춘 구 (세로가 늘어나 보임)
-        sx.set_xlim(-25, 25)
-        sx.set_ylim(lo, 2.5)
-        sx.set_title(LABELS[k], loc="left", color=INK, fontsize=10, pad=18)
-        sx.text(0, 1.02, " → ".join("0" if v == 0 else f"{v * 100:.2f}".replace("-", "−") for v in steps) + " cm",
-                transform=sx.transAxes, ha="left", va="bottom", color=INK2, fontsize=8.5)
-        sx.text(-24, lo + 0.3, f"이번 누름 +{(steps[-2] - bot) * 100:.2f} cm\n처음 흙 기준 깊이 {-bot * 100:.2f} cm",
-                ha="left", va="bottom", color=INK, fontsize=9.5, fontweight="bold", linespacing=1.4)
-        sx.set_xlabel("x (cm)")
-        sx.grid(axis="y", color=GRID, lw=0.6)
-        if k == 1:
-            sx.set_ylabel("높이 (cm, 세로 확대)")
-        else:
-            sx.tick_params(labelleft=False)
-    fig.text(0.01, -0.02, "아래: 구를 지나는 x 방향 단면 (세로 확대). 회색 가로선 = 처음 흙, 회색 점선 = 이번 누름 직전, 실선 = 누른 뒤, "
-             "색 띠 = 이번 누름이 더 판 부분, 원 = 멈춘 구. 3과 4는 누르기 직전 모양이 같다.\n"
-             "제목 아래 = 처음 흙 기준 높이 변화 (1: 누름, 2: 넣음 -> 누름, 3: 첫 누름 -> 되튐 -> 다시 누름, 4: 3의 되튄 표면을 넣음 -> 누름).\n"
-             "Chrono SCM, kphi 5e6 (vehicle_crossing.yaml 흙), 2 cm 격자 (conformance/probe_scm_injection.py)",
-             color=INK2, fontsize=8, va="top")
-    fig.savefig(path, dpi=130, bbox_inches="tight")
 
 
 if __name__ == "__main__":

@@ -43,10 +43,12 @@ python conformance/compare_link_timing.py <시나리오> --seeds 30   # 실시�
 python conformance/test_foot_soil.py                     # 무른 흙 발 상호작용 (SCM 기준 침하, 흙별 걷기)
 python conformance/test_render_stream.py                 # 렌더 스트림 계약 (스트림만으로 장면 재구성 = 시뮬레이터)
 python conformance/compare_variants.py [--policy card.yaml]   # cpu vs mjx 설정의 MOP 분포 비교
-python conformance/probe_scm_injection.py [--plot docs/img/scm_injection.png]   # (어느 환경이든: chrono 환경으로 다시 실행) SCM에 바깥 높이 넣기: 접촉은 따라가고 다짐 이력은 안 넘어감 (docs/map_server.md 5.5, 그림)
-python conformance/replay_scm_probe.py [--speed 0.5] [--loop]   # 위 시험을 Godot로 재생 (기록 없으면 시험부터. mj_ros 환경)
-python conformance/probe_scm_compaction.py [--plot docs/img/scm_compaction.png]   # 다짐 -> 단단한 흙 콜백: kphi ×25로 다짐 흉내 (docs/map_server.md 5.5, 약 1분)
-python conformance/probe_scm_virtual_compaction.py [--plot docs/img/scm_virtual_compaction.png]   # 가상 다짐: 한 번 눌러 두면 SCM이 다짐을 기억 (세 방법 비교, 약 35초)
+python conformance/probe_scm_injection.py [--record build/scm_press.npz] [--plot PNG]   # SCM에 바깥 높이 넣기: 접촉은 따라가고 다짐 이력은 안 넘어감 (docs/map_server.md 5.5). 어느 환경이든: chrono 환경으로 다시 실행
+python conformance/probe_scm_compaction.py [--record build/scm_compaction.npz]   # 다짐 -> 단단한 흙 콜백: kphi ×25로 다짐 흉내 (약 1분)
+python conformance/probe_scm_virtual_compaction.py [--record build/scm_virtual_compaction.npz]   # 가상 다짐: 한 번 눌러 두면 SCM이 다짐을 기억 (세 방법 비교, 약 35초)
+python conformance/probe_scm_rolling.py [--record build/scm_rolling.npz]   # 구르는 구: 높이만 / 굴려서 가상 다짐 vs 단일 SCM (침하, 구름 저항, 약 30초)
+python conformance/plot_scm_probe.py build/scm_<시험>.npz [-o PNG]   # 기록에서 분석 그래프 (시뮬레이션 없이, 기본 docs/img/scm_*.png)
+python conformance/replay_scm_probe.py [--probe press|rolling] [--speed 0.5] [--loop]   # 같은 기록을 Godot로 재생 (기록 없으면 시험부터. mj_ros 환경)
 python conformance/make_obs_reference.py                 # (관측 명세를 바꾼 경우) 기준 벡터 재생성
 python conformance/make_policy_reference.py <card.yaml>  # (ONNX를 바꾼 경우) 정책 입출력 기준 재생성
 ```
@@ -549,8 +551,9 @@ python conformance/test_render_stream.py                                    # �
   화면이 거의 멈춘다 (2026-10-24 확인: 같은 상태 메시지가 영어면 정상, 한글이면 150프레임을 20초 안에 못 그림). 한글이 필요하면
   한글 글꼴을 프로젝트에 넣어 기본 글꼴로 지정해야 한다 (하지 않음).
 - **로봇이 아닌 출처도 그린다**: 상태에 `info_lines`가 있으면 그 문구를 정보판에 쓰고, `command`가 없으면 경로와 명령 화살표를 생략한다.
-  `base` 바디가 없으면 카메라는 장면의 첫 바디를 따라간다. 예: `conformance/replay_scm_probe.py` (SCM 높이 넣기 시험 재생:
-  Chrono 기록 -> 중립 스트림 -> Godot. 자리 이름표는 번호 1~4, 뜻은 `docs/img/scm_injection.png` 범례).
+  `base` 바디가 없으면 카메라는 장면의 첫 바디를 따라간다. 예: `conformance/replay_scm_probe.py` (SCM 시험 기록 재생:
+  Chrono 기록 -> 중립 스트림 -> Godot. `--probe press`: 누르기, 자리 번호 1~4 (뜻은 `docs/img/scm_injection.png` 범례).
+  `--probe rolling`: 굴리기, 줄 A / B / C (뜻은 `docs/img/scm_rolling.png` 범례). 구 표면의 빨강·검정 표시점으로 회전이 보인다).
 - **아직 없는 것**: 같은 PC 밖의 Godot (중계기는 127.0.0.1만).
 
 ## 넓은 지형: 로봇을 따라다니는 지형 창
@@ -2044,6 +2047,20 @@ python -m sim.rt_link scenarios/flat_trot.yaml --brain ros --remote-brain --ros-
 - 남은 것: 쟁기질 비율 맞추기(실측 또는 다른 기준), 탄성 되튐·Janosi 미끄럼.
   발자국 화면 표시, C++ 실시간 코어(4단계), 지역마다 다른 흙, DIS 콘솔 `soil`로 로봇 발 흙 바꾸기(2026-10-17)는 했다.
 
+**맵 서버와 SCM 다짐 전달** (2026-10-24 정리. 설계와 시험 결과는 [`docs/map_server.md`](docs/map_server.md) 5.5, 9절)
+- 지금까지: 맵 서버 설계 v0.4.7 (타일, 공유 영역 파임은 min, 운용자 편집은 순서, 오르내리는 칸은 한 엔진이 소유).
+  SCM 시험 다섯 가지 (단일 SCM과 비교): 높이 넣기, 위치마다 흙 성질 콜백, 단단한 흙 콜백, 가상 다짐(누르기), 구르는 구.
+  결론: 높이만 넘기면 다짐 이력이 없어 새 흙처럼 가라앉는다. 넘겨받은 쪽이 같은 하중으로 한 번 눌러(굴려) 두는 **가상 다짐**이
+  기본 후보다. 시험 기록 하나에서 분석 그래프(`conformance/plot_scm_probe.py`)와 Godot 재생(`conformance/replay_scm_probe.py`)이 나온다.
+- 다음 (권하는 순서):
+  1. **가상 다짐의 높이 보정 계산식**: 지금은 시험을 3~4번 되풀이해 맞춘다. 맵 서버에서 쓰려면 흙 식(Bekker)으로 한 번에 계산해야 한다.
+  2. **실제 바퀴로 가상 다짐**: 구 대신 바퀴 모양, 구동 토크와 미끄러짐. HMMWV 바퀴 자국을 넘겨받는 실제 경우.
+  3. **맵 서버 1단계 구현**: 같은 프로세스 안 모드. 모든 시나리오가 지금과 비트 단위로 같아야 한다 (설계 문서 8절).
+  4. **타당성 확인**: 지금 결과는 모두 단일 SCM과의 일관성이다. 실제 흙과 비교하려면 판 재하 시험이나 반복 주행 시험의 실측 자료와
+     그에 맞춘 흙 매개변수가 필요하다. 자료를 구하는 것부터 정한다.
+- 급하지 않은 것: Godot에 한글 글꼴 넣기 (지금 화면 글자는 영어와 숫자만), 다른 PC 두뇌 + 지형 인지 실시간 실행의 결과 흔들림
+  원인 조사 (위 실시간 코어 절), shm 두뇌에서도 지형 지도와 디딜 곳을 화면에 내보내기 (위 Godot 절).
+
 ## 검토 중인 아이디어 (결정 전)
 
 (지금 없음. lockstep의 통계적 명령 지연은 2026-10-11 구현: 위 "통계적 명령 지연")
@@ -2061,3 +2078,6 @@ python -m sim.rt_link scenarios/flat_trot.yaml --brain ros --remote-brain --ros-
 - `sim.runner`의 실시간 루프는 Python이라 지터 보장이 없다. C++ 실시간 코어(`sim.rt_link`)도 시간 보장에는 시스템 설정이 더 필요하고, 이 PC에서는 실시간 HMMWV(Chrono)가 느려 세계를 자주 잠깐 멈춘다 (위 실시간 코어 절).
 - 기본(단단한 지형)에서는 흙의 힘이 로봇 발에 돌아오지 않는다. 선택 기능 `foot_soil`을 켜면 침하·마찰·에너지·쟁기질 저항이 돌아온다. 무른 흙 결과의 절댓값은 쟁기질 비율에 민감하다 (위 `foot_soil` 절).
 - 지형 갱신은 발 근처 셀을 보류하므로 로봇이 홈 위에 서 있으면 반영이 늦어진다 (의도된 동작).
+- SCM 다짐 전달 시험(`conformance/probe_scm_*.py`)의 기준은 단일 SCM 결과다. 실측과 비교하지 않았고, 흙 매개변수(kphi 5e6 등)도
+  특정 흙에 맞춘 값이 아니다 (`docs/map_server.md` 5.5 "비교 기준은 실측값이 아니다").
+- Godot 화면 글자는 영어와 숫자만 쓴다. 한글을 쓰면 대체 글꼴을 찾느라 화면이 거의 멈춘다 (위 Godot 절).

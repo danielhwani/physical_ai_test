@@ -66,7 +66,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mults", type=float, nargs="+", default=MULTS, help="kphi 배수")
     ap.add_argument("--masses", type=float, nargs="+", default=MASSES, help="다시 누르는 하중 (kg). 첫 값이 배수를 맞추는 하중")
-    ap.add_argument("--plot", metavar="PNG", help="그림으로 저장")
+    ap.add_argument("--plot", metavar="PNG", help="그림으로 저장 (기록을 저장한 뒤 plot_scm_probe.py로 그림)")
+    ap.add_argument("--record", metavar="NPZ", help="시험 기록 (scm_record.py)")
     a = ap.parse_args()
     rows = {}
     for mass in a.masses:
@@ -82,56 +83,16 @@ def main():
     for mass in a.masses[1:]:
         print(f"같은 배수로 {mass:.0f} kg: 이어 누른 자리 {rows[mass, best][0] * 100:.2f} cm, 베낀 자리 {rows[mass, best][1] * 100:.2f} cm "
               f"(같은 SCM 안에서 다져진 흙은 다질 때 하중을 넘으면 다시 가라앉는다)")
-    if a.plot:
-        plot(a.plot, rows, a.mults, a.masses, best)
-        print(f"그림: {a.plot}")
-
-
-LOAD_COLORS = {40.0: "#2a78d6", 60.0: "#eb6834", 90.0: "#1baf7a"}     # dataviz 기본 범주 색 1~3 (하중)
-
-
-def plot(path, rows, mults, masses, best):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    plt.rcParams.update({"font.family": ["Noto Sans CJK KR", "NanumGothic", "sans-serif"], "font.size": 10,
-                         "axes.edgecolor": P.GRID, "axes.labelcolor": P.INK2, "xtick.color": P.INK2, "ytick.color": P.INK2,
-                         "axes.facecolor": P.SURFACE, "figure.facecolor": P.SURFACE, "axes.spines.top": False,
-                         "axes.spines.right": False})
-    fig, ax = plt.subplots(figsize=(10, 5.6))
-    ax.axhline(0, color=P.GRID, lw=1, zorder=0)
-    ax.axvline(best, color=P.MUTED, lw=1, ls=":", zorder=0)
-    ax.text(best / 1.04, 0.03, f"×{best:g}: {masses[0]:.0f} kg에서 이어 누른 자리와 맞음", transform=ax.get_xaxis_transform(), ha="right",
-            va="bottom", color=P.INK2, fontsize=9)
-    for mass in sorted(masses):
-        c = LOAD_COLORS.get(mass, P.INK2)
-        xs = sorted(mults)
-        ys = [rows[mass, m][1] * 100 for m in xs]
-        real = rows[mass, xs[0]][0] * 100
-        ax.plot(xs, ys, color=c, lw=2, marker="o", ms=5, label=f"{mass:.0f} kg: 베낀 자리 + 단단한 흙", zorder=3)
-        ax.axhline(real, color=c, lw=1.5, ls=(0, (4, 3)), zorder=2)
-        ax.annotate(f"{ys[0]:.2f}", (xs[0], ys[0]), xytext=(7, 0), textcoords="offset points", va="center",
-                    color=P.INK, fontsize=8.5)
-    from matplotlib.lines import Line2D
-    reals = {mass: rows[mass, min(mults)][0] * 100 for mass in masses}
-    handles, labels = ax.get_legend_handles_labels()
-    handles.append(Line2D([], [], color=P.MUTED, lw=1.5, ls=(0, (4, 3))))
-    labels.append("점선 = 같은 하중의 이어 누른 자리 (단일 SCM 기준):\n" + ", ".join(f"{m:.0f} kg {reals[m]:.2f}" for m in sorted(masses)) + " cm")
-    ax.set_xscale("log")
-    ticks = [m for m in sorted(mults) if m != best]
-    ax.set_xticks(ticks)
-    ax.set_xticklabels([f"×{m:g}" for m in ticks])
-    ax.set_xlabel("베낀 자리에서 콜백이 답하는 kphi 배수 (×1 = 콜백 효과 없음)")
-    ax.set_ylabel("다시 누를 때 가라앉은 양 (cm)")
-    ax.grid(axis="y", color=P.GRID, lw=0.6)
-    ax.legend(handles, labels, loc="upper left", bbox_to_anchor=(0.28, 0.97), frameon=False, fontsize=9)
-    ax.set_title(f"다짐 -> 단단한 흙: kphi 약 ×{best:g}에서 베낀 자리(실선)가 이어 누른 자리(점선, 단일 SCM 기준)와 맞음",
-                 loc="left", color=P.INK, fontsize=11)
-    fig.text(0.01, -0.02, "이어 누른 자리 = 같은 SCM에서 60 kg 구로 한 번 누른 뒤 이어서 다시 누름 (단일 SCM 기준, 실측 아님), 베낀 자리 = 그 높이만 새 흙에 넣은 자리 (첫 시험 probe_scm_injection.py의 3, 4번). 같은 하중으로 누름.\n90 kg은 다질 때보다 무거워 "
-             "같은 SCM 안에서 다져진 흙은 다시 가라앉지만, 단단한 흙은 하중과 상관없이 단단하다.\n"
-             "음수 = 구가 누르기 전 가운데 높이보다 위에서 멈춤 (홈 벽에 얹힘). Chrono SCM, kphi 5e6, 2 cm 격자 "
-             "(conformance/probe_scm_compaction.py)", color=P.INK2, fontsize=8, va="top")
-    fig.savefig(path, dpi=130, bbox_inches="tight")
+    if a.record or a.plot:
+        import scm_record
+        config = {"soil": P.SOIL, "radius": P.R, "delta": P.DELTA, "compact_mass": COMPACT_MASS}
+        analysis = {"rows": [[mass, m, *v] for (mass, m), v in rows.items()], "mults": a.mults, "masses": a.masses, "best": best}
+        path = a.record or str(Path(__file__).resolve().parent.parent / "build/scm_compaction_plot.npz")
+        scm_record.save(path, "compaction", config, analysis)
+        print(f"기록: {path}")
+        if a.plot:
+            from plot_scm_probe import plot
+            print(f"그림: {plot(path, a.plot)}")
 
 
 if __name__ == "__main__":

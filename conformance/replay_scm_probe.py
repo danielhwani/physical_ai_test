@@ -1,12 +1,15 @@
-"""SCM 높이 넣기 시험(conformance/probe_scm_injection.py --record)의 기록을 중립 렌더 스트림으로 재생해 Godot로 본다.
+"""SCM 시험 기록(conformance/probe_scm_*.py --record)을 중립 렌더 스트림으로 재생해 Godot로 본다.
 mj_ros 환경 (ROS2). 렌더러는 출처를 모른다: MuJoCo 시뮬레이터 대신 이 재생기가 같은 토픽을 낸다.
 
-    python conformance/replay_scm_probe.py                        # 기록이 없으면 chrono 환경으로 시험부터 돌린다
+    python conformance/replay_scm_probe.py [--probe press|rolling]       # 기록이 없으면 chrono 환경으로 시험부터 돌린다
     python conformance/replay_scm_probe.py build/scm_probe.npz --speed 0.5 [--loop]
 
-  출력  /sim/scene_manifest (구 하나, 네 자리 = soil_regions로 색과 이름), /sim/terrain_patch (SCM 흙 높이, 바뀐 사각형),
-        /tf (world -> ball), /sim/status (info_lines: 단계, 가라앉은 양)
-Godot 창을 닫으면 끝난다. 장면: 2.4 m × 1.6 m SCM, 2 cm 격자. 자리마다 0.42 m 사각형 (2와 4는 SetModifiedNodes로 넣은 범위).
+  press    probe_scm_injection.py: 구를 네 자리에 누름 (1 새 흙, 2 높이만 3 cm 낮춤, 3 이어 누른 자리, 4 3의 높이만 베낌)
+  rolling  probe_scm_rolling.py: 구를 세 줄에 굴림 (A 이어 굴린 줄 = 기준, B 높이만 베낀 줄, C 가상 다짐 줄)
+  출력  /sim/scene_manifest (구 + 회전이 보이는 표시점, 자리·줄 = soil_regions로 색과 이름), /sim/terrain_patch (SCM 흙 높이,
+        바뀐 사각형), /tf (world -> ball), /sim/status (info_lines: 제목, 단계, 가라앉은 양, 끄는 힘, 결과)
+기록 규약: scm_record.py (분석 그래프 plot_scm_probe.py와 같은 기록). 렌더용 프레임이 있는 기록(시험을 --record로 돌림)만 재생한다.
+화면 글자는 영어와 숫자만 (Godot 기본 글꼴에 한글이 없어 한글을 쓰면 화면이 멈춘다). Godot 창을 닫으면 끝난다.
 """
 import argparse
 import json
@@ -22,9 +25,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from sim.stream import STREAM_VERSION, encode_heights  # noqa: E402
 
-NAMES = ["1", "2", "3", "4"]      # 화면에는 번호만 (뜻은 docs/img/scm_injection.png 범례: 1 새 흙, 2 높이만 3 cm 낮춤,
-                                  # 3 이어 누른 자리, 4 3의 높이만 베낌). Godot 기본 글꼴에 한글이 없어 한글을 쓰면 화면이 멈춘다
-TINTS = [(0.52, 0.62, 0.78), (0.80, 0.60, 0.48), (0.48, 0.72, 0.60), (0.82, 0.70, 0.42)]   # 흙색에 섞은 범주 색
+sys.path.insert(0, str(ROOT / "conformance"))
+import scm_record  # noqa: E402
+
+PROBES = {"press": ("probe_scm_injection.py", "build/scm_press.npz"), "rolling": ("probe_scm_rolling.py", "build/scm_rolling.npz")}
 
 
 def sphere_obj(path, r, nu=32, nv=16):
@@ -46,14 +50,15 @@ def sphere_obj(path, r, nu=32, nv=16):
 def manifest(rec, asset_dir):
     W, H = rec["size"]
     nrow, ncol = rec["heights"].shape[1:]
-    half = int(rec["half"]) * float(rec["delta"])
-    regions = [{"name": n, "region": [x - half, y - half, x + half, y + half], "soil": n, "rgba": [*c, 1.0]}
-               for n, (x, y), c in zip(NAMES, rec["spots"], TINTS)]
+    regions = [dict(rg, soil=rg["name"]) for rg in json.loads(str(rec["regions"]))]
+    r = float(rec["radius"])
     return {"stream_version": STREAM_VERSION, "frame": "world",
             "conventions": {"coordinates": "REP-103 (x forward, y left, z up, right-handed)", "units": "m", "quaternion": "x,y,z,w"},
             "asset_root": str(asset_dir),
             "bodies": [{"id": 1, "name": "ball", "parent": "world", "physics_source": "Chrono", "entity": "probe_ball"}],
-            "visuals": [{"body": "ball", "mesh": "ball.obj", "pos": [0, 0, 0], "quat": [0, 0, 0, 1], "rgba": [0.78, 0.78, 0.80, 1.0]}],
+            "visuals": [{"body": "ball", "mesh": "ball.obj", "pos": [0, 0, 0], "quat": [0, 0, 0, 1], "rgba": [0.78, 0.78, 0.80, 1.0]},
+                        {"body": "ball", "mesh": "mark.obj", "pos": [0, 0, r], "quat": [0, 0, 0, 1], "rgba": [0.15, 0.15, 0.18, 1.0]},
+                        {"body": "ball", "mesh": "mark.obj", "pos": [r, 0, 0], "quat": [0, 0, 0, 1], "rgba": [0.85, 0.25, 0.20, 1.0]}],
             "soil_regions": regions,
             "terrain": {"half_size": [W / 2, H / 2], "nrow": int(nrow), "ncol": int(ncol), "z_range": [-0.2, 0.2],
                         "layout": "row-major; row i -> y = -half_y + i*dy, col j -> x = -half_x + j*dx"}}
@@ -65,31 +70,36 @@ def patch(version, grid, r0, r1, c0, c1):
 
 
 def info_lines(rec, k):
-    res = rec["results"]
-    lines = ["SCM probe (Chrono SCM -> render stream replay)", f"[{rec['phase'][k]}]",
-             f"sinkage {rec['sink'][k] * 100:.2f} cm"]
-    lines += [f"result (cm):  1 {res[0] * 100:.2f}   2 {res[0] * 100:.2f} (bottom {(res[1] - res[0]) * 100:+.2f})   "
-              f"3 {res[2] * 100:.2f}   4 {res[3] * 100:.2f}"]
-    return lines
+    now = f"sinkage {rec['sink'][k] * 100:.2f} cm"
+    if "force" in rec:
+        now += f"   rolling resistance {rec['force'][k]:.1f} N"
+    return [str(rec["title"]), f"[{rec['phase'][k]}]", now, *json.loads(str(rec["result_lines"]))]
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("record", nargs="?", default=str(ROOT / "build/scm_probe.npz"))
+    ap.add_argument("record", nargs="?", help="기록 (없으면 --probe의 기본 기록)")
+    ap.add_argument("--probe", choices=list(PROBES), default="press", help="기록이 없을 때 돌릴 시험")
     ap.add_argument("--speed", type=float, default=0.5, help="재생 속도 (1 = 시뮬레이션 시간)")
     ap.add_argument("--loop", action="store_true", help="끝나면 처음부터 다시")
     a = ap.parse_args()
-    rec_path = Path(a.record)
-    if not rec_path.exists():
+    script, default = PROBES[a.probe]
+    rec_path = Path(a.record or ROOT / default)
+    try:
+        rec = scm_record.load(rec_path) if rec_path.exists() else {}
+    except ValueError as e:                               # 옛 기록
+        print(e)
+        rec = {}
+    if not rec or not scm_record.has_render(rec):         # 없거나 렌더용 프레임이 없는 기록: 시험부터 다시
         from sim.chrono_link import find_chrono_python
-        print("기록이 없어 시험부터 돌린다 (chrono 환경)")
+        print(f"기록이 없어 시험부터 돌린다 ({script}, chrono 환경)")
         rec_path.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run([find_chrono_python({}), str(ROOT / "conformance/probe_scm_injection.py"), "--record", str(rec_path)],
-                       cwd=ROOT, check=True)
-    rec = dict(np.load(rec_path))
+        subprocess.run([find_chrono_python({}), str(ROOT / "conformance" / script), "--record", str(rec_path)], cwd=ROOT, check=True)
+        rec = scm_record.load(rec_path)
     out = ROOT / "build/scm_probe_replay"
     out.mkdir(parents=True, exist_ok=True)
     sphere_obj(out / "ball.obj", float(rec["radius"]))
+    sphere_obj(out / "mark.obj", 0.022, nu=12, nv=6)        # 구 표면의 표시점 (구르는 회전이 보이게)
 
     import rclpy
     from geometry_msgs.msg import TransformStamped
@@ -131,7 +141,11 @@ def main():
                 tf = TransformStamped()
                 tf.header.frame_id, tf.child_frame_id = "world", "ball"
                 tf.transform.translation.x, tf.transform.translation.y, tf.transform.translation.z = map(float, c)
-                tf.transform.rotation.w = 1.0
+                if "quat" in rec:
+                    q = rec["quat"][k]
+                    tf.transform.rotation.x, tf.transform.rotation.y, tf.transform.rotation.z, tf.transform.rotation.w = map(float, q)
+                else:
+                    tf.transform.rotation.w = 1.0
                 pub_tf.publish(TFMessage(transforms=[tf]))
                 pub_st.publish(String(data=json.dumps({"info_lines": info_lines(rec, k), "base_pos": [float(v) for v in c]})))
                 rclpy.spin_once(node, timeout_sec=0.0)
