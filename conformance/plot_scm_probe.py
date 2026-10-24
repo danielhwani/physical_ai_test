@@ -18,7 +18,12 @@ import scm_record  # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 INK, INK2, MUTED, SURFACE, GRID = "#0b0b0b", "#52514e", "#8f8d86", "#fcfcfb", "#e4e3df"
 DEFAULT_PNG = {"press": "docs/img/scm_injection.png", "compaction": "docs/img/scm_compaction.png",
-               "virtual_compaction": "docs/img/scm_virtual_compaction.png", "rolling": "docs/img/scm_rolling.png"}
+               "virtual_compaction": "docs/img/scm_virtual_compaction.png", "rolling": "docs/img/scm_rolling.png",
+               "offset_compare": "docs/img/scm_offset_compare.png"}
+
+
+OFFSET_LABEL = {"sinkage": " (sinkage 보정)", "iterate": " (되풀이 보정)"}
+OFFSET_NOTE = {"sinkage": "앞쪽 SCM의 노드 sinkage만큼 = 자국 전 높이", "iterate": "되풀이로 맞춘 양"}
 
 
 def _korean_font():
@@ -162,7 +167,7 @@ def plot_virtual(rec, path):
     masses, stiff_mult = a["masses"], a["stiff_mult"]
     real, virt, only, stiff = ({float(m): x for m, x in a[k].items()} for k in ("reference", "virtual", "heights_only", "stiff"))
     methods = [("높이만 넣음", only, "#2a78d6"), (f"높이 + 단단한 흙 ×{stiff_mult}", stiff, "#eb6834"),
-               ("높이 + 가상 다짐", virt, "#1baf7a")]                        # dataviz 기본 범주 색 1~3
+               ("높이 + 가상 다짐" + OFFSET_LABEL.get(a.get("offset"), ""), virt, "#1baf7a")]   # dataviz 기본 범주 색 1~3
     fig, (ax, bx) = plt.subplots(1, 2, figsize=(12, 5.2), gridspec_kw={"width_ratios": [1.15, 1], "wspace": 0.25})
     x = np.arange(len(masses))
     w = 0.2
@@ -202,7 +207,7 @@ def plot_virtual(rec, path):
     bx.text(0.02, 0.80, f"높이만 넣음은 범위 밖:\n{only_err} cm", transform=bx.transAxes, ha="left", va="top",
             color=INK2, fontsize=8.5)
     fig.text(0.01, -0.02, "이어 누른 자리 = 같은 SCM에서 60 kg 구로 한 번 누른 뒤 이어서 다시 누름 (단일 SCM 기준, 실측 아님). 나머지는 그 높이를 새 흙에 넣은 자리: 높이만 / 콜백이 kphi를 키움 / "
-             "60 kg으로 한 번 눌러 둠 (높이는 미리 올려 넣어 보정).\n가상 다짐은 SCM이 눌러 둔 압력을 스스로 기억해 다질 때 하중을 넘으면 "
+             "60 kg으로 한 번 눌러 둠 (높이는 미리 올려 넣음: " + OFFSET_NOTE.get(a.get("offset"), "보정") + ").\n가상 다짐은 SCM이 눌러 둔 압력을 스스로 기억해 다질 때 하중을 넘으면 "
              "다시 파인다 (90 kg). Chrono SCM, kphi 5e6, 2 cm 격자 (conformance/probe_scm_virtual_compaction.py)",
              color=INK2, fontsize=8, va="top")
     fig.savefig(path, dpi=130, bbox_inches="tight")
@@ -217,7 +222,7 @@ def plot_rolling(rec, path):
     plt = _pyplot()
     a, cfg = rec["analysis"], rec["config"]
     MID, COMPACT_MASS = tuple(cfg["mid"]), cfg["compact_mass"]
-    NAMES, COLORS = ROLL_NAMES, ROLL_COLORS
+    NAMES, COLORS = ROLL_NAMES[:2] + [ROLL_NAMES[2] + OFFSET_LABEL.get(cfg.get("offset"), "")], ROLL_COLORS
     results = {float(m): x for m, x in a["results"].items()}
     traces = {float(m): x for m, x in a["traces"].items()}
     masses = sorted(results)
@@ -226,8 +231,10 @@ def plot_rolling(rec, path):
     (ax, fx), (sx, rx) = axs
     for k, tr in enumerate(traces[m0]):
         x, bot, before, f = (np.array(v) for v in zip(*tr))
-        ax.plot(x, (before - bot) * 100, color=COLORS[k], lw=2.5 if k == 0 else 1.8, label=NAMES[k], zorder=3 - k * 0.1)
-        fx.plot(x, f, color=COLORS[k], lw=2.5 if k == 0 else 1.6, label=NAMES[k])
+        style = dict(color=COLORS[k], lw=3.5 if k == 0 else 1.8, label=NAMES[k], zorder=3 + k,
+                     ls=(0, (4, 3)) if k == 2 else "-")             # C는 A와 겹칠 수 있어 점선으로 위에
+        ax.plot(x, (before - bot) * 100, **style)
+        fx.plot(x, f, **style)
     for a_ in (ax, fx):
         a_.axvspan(*MID, color=GRID, alpha=0.5, lw=0, zorder=0)
         a_.set_xlabel("x (m)")
@@ -264,7 +271,77 @@ def plot_rolling(rec, path):
     fig.savefig(path, dpi=130, bbox_inches="tight")
 
 
-PLOTTERS = {"press": plot_press, "compaction": plot_compaction, "virtual_compaction": plot_virtual, "rolling": plot_rolling}
+METHOD_COLORS = {"iterate": "#eb6834", "sinkage": "#1baf7a"}        # dataviz 기본 범주 색 2, 3
+METHOD_NAMES = {"iterate": "되풀이 보정", "sinkage": "sinkage 보정"}
+
+
+def plot_offset_compare(rec, path):
+    """probe_scm_offset_compare.py: 가상 다짐의 두 높이 보정을 단일 SCM 기준과 비교 + 되풀이 보정이 맞아 가는 과정."""
+    plt = _pyplot()
+    a, cfg = rec["analysis"], rec["config"]
+    pm, rm = a["press_masses"], a["roll_masses"]
+    press, roll = a["press"], a["roll"]
+    fig, axs = plt.subplots(2, 2, figsize=(12, 8.2), gridspec_kw={"hspace": 0.5, "wspace": 0.25})
+    (ax, bx), (cx, dx) = axs
+
+    def bars(axis, masses, value, fmt, unit):
+        x = np.arange(len(masses))
+        lim0 = 0.03 * max(max(abs(value(meth, m)) for meth in ("iterate", "sinkage") for m in masses), 1e-3)
+        vals_all = []
+        for k, meth in enumerate(("iterate", "sinkage")):
+            vals = [value(meth, m) for m in masses]
+            vals = [0.0 if abs(v) < 0.005 else v for v in vals]                 # 표시 자리보다 작은 차이는 0 (-0.00 막기)
+            vals_all += vals
+            pos = x + (k - 0.5) * 0.3
+            axis.bar(pos, vals, 0.27, color=METHOD_COLORS[meth], label=METHOD_NAMES[meth], zorder=2)
+            zero = [p_ for p_, v in zip(pos, vals) if v == 0.0]
+            axis.plot(zero, [0.0] * len(zero), ls="none", marker="D", ms=6, color=METHOD_COLORS[meth], zorder=3)   # 0인 막대도 보이게
+            for p_, v in zip(pos, vals):
+                axis.text(p_, v + (lim0 if v >= 0 else -lim0), fmt.format(v), ha="center", va="bottom" if v >= 0 else "top",
+                          fontsize=8.5, color=INK)
+        lim = max(max(abs(v) for v in vals_all) * 1.5, 1e-3)
+        axis.set_ylim(-lim, lim)
+        axis.axhline(0, color=INK2, lw=0.8)
+        axis.set_xticks(x)
+        axis.set_xticklabels([f"{m:.0f} kg" + (" (다질 때와 같음)" if m == cfg["compact_mass"] else "") for m in masses])
+        axis.set_ylabel(f"단일 SCM 기준 대비 차이 ({unit})")
+        axis.grid(axis="y", color=GRID, lw=0.6, zorder=0)
+        axis.text(1.0, 0.98, "더 가라앉음 / 더 큼", transform=axis.transAxes, ha="right", va="top", color=INK2, fontsize=8.5)
+        axis.text(1.0, 0.02, "덜 가라앉음 / 더 작음", transform=axis.transAxes, ha="right", va="bottom", color=INK2, fontsize=8.5)
+
+    bars(ax, pm, lambda meth, m: (press[f"{meth}/{m:g}"]["sink"] - press[f"{meth}/{m:g}"]["ref"]) * 100, "{:+.2f}", "cm")
+    ax.set_title("누르기: 다시 누를 때 침하", loc="left", color=INK, fontsize=11)
+    ax.legend(loc="upper left", frameon=False, fontsize=9)
+    bars(bx, rm, lambda meth, m: (roll[f"{meth}/{m:g}"]["sink"] - roll[f"{meth}/{m:g}"]["ref_sink"]) * 100, "{:+.2f}", "cm")
+    bx.set_title("굴리기: 두 번째 굴림 추가 침하", loc="left", color=INK, fontsize=11)
+    bars(cx, rm, lambda meth, m: roll[f"{meth}/{m:g}"]["force"] - roll[f"{meth}/{m:g}"]["ref_force"], "{:+.1f}", "N")
+    cx.set_title("굴리기: 두 번째 굴림 구름 저항", loc="left", color=INK, fontsize=11)
+
+    for name, hist, final, ls, mk in (("누르기", a["press_history"], press[f"iterate/{pm[0]:g}"]["shape_err"], "-", "o"),
+                                      ("굴리기", a["roll_history"], roll[f"iterate/{rm[0]:g}"]["shape_err"], (0, (4, 3)), "s")):
+        ys = [v * 100 for v in hist] + [final * 100]
+        dx.plot(range(len(ys)), ys, color=METHOD_COLORS["iterate"], ls=ls, marker=mk, ms=6, lw=2,
+                label=f"{name} 되풀이 보정 (시험 {len(hist)}회)")
+        dx.annotate(f"{ys[-1]:.2f}", (len(ys) - 1, ys[-1]), xytext=(6, 4), textcoords="offset points", fontsize=8.5, color=INK)
+    for name, val, mk, x0 in (("누르기", press[f"sinkage/{pm[0]:g}"]["shape_err"], "o", -0.1),
+                              ("굴리기", roll[f"sinkage/{rm[0]:g}"]["shape_err"], "s", 0.1)):
+        dx.plot([x0], [val * 100], color=METHOD_COLORS["sinkage"], marker=mk, ms=9, ls="none",
+                label=f"{name} sinkage 보정 (시험 0회): {val * 100:.3f} cm", zorder=4)
+    dx.set_xlabel("보정을 찾는 데 쓴 시험 횟수 (0 = 보정 없이 / sinkage 보정은 시험 없음)")
+    dx.set_ylabel("다진 뒤 목표 높이와의 차이 최대 (cm)")
+    dx.set_xticks(range(max(len(a["press_history"]), len(a["roll_history"])) + 1))
+    dx.grid(axis="y", color=GRID, lw=0.6)
+    dx.legend(loc="upper right", frameon=False, fontsize=8.5)
+    dx.set_title("모양 맞추기: 되풀이는 시험이 들고, sinkage는 한 번에", loc="left", color=INK, fontsize=11)
+    fig.text(0.01, 0.0, "가상 다짐 = 높이를 넣고 다질 때와 같은 하중(60 kg)으로 한 번 눌러(굴려) 둠. 되풀이 보정 = 다진 뒤 목표 높이가 되도록 시작 높이를 "
+             "시험을 되풀이해 찾음 (모양만 맞춤), sinkage 보정 = 앞쪽 SCM의 노드 sinkage만큼 올려 넣음\n(= 자국 전 높이에서 같은 일을 다시 함, "
+             "모양과 다짐 상태가 같아짐). 기준 = 같은 SCM에서 이어 누른(굴린) 결과, 실측 아님. 모양 차이: 누르기는 자리 전체, 굴리기는 줄 가운데 "
+             "가운데 구간. Chrono SCM, kphi 5e6, 2 cm 격자 (conformance/probe_scm_offset_compare.py)", color=INK2, fontsize=8, va="top")
+    fig.savefig(path, dpi=130, bbox_inches="tight")
+
+
+PLOTTERS = {"press": plot_press, "compaction": plot_compaction, "virtual_compaction": plot_virtual, "rolling": plot_rolling,
+            "offset_compare": plot_offset_compare}
 
 
 def plot(record, png=None):

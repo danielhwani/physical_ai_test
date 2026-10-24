@@ -1,7 +1,7 @@
 """구르는 구로 SCM 다짐 전달 시험 (docs/map_server.md 5.5): 누르기 시험(probe_scm_*.py)을 굴리기로. 흙을 미는 전단(kshear, tau)과
 구름 저항이 들어간다.
 
-    python conformance/probe_scm_rolling.py [--masses 60 90] [--rounds 3] [--plot docs/img/scm_rolling.png] [--record build/scm_rolling.npz]
+    python conformance/probe_scm_rolling.py [--masses 60 90] [--offset sinkage|iterate] [--plot PNG] [--record build/scm_rolling.npz]
     --record: 첫 하중의 실행을 기록 (흙 높이, 구 위치·회전, 약 15 Hz). Godot 재생: python conformance/replay_scm_probe.py --probe rolling
     (어느 환경이든: pychrono가 없으면 chrono 환경으로 다시 실행)
 
@@ -11,9 +11,12 @@
   B 높이만 베낀 줄                 A의 첫 자국 높이를 새 흙에 넣고 -> 하중 M으로 굴림
   C 가상 다짐 줄                   A의 높이(+ 보정)를 넣고 -> 60 kg으로 한 번 굴려 다짐 -> 하중 M으로 굴림
 가운데 구간(x -0.3 ~ 0.3 m)에서 두 번째 굴림의 추가 침하(굴리기 전 표면 - 구 바닥)와 평균 구름 저항(끄는 힘 x)을 잰다.
-보정: C에서 다지는 굴림 동안 더 내려가는 양을 미리 재서 그만큼 올려 넣는다 (--rounds번 되풀이, 매번 새 SCM).
+보정 (C에 올려 넣는 높이): --offset sinkage (기본) = A의 노드 sinkage(처음 높이 - 지금 높이)만큼 = 자국 전 높이를 넣고 같은 하중으로
+다시 굴림. 되풀이가 필요 없고 A와 같아진다 (2026-10-25: 60 / 90 kg 모두 침하·저항 같음). --offset iterate = 다지는 굴림 동안 더
+내려가는 양을 따로 돌려 재서 올려 넣는다 (--rounds번 되풀이, 예전 방식, 비교용).
 이 PC (2026-10-24, 약 30초): 첫 굴림 60 kg 새 흙 침하 2.80 cm, 저항 95.2 N. 두 번째 굴림 추가 침하 / 저항
-  60 kg: A 0.69 cm / 40.5 N, B 2.16 / 98.9, C 0.67 / 49.5.  90 kg: A 1.24 / 108.4, B 2.75 / 166.6, C 1.19 / 113.5.
+  60 kg: A 0.69 cm / 40.5 N, B 2.16 / 98.9, C 0.69 / 40.5 (sinkage 보정; 되풀이 보정 3회는 0.67 / 49.5).
+  90 kg: A 1.24 / 108.4, B 2.75 / 166.6, C 1.24 / 108.4 (되풀이 보정 1.19 / 113.5).
 """
 import argparse
 import json
@@ -125,6 +128,13 @@ class Roller:
         i0, i1 = int(round(-SIZE[0] / 2 / DELTA)), int(round(SIZE[0] / 2 / DELTA))
         return {(i, dj): self.height(i * DELTA, (j0 + dj) * DELTA) for i in range(i0, i1 + 1) for dj in range(-STRIP, STRIP + 1)}
 
+    def strip_sinkage(self, y):
+        """줄 y 둘레 노드의 sinkage (SCM NodeInfo: 처음 높이 - 지금 높이). 앞쪽 SCM이 자국과 함께 넘길 수 있는 값."""
+        j0 = int(round(y / DELTA))
+        i0, i1 = int(round(-SIZE[0] / 2 / DELTA)), int(round(SIZE[0] / 2 / DELTA))
+        return {(i, dj): self.ter.GetNodeInfo(chrono.ChVector3d(i * DELTA, (j0 + dj) * DELTA, 0)).sinkage
+                for i in range(i0, i1 + 1) for dj in range(-STRIP, STRIP + 1)}
+
     def inject(self, y, levels, offset=None):
         if self.frames is not None:
             self.last_xy, self.last_z = (X0, y), self.height(X0, y) + R + 0.25
@@ -145,8 +155,14 @@ def first_pass(r):
     return r.strip(LANES["A"]), s, f
 
 
+def mid_error(rut, after):
+    """줄 가운데, 가운데 구간에서 (목표 높이 - 다진 뒤 높이)의 최대 크기."""
+    return max(abs(rut[key] - after[key]) for key in rut if key[1] == 0 and MID[0] <= key[0] * DELTA <= MID[1])
+
+
 def calibrate(rounds):
     offset = {}
+    calibrate.history = []                                          # 회차마다 (그 회차 시작 보정으로) 다진 뒤 줄 가운데 차이 최대
     for k in range(rounds):
         r = Roller()
         rut, _, _ = first_pass(r)
@@ -155,6 +171,7 @@ def calibrate(rounds):
         after = r.strip(LANES["C"])
         err = {key: rut[key] - after[key] for key in rut}
         mid = [v for (i, dj), v in err.items() if dj == 0 and MID[0] <= i * DELTA <= MID[1]]
+        calibrate.history.append(mid_error(rut, after))
         offset = {key: offset.get(key, 0.0) + err[key] for key in rut}
         print(f"  보정 {k + 1}회: 다지는 굴림 뒤 베낀 높이와의 차이 (줄 가운데, 가운데 구간) 평균 {np.mean(mid) * 100:+.2f} cm, "
               f"최대 {np.max(np.abs(mid)) * 100:.2f} cm", flush=True)
@@ -167,6 +184,8 @@ def run(mass, offset, record=False):
     if record:
         r.frames = []
     rut, s1, f1 = first_pass(r)
+    if offset == "sinkage":                             # 되풀이 보정 없이: A의 노드 sinkage만큼 올려 넣는다 (= 자국 전 높이)
+        offset = r.strip_sinkage(LANES["A"])
     r.phase = f"A: roll again in the same SCM ({mass:.0f} kg) = reference"
     a = r.roll(LANES["A"], mass)
     ta = r.trace
@@ -179,6 +198,7 @@ def run(mass, offset, record=False):
     r.inject(LANES["C"], rut, offset)
     r.phase = "C: virtual compaction roll (60 kg)"
     r.roll(LANES["C"], COMPACT_MASS)
+    run.shape_err[mass] = mid_error(rut, r.strip(LANES["C"]))     # 다진 뒤 C와 A 첫 자국의 높이 차이 (줄 가운데)
     r.phase = f"C: roll after virtual compaction ({mass:.0f} kg)"
     c = r.roll(LANES["C"], mass)
     tc = r.trace
@@ -187,6 +207,7 @@ def run(mass, offset, record=False):
 
 
 run.traces = {}
+run.shape_err = {}
 
 
 def render(r, mass, a, b, c):
@@ -206,13 +227,17 @@ def render(r, mass, a, b, c):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--masses", type=float, nargs="+", default=[60.0, 90.0], help="두 번째 굴림 하중 (kg)")
-    ap.add_argument("--rounds", type=int, default=3, help="C 높이 보정 되풀이 횟수")
+    ap.add_argument("--offset", choices=["sinkage", "iterate"], default="sinkage", help="C 높이 보정 방식")
+    ap.add_argument("--rounds", type=int, default=3, help="--offset iterate의 되풀이 횟수")
     ap.add_argument("--plot", metavar="PNG", help="그림으로 저장 (기록을 저장한 뒤 plot_scm_probe.py로 그림)")
     ap.add_argument("--record", metavar="NPZ", help="시험 기록: 분석 데이터 + 첫 하중 실행의 Godot 재생용 프레임 (scm_record.py)")
     a = ap.parse_args()
-    print("보정 (C: 다지는 굴림 동안 내려가는 양 재기):")
-    offset = calibrate(a.rounds)
-    print()
+    if a.offset == "iterate":
+        print("보정 (C: 다지는 굴림 동안 내려가는 양 재기):")
+        offset = calibrate(a.rounds)
+        print()
+    else:
+        offset = "sinkage"
     results, frames = {}, None
     for mass in a.masses:
         (s1, f1), A, B, C, rend = run(mass, offset, record=bool(a.record) and mass == a.masses[0])
@@ -224,7 +249,7 @@ def main():
     if a.record or a.plot:
         import scm_record
         config = {"soil": P.SOIL, "radius": R, "delta": DELTA, "compact_mass": COMPACT_MASS, "mid": MID, "lanes": LANES,
-                  "x": [X0, X1], "speed": SPEED, "rounds": a.rounds}
+                  "x": [X0, X1], "speed": SPEED, "offset": a.offset, "rounds": a.rounds}
         analysis = {"masses": a.masses, "results": results, "traces": run.traces}
         path = a.record or str(Path(__file__).resolve().parent.parent / "build/scm_rolling_plot.npz")
         scm_record.save(path, "rolling", config, analysis, frames)

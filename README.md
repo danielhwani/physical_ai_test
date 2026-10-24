@@ -45,8 +45,9 @@ python conformance/test_render_stream.py                 # 렌더 스트림 계�
 python conformance/compare_variants.py [--policy card.yaml]   # cpu vs mjx 설정의 MOP 분포 비교
 python conformance/probe_scm_injection.py [--record build/scm_press.npz] [--plot PNG]   # SCM에 바깥 높이 넣기: 접촉은 따라가고 다짐 이력은 안 넘어감 (docs/map_server.md 5.5). 어느 환경이든: chrono 환경으로 다시 실행
 python conformance/probe_scm_compaction.py [--record build/scm_compaction.npz]   # 다짐 -> 단단한 흙 콜백: kphi ×25로 다짐 흉내 (약 1분)
-python conformance/probe_scm_virtual_compaction.py [--record build/scm_virtual_compaction.npz]   # 가상 다짐: 한 번 눌러 두면 SCM이 다짐을 기억 (세 방법 비교, 약 35초)
+python conformance/probe_scm_virtual_compaction.py [--record build/scm_virtual_compaction.npz] [--offset sinkage|iterate]   # 가상 다짐: 자국 전 높이를 넣고 한 번 다시 누르면 단일 SCM과 같음 (세 방법 비교, 약 35초)
 python conformance/probe_scm_rolling.py [--record build/scm_rolling.npz]   # 구르는 구: 높이만 / 굴려서 가상 다짐 vs 단일 SCM (침하, 구름 저항, 약 30초)
+python conformance/probe_scm_offset_compare.py [--record build/scm_offset_compare.npz]   # 가상 다짐 두 보정 비교: 되풀이 vs sinkage (약 1분 20초)
 python conformance/plot_scm_probe.py build/scm_<시험>.npz [-o PNG]   # 기록에서 분석 그래프 (시뮬레이션 없이, 기본 docs/img/scm_*.png)
 python conformance/replay_scm_probe.py [--probe press|rolling] [--speed 0.5] [--loop]   # 같은 기록을 Godot로 재생 (기록 없으면 시험부터. mj_ros 환경)
 python conformance/make_obs_reference.py                 # (관측 명세를 바꾼 경우) 기준 벡터 재생성
@@ -2053,8 +2054,11 @@ python -m sim.rt_link scenarios/flat_trot.yaml --brain ros --remote-brain --ros-
   결론: 높이만 넘기면 다짐 이력이 없어 새 흙처럼 가라앉는다. 넘겨받은 쪽이 같은 하중으로 한 번 눌러(굴려) 두는 **가상 다짐**이
   기본 후보다. 시험 기록 하나에서 분석 그래프(`conformance/plot_scm_probe.py`)와 Godot 재생(`conformance/replay_scm_probe.py`)이 나온다.
 - 다음 (권하는 순서):
-  1. **가상 다짐의 높이 보정 계산식**: 지금은 시험을 3~4번 되풀이해 맞춘다. 맵 서버에서 쓰려면 흙 식(Bekker)으로 한 번에 계산해야 한다.
+  1. ~~가상 다짐의 높이 보정 계산식~~ (2026-10-25 풀림): 앞쪽 SCM의 노드 `sinkage`만큼 올려 넣으면(= 자국 전 높이) 되풀이 없이
+     단일 SCM과 같아진다 (누르기·굴리기 모두, `docs/map_server.md` 5.5 "높이 보정 = 앞쪽 SCM의 sinkage"). 넘길 것: 지금 높이, sinkage,
+     자국을 만든 하중·물체·경로.
   2. **실제 바퀴로 가상 다짐**: 구 대신 바퀴 모양, 구동 토크와 미끄러짐. HMMWV 바퀴 자국을 넘겨받는 실제 경우.
+     여러 번 지나간 자리(순서대로 되풀이)도 함께 본다.
   3. **맵 서버 1단계 구현**: 같은 프로세스 안 모드. 모든 시나리오가 지금과 비트 단위로 같아야 한다 (설계 문서 8절).
   4. **타당성 확인**: 지금 결과는 모두 단일 SCM과의 일관성이다. 실제 흙과 비교하려면 판 재하 시험이나 반복 주행 시험의 실측 자료와
      그에 맞춘 흙 매개변수가 필요하다. 자료를 구하는 것부터 정한다.
