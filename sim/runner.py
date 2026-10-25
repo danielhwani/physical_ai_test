@@ -123,7 +123,7 @@ class Simulation:
     dis = None      # DIS 시나리오 콘솔 서버 (sim/dis_server.py). 콘솔 요청을 events에 넣는다
 
     def __init__(self, scenario, spec_path=ROOT / "specs/go2_control.yaml", variant="cpu", seed=None,
-                 policy=None, sensors=None):
+                 policy=None, sensors=None, map_client=None):
         self.scn = copy.deepcopy(scenario) if isinstance(scenario, dict) else load_yaml(scenario)
         if seed is not None:
             self.scn["seed"] = seed
@@ -137,7 +137,9 @@ class Simulation:
         self.guard_radius = t.get("guard_radius", 0.15)
         for p in t.get("patches", []):
             self.terrain.add_patch(p)
-        self.terrain.attach_server()     # 맵 서버 (sim/map_server.py): 시작 지형이 바탕, 이후 변경은 서버를 거친다 (결과는 같음)
+        # 맵 서버 (sim/map_server.py): 시작 지형이 바탕, 이후 변경은 서버를 거친다 (결과는 같음).
+        # map_client: 이름을 주면 별도 프로세스 서버(sim/map_server_node.py)의 원격 클라이언트 (--map-server)
+        self.terrain.attach_server(remote=map_client)
         self.variant = variant
         # 무른 흙 발 반력 (선택, sim/foot_soil.py): 발·정강이는 단단한 지형과 충돌하지 않고 흙 반력을 받는다
         self.foot_soil_cfg = self.scn.get("foot_soil") or None
@@ -419,6 +421,7 @@ class Simulation:
                     print(f"[t={d.time:6.2f}] event: vehicle_near ({dist:.2f} m)")
         terrain_changed = False
         if d.time >= self.next_terrain_commit:
+            self.terrain.poll_server()                 # 원격 맵 서버의 다른 쪽 변경 (없으면 아무 일 없음)
             if self.terrain.recenter(*d.qpos[:2], trigger=self.window_trigger):
                 # 창 이동: 지형 mocap 바디를 새 창 중심으로 옮기고 창 영역을 다시 채운다 (월드 좌표의 높이는 그대로)
                 d.mocap_pos[self.terrain_mocap] = [*self.terrain.window_center, 0.0]
@@ -476,8 +479,13 @@ def run(args):
     scenario = apply_overrides(scenario, getattr(args, "set", None))
     sensor_node = getattr(args, "sensor_node", False)
     # --sensor-node: 센서를 별도 프로세스(ROS2 스트림 구독)에서 계산하므로 러너 안에서는 센서를 켜지 않는다
+    map_proc = None
+    if getattr(args, "map_server", False):          # 맵 서버를 별도 프로세스로 (docs/map_server.md 2단계)
+        from .ros2_bridge import launch_map_server
+        map_proc = launch_map_server(ROOT / "build")
     sim = Simulation(scenario, variant=args.variant, policy=args.policy,
-                     sensors=None if sensor_node else getattr(args, "sensor", None))
+                     sensors=None if sensor_node else getattr(args, "sensor", None),
+                     map_client="sim" if map_proc is not None else None)
     if sensor_node and sim.controller.sensor:
         raise SystemExit("지형 인지 보행기는 센서를 러너 안에서 계산한다. --sensor-node 없이 실행한다.")
     scn, d, m = sim.scn, sim.data, sim.model
@@ -769,8 +777,14 @@ def run(args):
         "max_lag_s": round(max_lag, 4) if (args.realtime or viewer) else None,
     }
     rec.save(mop)
-    if sim.terrain.server is not None:             # 맵 서버 변경 기록 요약
-        (out / "map_updates.json").write_text(json.dumps(sim.terrain.server.summary(), indent=1))
+    if sim.terrain.server is not None:             # 맵 서버 변경 기록 요약 (+ 별도 프로세스면 서버와 사본 대조)
+        summary = sim.terrain.server.summary()
+        if map_proc is not None:
+            summary["audit"] = sim.terrain.server.audit()
+            print(f"맵 서버 대조: {summary['audit']}")
+        (out / "map_updates.json").write_text(json.dumps(summary, indent=1))
+    if map_proc is not None:
+        map_proc.terminate()
     if sim.dis is not None:                  # 콘솔 이벤트를 적용 시각으로 넣은 시나리오: python -m sim.runner <이 파일> 로 같은 결과
         reason = ("stopped" if sim.stop_requested else "fell" if fell_at is not None else
                   "interrupted" if interrupted else "duration")
@@ -823,6 +837,8 @@ def main():
     ap.add_argument("--view", action="store_true", help="MuJoCo 뷰어 표시")
     ap.add_argument("--start-paused", action="store_true", help="--view와 함께: 일시정지 상태로 시작")
     ap.add_argument("--ros2", action="store_true", help="ROS2 /tf, /joint_states, /clock 발행")
+    ap.add_argument("--map-server", action="store_true",
+                    help="맵 서버를 별도 프로세스로 (sim/map_server_node.py, ROS2. docs/map_server.md 2단계). 없으면 같은 프로세스 안")
     ap.add_argument("--rviz", action="store_true",
                     help="RViz로 가시화 (--ros2, --realtime 자동 적용. conda 환경에서 바로 실행 가능)")
     ap.add_argument("--mjviz", action="store_true",

@@ -50,6 +50,13 @@ def launch_sensor_node(log_dir, sensors):
                             stdout=open(log_dir / "sensor_node.log", "w"), stderr=subprocess.STDOUT)
 
 
+def launch_map_server(log_dir):
+    """맵 서버 프로세스 (sim/map_server_node.py). 클라이언트(RemoteMap)가 /map/write 구독을 기다리므로 바로 돌려준다."""
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return subprocess.Popen([sys.executable, "-m", "sim.map_server_node"], cwd=ROOT,
+                            stdout=open(log_dir / "map_server_node.log", "w"), stderr=subprocess.STDOUT)
+
+
 def launch_controller_node(log_dir, scenario_path=None, policy=None, viz=False):
     """보행 알고리즘 ROS2 노드 (control/ros_node.py): 로봇 상태 토픽만 보고 관절 명령 토픽을 낸다."""
     cmd = [sys.executable, "-m", "control.ros_node"] + (["--publish-perception"] if viz else [])

@@ -78,11 +78,25 @@ class TerrainMapService:
         self.wr0, self.wc0 = origin
         return True
 
-    def attach_server(self):
-        """지금 target(시작 패치까지 반영된 지형)을 바탕으로 맵 서버를 만들고, 이후 변경은 서버를 거친다."""
-        from .map_server import MapServer
-        self.server = MapServer(self.target, (self.z_min, self.z_max))
+    def attach_server(self, remote=None):
+        """지금 target(시작 패치까지 반영된 지형)을 바탕으로 맵 서버를 만들고, 이후 변경은 서버를 거친다.
+        remote: 클라이언트 이름을 주면 별도 프로세스 맵 서버(sim/map_server_node.py)의 원격 클라이언트 (2단계)."""
+        if remote:
+            from .map_client import RemoteMap
+            self.server = RemoteMap(self.target, (self.z_min, self.z_max), name=remote)
+        else:
+            from .map_server import MapServer
+            self.server = MapServer(self.target, (self.z_min, self.z_max))
         return self.server
+
+    def poll_server(self):
+        """원격 맵 서버에서 받은 다른 쪽 변경을 반영. 바뀌었으면 True (commit 전에 부른다)."""
+        if self.server is None or not hasattr(self.server, "poll") or self.server.poll() == 0:
+            return False
+        self.target = self.server.compose(0, self.nrow, 0, self.ncol)
+        self.version += 1
+        self._cand = None
+        return True
 
     # ---- 패치 생성 ----
     def add_patch(self, p):

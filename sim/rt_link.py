@@ -325,13 +325,18 @@ class RosBrain(InprocBrain):
 
 
 def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inproc", policy=None, remote=False,
-        viz=(), out_dir=None, variant="cpu", overrides=(), dis=None, chrono_max_lag=CHRONO_MAX_LAG):
+        viz=(), out_dir=None, variant="cpu", overrides=(), dis=None, chrono_max_lag=CHRONO_MAX_LAG, map_server=False):
     """시나리오를 C++ 코어로 실행하고 (MOP, 끝 qpos)를 돌려준다.
     viz: ("rviz", "mjviz", "godot", "godot_lidar") 중 고른 것. out_dir: 기록 폴더 (timeseries.parquet, summary.json, 로그. 없으면 남기지 않음).
     variant: 모델 설정 (cpu / mjx, sim.runner --variant와 같다).
     dis: DIS 콘솔 설정 {port, host, key(bytes), wait, comm_lost} (실시간 전용).
-    chrono_max_lag: 실시간에서 Chrono가 이보다(s) 뒤처지면 코어를 멈춰 기다린다 (0: 상한 없음)."""
-    sim = Simulation(scenario, policy=policy, variant=variant)
+    chrono_max_lag: 실시간에서 Chrono가 이보다(s) 뒤처지면 코어를 멈춰 기다린다 (0: 상한 없음).
+    map_server: 맵 서버를 별도 프로세스로 (sim/map_server_node.py, docs/map_server.md 2단계). 아니면 같은 프로세스 안."""
+    map_proc = None
+    if map_server:
+        from .ros2_bridge import launch_map_server
+        map_proc = launch_map_server(out_dir or ROOT / "build/rt")
+    sim = Simulation(scenario, policy=policy, variant=variant, map_client="sim" if map_proc is not None else None)
     supported = ("set_command", "add_patch", "inject_fault", "clear_fault", "create_entity", "remove_entity", "set_soil")
     unsupported = [e["action"] for e in sim.events if e["action"] not in supported]
     if unsupported:
@@ -498,6 +503,7 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
         changed = False
         if t_now >= next_commit[0]:
             T = sim.terrain
+            T.poll_server()                                              # 원격 맵 서버의 다른 쪽 변경 (sim.runner와 같은 자리)
             if T.recenter(*base_xy, trigger=sim.window_trigger):          # 지형 창 이동
                 sim.data.mocap_pos[sim.terrain_mocap] = [*T.window_center, 0.0]
                 T.write_all(sim.model, sim.hfield_id)
@@ -843,8 +849,12 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
         if rec is not None:
             rec.meta["brain"] = br.name
             rec.save(mop)
-            if sim.terrain.server is not None:                      # 맵 서버 변경 기록 요약
-                (out_dir / "map_updates.json").write_text(json.dumps(sim.terrain.server.summary(), indent=1))
+            if sim.terrain.server is not None:                      # 맵 서버 변경 기록 요약 (+ 별도 프로세스면 서버와 사본 대조)
+                summary = sim.terrain.server.summary()
+                if map_proc is not None:
+                    summary["audit"] = sim.terrain.server.audit()
+                    print(f"맵 서버 대조: {summary['audit']}")
+                (out_dir / "map_updates.json").write_text(json.dumps(summary, indent=1))
             for name, scans in scan_log.items():                    # LiDAR 원시 출력 (sim.runner와 같은 형식)
                 np.savez_compressed(out_dir / f"{name}.npz", t=np.array([s["t"] for s in scans]),
                                     frame=np.concatenate([np.full(len(s["points"]), i, np.int32) for i, s in enumerate(scans)]),
@@ -877,7 +887,7 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
             dis_srv.close()
         if br is not None:
             br.close()
-        for p in [p for _, p in displays] + helpers:
+        for p in [p for _, p in displays] + helpers + ([map_proc] if map_proc is not None else []):
             if p.poll() is None:
                 p.terminate()
         if bridge is not None:
@@ -910,6 +920,7 @@ def main():
     ap.add_argument("--rviz", action="store_true", help="RViz로 보기 (sim.runner --rviz와 같은 화면)")
     ap.add_argument("--mjviz", action="store_true", help="MuJoCo 렌더러로 보기")
     ap.add_argument("--godot", action="store_true", help="Godot 4 렌더러로 보기 (viz/godot_bridge.py + godot/)")
+    ap.add_argument("--map-server", action="store_true", help="맵 서버를 별도 프로세스로 (sim/map_server_node.py, ROS2)")
     ap.add_argument("--godot-lidar", action="store_true",
                     help="--godot + LiDAR 점군과 알고리즘 지형 지도 (시나리오에 센서가 없으면 front_lidar를 켠다)")
     ap.add_argument("--cpu", type=int, default=5, help="코어를 고정할 CPU (-1: 고정 안 함)")
@@ -942,7 +953,8 @@ def main():
             dis = {"port": a.dis_port, "host": a.dis_host, "wait": a.dis_wait, "comm_lost": a.dis_comm_lost,
                    "key": load_key(a.dis_key) if a.dis_key else None}
         mop, _ = run(scn, a.lockstep, a.cpu, a.priority, brain=a.brain, policy=a.policy, remote=a.remote_brain,
-                     viz=viz, out_dir=out, variant=a.variant, overrides=a.set or (), dis=dis, chrono_max_lag=a.chrono_max_lag)
+                     viz=viz, out_dir=out, variant=a.variant, overrides=a.set or (), dis=dis, chrono_max_lag=a.chrono_max_lag,
+                     map_server=a.map_server)
         print("\n== MOP (C++ 실시간 코어) ==")
         for k, v in mop.items():
             print(f"  {k:20s} {v}")
