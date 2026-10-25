@@ -7,6 +7,8 @@
 - 로봇 발 근처 셀은 갱신을 미루고, 발이 떠난 뒤 반영한다 (발밑 지형 급변 방지).
 - 지금은 패치(요철, 경사, 홈)를 직접 생성하지만, 나중에 Chrono SCM 변형 결과를
   같은 apply_heights() 경로로 넣으면 된다.
+- 맵 서버 (sim/map_server.py, 1단계): attach_server() 뒤로는 지형 변경을 맵 서버에 쓰고(홈 = 파임, 요철·경사·둔덕 = 편집 add,
+  Chrono 노드 = 소유 영역), 서버가 합친 물리 높이를 target에 받아 쓴다. 결과는 서버 없이 할 때와 비트 단위로 같다.
 """
 import numpy as np
 
@@ -27,6 +29,8 @@ class TerrainMapService:
         self.applied = self.target.copy()                  # 물리엔진에 반영된 지형
         self._cand = None   # 반영 대기일 수 있는 셀 (rows, cols). None이면 다음 반영 때 세계 지도 전체를 비교한다
         self.version = 0            # 원천(target)이 바뀔 때 증가
+        self.server = None          # 맵 서버 (attach_server 뒤). target은 그 서버가 합친 물리 높이의 사본
+        self.time = 0.0             # 변경 기록에 붙일 시뮬레이션 시각 (호출하는 쪽이 갱신)
         self.applied_version = 0    # 물리엔진 반영(applied)이 바뀔 때 증가 (렌더러 갱신 기준)
 
         # MuJoCo heightfield 창 (window=None이면 세계 지도 전체 = 예전 방식)
@@ -73,6 +77,12 @@ class TerrainMapService:
             return False
         self.wr0, self.wc0 = origin
         return True
+
+    def attach_server(self):
+        """지금 target(시작 패치까지 반영된 지형)을 바탕으로 맵 서버를 만들고, 이후 변경은 서버를 거친다."""
+        from .map_server import MapServer
+        self.server = MapServer(self.target, (self.z_min, self.z_max))
+        return self.server
 
     # ---- 패치 생성 ----
     def add_patch(self, p):
@@ -123,10 +133,25 @@ class TerrainMapService:
         """patch_delta 결과를 원천에 더한다. 사각형 패치(홈)는 그 사각형만 고친다: 세계 지도 전체를 더하고 자르면 실시간에서 약 50 ms
         (원천은 늘 범위 안이라 바깥 셀은 전체 계산과 같은 값이다)."""
         if not isinstance(delta, tuple):
-            self.apply_heights(self.target + delta)
+            if self.server is None:
+                self.apply_heights(self.target + delta)
+                return
+            self.server.write("add", "event", 0, 0, delta, t=self.time)            # 요철·경사·둔덕: 편집 (E와 D를 함께 옮김)
+            self.target = self.server.compose(0, self.nrow, 0, self.ncol)
+            self.version += 1
+            self._cand = None
             return
         (rs, cs), block = delta
-        self.target[rs, cs] = np.clip(self.target[rs, cs] + block, self.z_min, self.z_max)
+        if self.server is None:
+            self.target[rs, cs] = np.clip(self.target[rs, cs] + block, self.z_min, self.z_max)
+        elif (block <= 0).all():                     # 홈: 파임 (바뀐 뒤의 절대 높이, 안 바뀐 칸은 NaN)
+            new = np.clip(self.target[rs, cs] + block, self.z_min, self.z_max)
+            new[block == 0] = np.nan
+            r0, r1, c0, c1 = self.server.write("dig", "event", rs.start, cs.start, new, t=self.time)
+            self.target[r0:r1, c0:c1] = self.server.compose(r0, r1, c0, c1)
+        else:                                        # 높이는 사각형 패치: 편집
+            r0, r1, c0, c1 = self.server.write("add", "event", rs.start, cs.start, block, t=self.time)
+            self.target[r0:r1, c0:c1] = self.server.compose(r0, r1, c0, c1)
         self.version += 1
         if self._cand is not None:                 # 바뀔 수 있는 셀: 보류 중이던 셀 + 패치가 0이 아닌 셀
             rows, cols = np.nonzero(block)
@@ -134,16 +159,30 @@ class TerrainMapService:
 
     def apply_heights(self, heights):
         """외부(예: Chrono SCM)에서 받은 절대 높이 격자를 원천에 반영."""
-        self.target = np.clip(heights, self.z_min, self.z_max)
+        if self.server is not None:                  # 높이 전체를 정함: 편집 set
+            self.server.write("set", "external", 0, 0, np.clip(heights, self.z_min, self.z_max), t=self.time)
+            self.target = self.server.compose(0, self.nrow, 0, self.ncol)
+        else:
+            self.target = np.clip(heights, self.z_min, self.z_max)
         self.version += 1
         self._cand = None
 
-    def set_cells(self, rows, cols, heights):
+    def set_cells(self, rows, cols, heights, writer="chrono"):
         """외부 물리엔진(Chrono SCM)이 계산한 일부 셀의 절대 높이를 원천에 반영. 격자 밖 셀은 버린다."""
         rows, cols, heights = np.asarray(rows), np.asarray(cols), np.asarray(heights, dtype=float)
         ok = (rows >= 0) & (rows < self.nrow) & (cols >= 0) & (cols < self.ncol)
         if ok.any():
-            self.target[rows[ok], cols[ok]] = np.clip(heights[ok], self.z_min, self.z_max)
+            r, c, h = rows[ok], cols[ok], np.clip(heights[ok], self.z_min, self.z_max)
+            if self.server is None:
+                self.target[r, c] = h
+            else:                                    # 소유 영역(Chrono)이면 own, 아니면 높이를 정함 (set: 지금 동작과 같은 덮어쓰기)
+                own = self.server.owned[r, c]
+                if own.any():
+                    self.server.write_cells("own", writer, r[own], c[own], h[own], t=self.time)
+                if (~own).any():
+                    self.server.write_cells("set", writer, r[~own], c[~own], h[~own], t=self.time)
+                r0, r1, c0, c1 = r.min(), r.max() + 1, c.min(), c.max() + 1
+                self.target[r, c] = self.server.compose(r0, r1, c0, c1)[r - r0, c - c0]
             self.version += 1
             if self._cand is not None:
                 self._cand = (np.concatenate([self._cand[0], rows[ok]]), np.concatenate([self._cand[1], cols[ok]]))

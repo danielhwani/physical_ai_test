@@ -42,6 +42,7 @@ python conformance/test_link_jitter.py                   # lockstep 통계적 �
 python conformance/compare_link_timing.py <시나리오> --seeds 30   # 실시간 지연 vs lockstep 통계적 지연 비교 (실측 분포도 잰다)
 python conformance/test_foot_soil.py                     # 무른 흙 발 상호작용 (SCM 기준 침하, 흙별 걷기)
 python conformance/test_render_stream.py                 # 렌더 스트림 계약 (스트림만으로 장면 재구성 = 시뮬레이터)
+python conformance/test_map_server.py                    # 맵 서버 1단계: 합치는 규칙 (min, NaN, 순서), 소유 영역, 서버 없이 / 있게 비트 동일
 python conformance/compare_variants.py [--policy card.yaml]   # cpu vs mjx 설정의 MOP 분포 비교
 python conformance/probe_scm_injection.py [--record build/scm_press.npz] [--plot PNG]   # SCM에 바깥 높이 넣기: 접촉은 따라가고 다짐 이력은 안 넘어감 (docs/map_server.md 5.5). 어느 환경이든: chrono 환경으로 다시 실행
 python conformance/probe_scm_compaction.py [--record build/scm_compaction.npz]   # 다짐 -> 단단한 흙 콜백: kphi ×25로 다짐 흉내 (약 1분)
@@ -88,7 +89,7 @@ done
 `python -m sim.sweep <시나리오> --param <키> --values ...`는 값 하나를 바꿔 가며 MOP 비교표(`runs/sweep_*.csv`)를 만든다.
 Chrono 시나리오의 MOP에는 지면 변형량(`deformed_cells`, `deform_mean_m`, `deform_max_m`)이 들어간다.
 
-결과는 `runs/<시나리오>_<시각>/`에 `timeseries.parquet`(시계열, 메타데이터에 버전 조합)과 `summary.json`(MOP)으로 남는다.
+결과는 `runs/<시나리오>_<시각>/`에 `timeseries.parquet`(시계열, 메타데이터에 버전 조합)과 `summary.json`(MOP), `map_updates.json`(맵 서버 변경 기록 요약, `docs/map_server.md`)으로 남는다.
 
 ## 구성과 문서 대응
 
@@ -2061,7 +2062,9 @@ python -m sim.rt_link scenarios/flat_trot.yaml --brain ros --remote-brain --ros-
   2. ~~실제 바퀴로 가상 다짐~~ (2026-10-25, 단단한 원통 구동 바퀴로 함): 이력을 알면 바퀴로도 단일 SCM과 같다. 넘길 이력에
      **미끄럼률**이 있어야 견인력이 맞는다 (없으면 33 ~ 35 % 작음). 여러 번 지나간 자리는 순서대로 되풀이하면 같다
      (`docs/map_server.md` 5.5 "구동 바퀴 시험"). 남은 것: 타이어 변형·트레드, HMMWV 바퀴 자국을 실제로 넘겨받기.
-  3. **맵 서버 1단계 구현**: 같은 프로세스 안 모드. 모든 시나리오가 지금과 비트 단위로 같아야 한다 (설계 문서 8절).
+  3. ~~맵 서버 1단계 구현~~ (2026-10-25, `sim/map_server.py`): 같은 프로세스 안 모드. 시나리오 13개 모두 이전과 비트 단위로 같다
+     (설계 문서 8절 "1단계 결과"). 찾은 것: Chrono는 시나리오의 SCM 패치 밖도 변형한다 (소유 영역을 잡는 규칙이 필요).
+     다음: 2단계 (별도 프로세스, ROS2, 바탕 파일·해시, 일관성 감사), 자국 이력 저장 (sinkage, 물체, 하중, 미끄럼률).
   4. **타당성 확인**: 지금 결과는 모두 단일 SCM과의 일관성이다. 실제 흙과 비교하려면 판 재하 시험이나 반복 주행 시험의 실측 자료와
      그에 맞춘 흙 매개변수가 필요하다. 자료를 구하는 것부터 정한다.
 - 급하지 않은 것: Godot에 한글 글꼴 넣기 (지금 화면 글자는 영어와 숫자만), 다른 PC 두뇌 + 지형 인지 실시간 실행의 결과 흔들림

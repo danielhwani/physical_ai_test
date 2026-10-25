@@ -13,6 +13,7 @@
 import argparse
 import copy
 import datetime as dt
+import json
 import os
 import platform
 import threading
@@ -136,6 +137,7 @@ class Simulation:
         self.guard_radius = t.get("guard_radius", 0.15)
         for p in t.get("patches", []):
             self.terrain.add_patch(p)
+        self.terrain.attach_server()     # 맵 서버 (sim/map_server.py): 시작 지형이 바탕, 이후 변경은 서버를 거친다 (결과는 같음)
         self.variant = variant
         # 무른 흙 발 반력 (선택, sim/foot_soil.py): 발·정강이는 단단한 지형과 충돌하지 않고 흙 반력을 받는다
         self.foot_soil_cfg = self.scn.get("foot_soil") or None
@@ -247,6 +249,7 @@ class Simulation:
             e = self.events.pop(0)
             e["applied_t"] = self.data.time
             self.event_log.append(e)
+            self.terrain.time = self.data.time       # 맵 서버 변경 기록의 시각
             if e["action"] == "set_command":       # 운용자 명령 -> 보행 알고리즘
                 self.command = (e["vx"], e.get("yaw_rate", 0.0))
                 if self.remote is not None:
@@ -766,6 +769,8 @@ def run(args):
         "max_lag_s": round(max_lag, 4) if (args.realtime or viewer) else None,
     }
     rec.save(mop)
+    if sim.terrain.server is not None:             # 맵 서버 변경 기록 요약
+        (out / "map_updates.json").write_text(json.dumps(sim.terrain.server.summary(), indent=1))
     if sim.dis is not None:                  # 콘솔 이벤트를 적용 시각으로 넣은 시나리오: python -m sim.runner <이 파일> 로 같은 결과
         reason = ("stopped" if sim.stop_requested else "fell" if fell_at is not None else
                   "interrupted" if interrupted else "duration")

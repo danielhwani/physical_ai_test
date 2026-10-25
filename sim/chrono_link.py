@@ -65,6 +65,9 @@ class ChronoLink:
         hx, hy = scm["size"][0] / 2, scm["size"][1] / 2
         region = (np.abs(terrain.X - scm["center"][0]) <= hx) & (np.abs(terrain.Y - scm["center"][1]) <= hy)
         assert np.all(terrain.target[region] == 0.0), "SCM 영역의 기본 지형은 평평(높이 0)해야 한다"
+        if terrain.server is not None:                  # 맵 서버: SCM 패치 = Chrono 소유 영역 (docs/map_server.md 5.7)
+            rr, cc = np.nonzero(region)
+            terrain.server.set_owner(int(rr.min()), int(rr.max()) + 1, int(cc.min()), int(cc.max()) + 1, "chrono")
 
         log_path.parent.mkdir(parents=True, exist_ok=True)
         self.sock, child = socket.socketpair()
@@ -129,6 +132,7 @@ class ChronoLink:
 
     def _apply(self, r):
         self.t = r["t"]
+        self.terrain.time = r["t"]
         self.poses = [(np.array(p["pos"]), np.array(p["quat"])) for p in r["poses"]]
         self.vehicle = r["vehicle"]
         self.foot_state = r.get("feet", [])

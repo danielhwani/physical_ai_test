@@ -402,6 +402,7 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
                 sim.stop_requested = True
                 stop_after[0] = step_next
             elif e["action"] == "add_patch":
+                sim.terrain.time = t_next                  # 맵 서버 변경 기록의 시각
                 delta = patch_ready.pop(id(e), None)
                 if delta is None:
                     sim.terrain.add_patch(e["patch"])
@@ -842,6 +843,8 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
         if rec is not None:
             rec.meta["brain"] = br.name
             rec.save(mop)
+            if sim.terrain.server is not None:                      # 맵 서버 변경 기록 요약
+                (out_dir / "map_updates.json").write_text(json.dumps(sim.terrain.server.summary(), indent=1))
             for name, scans in scan_log.items():                    # LiDAR 원시 출력 (sim.runner와 같은 형식)
                 np.savez_compressed(out_dir / f"{name}.npz", t=np.array([s["t"] for s in scans]),
                                     frame=np.concatenate([np.full(len(s["points"]), i, np.int32) for i, s in enumerate(scans)]),
