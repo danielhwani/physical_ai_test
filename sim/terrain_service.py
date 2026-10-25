@@ -84,6 +84,10 @@ class TerrainMapService:
         if remote:
             from .map_client import RemoteMap
             self.server = RemoteMap(self.target, (self.z_min, self.z_max), name=remote)
+            if self.server.joined:                       # 나중에 붙음: 서버에 이미 있던 변경까지 받은 지도에서 시작
+                self.target = self.server.compose(0, self.nrow, 0, self.ncol)
+                self.version += 1
+                self._cand = None
         else:
             from .map_server import MapServer
             self.server = MapServer(self.target, (self.z_min, self.z_max))

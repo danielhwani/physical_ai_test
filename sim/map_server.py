@@ -149,6 +149,26 @@ class MapServer:
         block[rows - r0, cols - c0] = values
         return self.write(op, writer, int(r0), int(c0), block, t=t)
 
+    # ---- 상태 전체 (늦게 붙는 클라이언트의 스냅샷, 설계 6.1) ----
+    def state(self):
+        """사본을 똑같이 다시 만들 수 있는 상태: E, D·O 타일, 소유 영역, 판, 타일별 판, 종류별 수. 변경 기록(log)은 싣지 않는다."""
+        return {"grid": [self.nrow, self.ncol], "z_range": [self.z_min, self.z_max], "tile": self.tile, "version": self.version,
+                "E": self.E, "D": dict(self.D), "O": dict(self.O), "owners": [list(o) for o in self.owners],
+                "tile_version": dict(self.tile_version), "counts": dict(self.counts)}
+
+    @classmethod
+    def from_state(cls, st):
+        s = cls(np.asarray(st["E"], dtype=float), tuple(st["z_range"]), tile=st["tile"])
+        s.D = {tuple(k): np.array(v, dtype=float) for k, v in st["D"].items()}
+        s.O = {tuple(k): np.array(v, dtype=float) for k, v in st["O"].items()}
+        s.owners = [tuple(o) for o in st["owners"]]
+        for r0, r1, c0, c1, _ in s.owners:
+            s.owned[r0:r1, c0:c1] = True
+        s.version = st["version"]
+        s.tile_version = {tuple(k): v for k, v in st["tile_version"].items()}
+        s.counts = dict(st["counts"])
+        return s
+
     def summary(self):
         """변경 기록 요약 (실행 폴더 map_updates.json용)."""
         return {"format": FORMAT, "rules": RULES, "tile": self.tile, "grid": [self.nrow, self.ncol], "version": self.version,

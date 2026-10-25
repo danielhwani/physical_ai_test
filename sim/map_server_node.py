@@ -5,6 +5,7 @@
 
   시작: 첫 init 메시지의 바탕 격자로 지도를 만든다 (2c에서 바탕 파일·해시로 바꿀 예정). init 전의 변경은 버린다 (세어서 info에 싣는다).
   감사: /map/request {"type": "audit"} -> /map/reply에 지금 판, 클라이언트별 마지막 seq, 타일 해시.
+  스냅샷: /map/request {"type": "snapshot"} -> /map/reply에 상태 전체와 그때의 n (늦게 붙는 클라이언트, 설계 6.1).
 """
 import base64
 import hashlib
@@ -16,7 +17,7 @@ from rclpy.executors import ExternalShutdownException
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 
-from .map_client import apply_message, dec, tile_hashes
+from .map_client import apply_message, dec, enc_state, stats_ms, tile_hashes
 from .map_server import FORMAT, RULES, MapServer
 
 
@@ -32,12 +33,16 @@ class MapServerNode:
         self.node.create_subscription(String, "/map/request", self.on_request, rel)
         self.server, self.seq, self.dropped, self.gaps = None, {}, 0, 0
         self.base_hash, self.joined, self.refused = None, [], []    # 첫 init의 바탕 해시, 같은 바탕으로 붙은 / 다른 바탕이라 거부한 클라이언트
+        self.inits = {}                                             # 클라이언트 -> 마지막 init의 {nonce, result} (클라이언트가 답을 알아봄)
+        self.n = 0                                                  # /map/updates로 내보낸 메시지 번호 (붙는 절차가 스냅샷 뒤를 가른다)
+        self.lat = {}                                               # 클라이언트 -> 보낸 때부터 서버가 받기까지 (s) 목록
         self.node.get_logger().info("맵 서버 대기 (init)")
 
     def publish_info(self):
         s = self.server
         info = {"format": FORMAT, "rules": RULES, "dropped_before_init": self.dropped, "seq_gaps": self.gaps,
-                "writers": self.seq, "base_sha256": self.base_hash, "joined": self.joined, "refused": self.refused}
+                "writers": self.seq, "base_sha256": self.base_hash, "joined": self.joined, "refused": self.refused,
+                "inits": self.inits, "n": self.n}
         if s is not None:
             info.update(tile=s.tile, grid=[s.nrow, s.ncol], z_range=[s.z_min, s.z_max], version=s.version,
                         owners=[list(o) for o in s.owners])
@@ -46,29 +51,37 @@ class MapServerNode:
     def on_write(self, msg):
         m = json.loads(msg.data)
         sender = m.get("from", "?")
+        if "wall" in m and m["type"] != "init":                # init(바탕 격자 전체, 접속 직후)은 지연에서 뺀다: 401 x 401에 약 1.7 MB
+            self.lat.setdefault(sender, []).append(time.time() - m["wall"])
         last = self.seq.get(sender, 0)
-        if m["seq"] != last + 1:
+        if m["type"] != "init" and m["seq"] != last + 1:     # init은 seq 1부터 다시 (같은 이름이 다시 붙을 때)
             self.gaps += 1                                    # 빈칸 (2d에서 다시 받기)
         self.seq[sender] = m["seq"]
         if m["type"] == "init":
             h = hashlib.sha256(base64.b64decode(m["base"])).hexdigest()
             if self.server is None:                           # 첫 init: 이 바탕으로 지도를 만든다
                 self.server = MapServer(dec(m["base"], tuple(m["shape"])), tuple(m["z_range"]))
-                self.base_hash = h
+                self.base_hash, result = h, "first"
                 self.node.get_logger().info(f"지도 시작: {m['shape']} 격자, {sender}")
-            elif h == self.base_hash:                         # 같은 바탕: 붙기만 (지도를 다시 만들지 않는다)
+            elif h == self.base_hash:                         # 같은 바탕: 붙기만 (지도를 다시 만들지 않는다. 클라이언트가 스냅샷을 받음)
                 self.joined.append(sender)
-                self.node.get_logger().info(f"클라이언트 붙음: {sender}")
+                result = "joined"
+                self.node.get_logger().info(f"클라이언트 붙음: {sender} (판 {self.server.version})")
             else:                                             # 다른 바탕: 거부 (지형 상관이 깨진다)
                 self.refused.append(sender)
+                result = "refused"
                 self.node.get_logger().error(f"바탕이 다른 클라이언트 거부: {sender}")
+            if result != "refused" and sender in self.refused:
+                self.refused.remove(sender)
+            self.inits[sender] = {"nonce": m.get("nonce"), "result": result}
             self.publish_info()
             return
         if self.server is None or sender in self.refused:     # init 전, 또는 바탕이 달라 거부한 클라이언트의 변경은 버린다
             self.dropped += 1
             return
         apply_message(self.server, m)
-        m["v"] = self.server.version
+        self.n += 1
+        m["v"], m["n"] = self.server.version, self.n
         self.pub_up.publish(String(data=json.dumps(m)))
         if m["type"] == "owner":
             self.publish_info()
@@ -77,8 +90,13 @@ class MapServerNode:
         m = json.loads(msg.data)
         if m["type"] == "audit":
             r = {"type": "audit", "client": m["client"], "id": m["id"], "version": None if self.server is None else self.server.version,
-                 "seq": self.seq, "hashes": {} if self.server is None else tile_hashes(self.server), "gaps": self.gaps}
+                 "seq": self.seq, "hashes": {} if self.server is None else tile_hashes(self.server), "gaps": self.gaps,
+                 "recv_latency_ms": stats_ms(self.lat.get(m["client"], []))}
             self.pub_reply.publish(String(data=json.dumps(r)))
+        elif m["type"] == "snapshot" and self.server is not None:   # 붙는 절차 2: 지금 상태 전체와 그때의 n (서버는 한 줄로 돌아 사이에 끼는 변경이 없다)
+            r = {"type": "snapshot", "client": m["client"], "id": m["id"], "n": self.n, "state": enc_state(self.server.state())}
+            self.pub_reply.publish(String(data=json.dumps(r)))
+            self.node.get_logger().info(f"스냅샷: {m['client']} (판 {self.server.version}, n {self.n})")
 
     def spin(self):
         last_info = 0.0

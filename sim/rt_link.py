@@ -846,14 +846,19 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
                 "overruns": int(st.overruns)})
         if dis_srv is not None:
             mop["stopped_by_console"] = sim.stop_requested
+        audit = None
+        if map_proc is not None:                                    # 별도 프로세스 맵 서버: 서버와 사본 대조, 동기화 지연 (MOP에도)
+            from .map_client import audit_mop
+            audit = sim.terrain.server.audit()
+            mop.update(audit_mop(audit))
+            print(f"맵 서버 대조: {audit}")
         if rec is not None:
             rec.meta["brain"] = br.name
             rec.save(mop)
-            if sim.terrain.server is not None:                      # 맵 서버 변경 기록 요약 (+ 별도 프로세스면 서버와 사본 대조)
+            if sim.terrain.server is not None:                      # 맵 서버 변경 기록 요약
                 summary = sim.terrain.server.summary()
-                if map_proc is not None:
-                    summary["audit"] = sim.terrain.server.audit()
-                    print(f"맵 서버 대조: {summary['audit']}")
+                if audit is not None:
+                    summary["audit"] = audit
                 (out_dir / "map_updates.json").write_text(json.dumps(summary, indent=1))
             for name, scans in scan_log.items():                    # LiDAR 원시 출력 (sim.runner와 같은 형식)
                 np.savez_compressed(out_dir / f"{name}.npz", t=np.array([s["t"] for s in scans]),

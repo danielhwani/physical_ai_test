@@ -776,12 +776,17 @@ def run(args):
         "late_control_steps": late if (args.realtime or viewer) else None,
         "max_lag_s": round(max_lag, 4) if (args.realtime or viewer) else None,
     }
+    audit = None
+    if map_proc is not None:                       # 별도 프로세스 맵 서버: 서버와 사본 대조, 동기화 지연 (MOP에도)
+        from .map_client import audit_mop
+        audit = sim.terrain.server.audit()
+        mop.update(audit_mop(audit))
+        print(f"맵 서버 대조: {audit}")
     rec.save(mop)
-    if sim.terrain.server is not None:             # 맵 서버 변경 기록 요약 (+ 별도 프로세스면 서버와 사본 대조)
+    if sim.terrain.server is not None:             # 맵 서버 변경 기록 요약
         summary = sim.terrain.server.summary()
-        if map_proc is not None:
-            summary["audit"] = sim.terrain.server.audit()
-            print(f"맵 서버 대조: {summary['audit']}")
+        if audit is not None:
+            summary["audit"] = audit
         (out / "map_updates.json").write_text(json.dumps(summary, indent=1))
     if map_proc is not None:
         map_proc.terminate()

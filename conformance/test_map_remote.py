@@ -1,4 +1,4 @@
-"""맵 서버 2단계 2a (sim/map_server_node.py + sim/map_client.py) 시험: 별도 프로세스 서버와 원격 클라이언트 둘. ROS2 필요 (mj_ros).
+"""맵 서버 2단계 (sim/map_server_node.py + sim/map_client.py) 시험: 별도 프로세스 서버와 원격 클라이언트. ROS2 필요 (mj_ros).
 
     python conformance/test_map_remote.py          (약 20초. ROS_DOMAIN_ID는 79를 쓴다)
 
@@ -6,7 +6,10 @@
   바탕이 다른 클라이언트는 거부된다.
   감사가 어긋남을 잡는다: A의 파임이 서버에 먼저 들어간 뒤 B가 그걸 받기 전에 같은 칸을 add로 편집하면, B의 사본은 적용 순서가 서버와
   달라 어긋난다 (설계 5.6 "늦게 온 이른 파임", 아직 구현 안 함). 감사가 그 타일을 불일치로 보고해야 한다.
+  늦게 붙기 (2b): 관찰자가 A가 쓰는 도중에 붙어도(스냅샷 + 그 뒤 변경) 서버와 같다. 바탕이 같은 클라이언트가 나중에 붙으면 바탕이
+  아니라 지금 지도에서 시작한다. 지연: 자기 변경 왕복(echo), 다른 쪽 변경 반영(apply).
 """
+import threading
 import os
 import subprocess
 import sys
@@ -20,7 +23,7 @@ sys.path.insert(0, str(ROOT))
 os.environ.setdefault("ROS_DOMAIN_ID", "79")
 
 
-def settle(*clients, version, wait_s=20.0):
+def settle(*clients, version, wait_s=20.0):  # noqa: E302
     """모든 클라이언트 사본의 판이 version(지금까지 쓴 변경 수)이 될 때까지 받는다. 걸린 시간을 돌려준다."""
     t0 = time.monotonic()
     while any(c.local.version < version for c in clients):
@@ -82,7 +85,54 @@ def main():
         assert au_a["hash_mismatch"] == 0, au_a                 # A: 파임 -> add (서버와 같은 순서)
         assert au_b["hash_mismatch"] >= 1 and "0,0" in au_b["mismatched_tiles"], au_b   # B: add -> 파임 (순서가 다름)
         print(f"test_audit_catches_order: OK (B 불일치 타일 {au_b['mismatched_tiles']})")
-        a.close(), b.close()
+
+        # 4. 관찰자가 A가 쓰는 도중에 붙는다 (A는 다른 스레드에서 계속 쓴다: 스냅샷과 스트림 사이 경합)
+        stop = threading.Event()
+        def writer():
+            k = 0
+            while not stop.is_set() and k < 300:
+                r0, c0 = rng.integers(0, 120), rng.integers(0, 380)
+                a.write("dig", "a_wheels", int(r0), int(c0), base[r0:r0 + 20, c0:c0 + 30] - 0.04 - 0.0001 * k)
+                k += 1
+                time.sleep(0.002)
+        th = threading.Thread(target=writer)
+        th.start()
+        time.sleep(0.1)
+        obs = RemoteMap(None, name="observer")
+        th.join()
+        assert obs.joined["version"] > 62, obs.joined                # A가 쓰던 도중에 붙었다
+        v = a.local.version
+        settle(obs, version=v)
+        au_o = obs.audit()
+        assert au_o["hash_mismatch"] == 0 and au_o["client_version"] == v, au_o
+        assert np.array_equal(obs.compose(0, 300, 0, 420), a.compose(0, 300, 0, 420))
+        print(f"test_late_join_observer: OK (붙은 판 {obs.joined['version']}, 스냅샷 {obs.joined['s']} s, 끝 판 {v}, "
+              f"그 뒤 받은 변경 {au_o['latency_ms']['apply']['n']})")
+
+        # 5. 바탕이 같은 클라이언트가 나중에 붙으면 지금 지도에서 시작한다 (2a에서는 바탕에서 시작했다)
+        d = RemoteMap(base, (-0.2, 0.2), name="d")
+        assert d.joined and np.array_equal(d.compose(0, 300, 0, 420), a.compose(0, 300, 0, 420)), "늦게 붙은 클라이언트가 바탕에서 시작"
+        assert d.audit()["hash_mismatch"] == 0
+        print(f"test_late_join_writer: OK (판 {d.local.version}에서 시작)")
+
+        # 6. 지연 (같은 PC): A가 50 Hz로 쓰고, A와 관찰자가 100 Hz로 poll (사본 반영 지연에는 poll 주기가 들어간다)
+        for c in (a, obs):
+            c.poll()                                              # 앞 시험에서 쌓인 메아리를 먼저 비운다
+            c.lat = {"echo": [], "apply": []}
+        t0, k = time.monotonic(), 0
+        while time.monotonic() - t0 < 2.0:
+            if time.monotonic() - t0 >= k / 50.0:
+                r0, c0 = rng.integers(0, 120), rng.integers(0, 380)
+                a.write("dig", "a_wheels", int(r0), int(c0), base[r0:r0 + 20, c0:c0 + 30] - 0.05)
+                k += 1
+            a.poll(), obs.poll()
+            time.sleep(0.01)
+        settle(obs, version=a.local.version)
+        la, lo = a.audit()["latency_ms"], obs.audit()["latency_ms"]
+        assert lo["apply"]["n"] == k and lo["apply"]["p95"] < 100 and la["echo"]["n"] == k, (la, lo)
+        print(f"test_latency: OK (변경 {k}개, A -> 서버 recv {la['recv']}, 관찰자 반영 apply {lo['apply']} ms)")
+        for c in (a, b, obs, d):
+            c.close()
     finally:
         proc.terminate()
         proc.wait(timeout=10)

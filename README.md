@@ -43,7 +43,7 @@ python conformance/compare_link_timing.py <시나리오> --seeds 30   # 실시�
 python conformance/test_foot_soil.py                     # 무른 흙 발 상호작용 (SCM 기준 침하, 흙별 걷기)
 python conformance/test_render_stream.py                 # 렌더 스트림 계약 (스트림만으로 장면 재구성 = 시뮬레이터)
 python conformance/test_map_server.py                    # 맵 서버 1단계: 합치는 규칙 (min, NaN, 순서), 소유 영역, 서버 없이 / 있게 비트 동일
-python conformance/test_map_remote.py                    # 맵 서버 2a: 별도 프로세스 서버 + 클라이언트 둘 (주고받기, 다른 바탕 거부, 감사가 어긋남을 잡음)
+python conformance/test_map_remote.py                    # 맵 서버 2단계: 별도 프로세스 서버 + 클라이언트 (주고받기, 다른 바탕 거부, 감사, 늦게 붙기, 지연)
 python conformance/compare_variants.py [--policy card.yaml]   # cpu vs mjx 설정의 MOP 분포 비교
 python conformance/probe_scm_injection.py [--record build/scm_press.npz] [--plot PNG]   # SCM에 바깥 높이 넣기: 접촉은 따라가고 다짐 이력은 안 넘어감 (docs/map_server.md 5.5). 어느 환경이든: chrono 환경으로 다시 실행
 python conformance/probe_scm_compaction.py [--record build/scm_compaction.npz]   # 다짐 -> 단단한 흙 콜백: kphi ×25로 다짐 흉내 (약 1분)
@@ -2066,7 +2066,9 @@ python -m sim.rt_link scenarios/flat_trot.yaml --brain ros --remote-brain --ros-
   3. ~~맵 서버 1단계 구현~~ (2026-10-25, `sim/map_server.py`): 같은 프로세스 안 모드. 시나리오 13개 모두 이전과 비트 단위로 같다
      (설계 문서 8절 "1단계 결과"). 찾은 것: Chrono는 시나리오의 SCM 패치 밖도 변형한다 (소유 영역을 잡는 규칙이 필요).
      2a (2026-10-25): 별도 프로세스 서버 `python -m sim.map_server_node`, `sim.runner`/`sim.rt_link --map-server`. 시나리오 13개 비트 동일,
-     서버와 사본 해시 불일치 0. 다음: 2b (늦게 붙는 클라이언트, 동기화 지연), 2c (바탕 파일·해시), 2d (스냅샷, 빈칸), 자국 이력 저장.
+     서버와 사본 해시 불일치 0.
+     2b (2026-10-25): 늦게 붙기 (스냅샷 + 그 뒤 변경), 관찰자 `python -m sim.map_client --observe` (다른 터미널에서 실행 중에 붙음),
+     MOP `map_hash_mismatch`, `map_recv_latency_p95_ms`, `map_apply_latency_p95_ms`. 다음: 2c (바탕 파일·해시), 2d (스냅샷 저장, 빈칸).
   4. **타당성 확인**: 지금 결과는 모두 단일 SCM과의 일관성이다. 실제 흙과 비교하려면 판 재하 시험이나 반복 주행 시험의 실측 자료와
      그에 맞춘 흙 매개변수가 필요하다. 자료를 구하는 것부터 정한다.
 - 급하지 않은 것: Godot에 한글 글꼴 넣기 (지금 화면 글자는 영어와 숫자만), 다른 PC 두뇌 + 지형 인지 실시간 실행의 결과 흔들림
