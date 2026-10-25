@@ -325,17 +325,20 @@ class RosBrain(InprocBrain):
 
 
 def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inproc", policy=None, remote=False,
-        viz=(), out_dir=None, variant="cpu", overrides=(), dis=None, chrono_max_lag=CHRONO_MAX_LAG, map_server=False):
+        viz=(), out_dir=None, variant="cpu", overrides=(), dis=None, chrono_max_lag=CHRONO_MAX_LAG, map_server=False, map_base=None):
     """시나리오를 C++ 코어로 실행하고 (MOP, 끝 qpos)를 돌려준다.
     viz: ("rviz", "mjviz", "godot", "godot_lidar") 중 고른 것. out_dir: 기록 폴더 (timeseries.parquet, summary.json, 로그. 없으면 남기지 않음).
     variant: 모델 설정 (cpu / mjx, sim.runner --variant와 같다).
     dis: DIS 콘솔 설정 {port, host, key(bytes), wait, comm_lost} (실시간 전용).
     chrono_max_lag: 실시간에서 Chrono가 이보다(s) 뒤처지면 코어를 멈춰 기다린다 (0: 상한 없음).
-    map_server: 맵 서버를 별도 프로세스로 (sim/map_server_node.py, docs/map_server.md 2단계). 아니면 같은 프로세스 안."""
+    map_server: 맵 서버를 별도 프로세스로 (sim/map_server_node.py, docs/map_server.md 2단계). 아니면 같은 프로세스 안.
+    map_base: 미리 만든 바탕 파일 폴더 (map_server를 켠다. 없으면 시작 지형으로 build/maps/<이름>에 만든다)."""
     map_proc = None
-    if map_server:
+    if map_server or map_base:
+        from .map_base import prepare_base
         from .ros2_bridge import launch_map_server
-        map_proc = launch_map_server(out_dir or ROOT / "build/rt")
+        scn_dict = scenario if isinstance(scenario, dict) else load_yaml(scenario)
+        map_proc = launch_map_server(out_dir or ROOT / "build/rt", base=prepare_base(scn_dict, map_base))
     sim = Simulation(scenario, policy=policy, variant=variant, map_client="sim" if map_proc is not None else None)
     supported = ("set_command", "add_patch", "inject_fault", "clear_fault", "create_entity", "remove_entity", "set_soil")
     unsupported = [e["action"] for e in sim.events if e["action"] not in supported]
@@ -926,6 +929,7 @@ def main():
     ap.add_argument("--mjviz", action="store_true", help="MuJoCo 렌더러로 보기")
     ap.add_argument("--godot", action="store_true", help="Godot 4 렌더러로 보기 (viz/godot_bridge.py + godot/)")
     ap.add_argument("--map-server", action="store_true", help="맵 서버를 별도 프로세스로 (sim/map_server_node.py, ROS2)")
+    ap.add_argument("--map-base", metavar="DIR", help="미리 만든 바탕 파일 (python -m sim.map_base build). --map-server를 켠다")
     ap.add_argument("--godot-lidar", action="store_true",
                     help="--godot + LiDAR 점군과 알고리즘 지형 지도 (시나리오에 센서가 없으면 front_lidar를 켠다)")
     ap.add_argument("--cpu", type=int, default=5, help="코어를 고정할 CPU (-1: 고정 안 함)")
@@ -959,7 +963,7 @@ def main():
                    "key": load_key(a.dis_key) if a.dis_key else None}
         mop, _ = run(scn, a.lockstep, a.cpu, a.priority, brain=a.brain, policy=a.policy, remote=a.remote_brain,
                      viz=viz, out_dir=out, variant=a.variant, overrides=a.set or (), dis=dis, chrono_max_lag=a.chrono_max_lag,
-                     map_server=a.map_server)
+                     map_server=a.map_server, map_base=a.map_base)
         print("\n== MOP (C++ 실시간 코어) ==")
         for k, v in mop.items():
             print(f"  {k:20s} {v}")

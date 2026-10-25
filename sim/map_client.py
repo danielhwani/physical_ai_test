@@ -144,17 +144,25 @@ class RemoteMap:
             self._wait(lambda: self.info and "grid" in self.info, "맵 서버에 아직 지도가 없다 (첫 클라이언트의 init 전)")
             self._join()
             return
+        from .map_base import tile_shas
         self.local = MapServer(base, z_range)
+        self._wait(lambda: self.info is not None, "맵 서버가 /map/info를 내지 않는다")
         nonce = hashlib.sha256(f"{name} {time.time_ns()} {id(self)}".encode()).hexdigest()[:16]   # 이번 init의 답을 알아보는 표
-        self._send({"type": "init", "writer": name, "shape": list(base.shape), "z_range": list(z_range), "base": enc(base),
-                    "nonce": nonce})
-        mine = sha(base)
+        m = {"type": "init", "writer": name, "shape": list(base.shape), "z_range": list(z_range), "nonce": nonce,
+             "base_sha256": sha(base), "tiles": tile_shas(base)}           # 바탕은 해시로 (2c)
+        if "grid" not in self.info:                              # 서버에 아직 지도가 없다 (바탕 파일 없이 띄운 서버): 격자도 보낸다
+            m["base"] = enc(base)
+        self.init_bytes = len(json.dumps(m))
+        self._send(m)
         ack = lambda: (self.info or {}).get("inits", {}).get(name, {})   # noqa: E731
         self._wait(lambda: ack().get("nonce") == nonce, "맵 서버가 init에 답하지 않는다 (/map/info)")
-        result = ack()["result"]                                 # first (이 바탕으로 지도를 만듦) | joined | refused
-        if result == "refused":                                  # 서버 지도의 바탕이 이 클라이언트의 시작 지형과 다르다
-            raise RuntimeError(f"맵 서버의 바탕이 다르다 (서버 {self.info.get('base_sha256', '')[:12]}, 이쪽 {mine[:12]})")
-        if result == "joined":                                   # 나중에 붙음: 그 사이 서버에 들어간 변경을 받는다
+        a = ack()                                                # result: first (이 격자로 지도를 만듦) | joined | refused | no_map
+        if a["result"] == "refused":                             # 서버 지도의 바탕이 이 클라이언트의 시작 지형과 다르다
+            raise RuntimeError(f"맵 서버의 바탕이 다르다 (서버 {self.info.get('base_path') or '첫 클라이언트의 격자'}, "
+                               f"다른 타일 {a.get('bad_tiles')})")
+        if a["result"] == "no_map":
+            raise RuntimeError("맵 서버에 지도가 없다 (바탕 파일 없이 띄웠고 격자를 받지 못했다)")
+        if a["result"] == "joined" and a.get("n", 0) > 0:      # 서버에 이미 변경이 있다: 그것까지 받는다 (없으면 바탕이 곧 지금 지도)
             self._join()
 
     def __getattr__(self, k):                                    # owned, owners, counts, version, compose ... 는 사본에서

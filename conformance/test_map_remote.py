@@ -8,7 +8,11 @@
   달라 어긋난다 (설계 5.6 "늦게 온 이른 파임", 아직 구현 안 함). 감사가 그 타일을 불일치로 보고해야 한다.
   늦게 붙기 (2b): 관찰자가 A가 쓰는 도중에 붙어도(스냅샷 + 그 뒤 변경) 서버와 같다. 바탕이 같은 클라이언트가 나중에 붙으면 바탕이
   아니라 지금 지도에서 시작한다. 지연: 자기 변경 왕복(echo), 다른 쪽 변경 반영(apply).
+  바탕 파일 (2c): 서버를 바탕 파일로 띄우면 클라이언트는 격자 대신 타일 해시만 보내고 붙는다 (init이 작다). 타일 하나가 다른
+  클라이언트는 그 타일을 적어 거부된다.
 """
+import shutil
+import tempfile
 import threading
 import os
 import subprocess
@@ -136,6 +140,38 @@ def main():
     finally:
         proc.terminate()
         proc.wait(timeout=10)
+    base_files()
+
+
+def base_files():
+    """7. 바탕 파일로 띄운 서버 (2c)."""
+    from sim.map_base import write_base
+    from sim.map_client import RemoteMap
+    tmp = Path(tempfile.mkdtemp(prefix="map_remote_base_"))
+    base = np.random.default_rng(5).uniform(-0.02, 0.02, (401, 401))
+    write_base(base, tmp / "m", (-0.2, 0.2), name="m")
+    proc = subprocess.Popen([sys.executable, "-m", "sim.map_server_node", "--base", str(tmp / "m")], cwd=ROOT,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+    try:
+        a = RemoteMap(base, (-0.2, 0.2), name="a")
+        assert a.info.get("base_path") == str(tmp / "m") and a.joined is None, a.info.get("base_path")   # 판 0: 스냅샷 없이
+        assert a.init_bytes < 10000, a.init_bytes                     # 격자(약 1.7 MB) 대신 타일 해시 9개
+        a.write("dig", "w", 100, 100, base[100:110, 100:110] - 0.01)
+        assert a.audit()["hash_mismatch"] == 0
+        print(f"test_base_file_join: OK (init {a.init_bytes} 바이트, 격자를 보냈다면 약 {len(base.tobytes()) * 4 // 3} 바이트)")
+        other = base.copy()
+        other[250, 390] += 0.001                                      # 타일 1,1 (행 200~399, 열 200~399)의 한 칸
+        try:
+            RemoteMap(other, (-0.2, 0.2), name="c", wait_s=5.0)
+            raise SystemExit("FAIL: 타일 하나가 다른 클라이언트가 붙었다")
+        except RuntimeError as e:
+            assert "'1,1'" in str(e) and "'0,0'" not in str(e), e
+        print("test_base_file_refuse_tile: OK (다른 타일 ['1,1'])")
+        a.close()
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+        shutil.rmtree(tmp)
 
 
 if __name__ == "__main__":

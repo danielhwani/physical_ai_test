@@ -50,11 +50,15 @@ def launch_sensor_node(log_dir, sensors):
                             stdout=open(log_dir / "sensor_node.log", "w"), stderr=subprocess.STDOUT)
 
 
-def launch_map_server(log_dir):
-    """맵 서버 프로세스 (sim/map_server_node.py). 클라이언트(RemoteMap)가 /map/write 구독을 기다리므로 바로 돌려준다."""
+def launch_map_server(log_dir, base=None):
+    """맵 서버 프로세스 (sim/map_server_node.py). base: 바탕 파일 폴더 (sim/map_base.py).
+    클라이언트(RemoteMap)가 서버를 기다리므로 바로 돌려준다."""
+    import atexit
     log_dir.mkdir(parents=True, exist_ok=True)
-    return subprocess.Popen([sys.executable, "-m", "sim.map_server_node"], cwd=ROOT,
-                            stdout=open(log_dir / "map_server_node.log", "w"), stderr=subprocess.STDOUT)
+    p = subprocess.Popen([sys.executable, "-m", "sim.map_server_node"] + (["--base", str(base)] if base else []), cwd=ROOT,
+                         stdout=open(log_dir / "map_server_node.log", "w"), stderr=subprocess.STDOUT)
+    atexit.register(lambda: p.poll() is None and p.terminate())   # 시작 중 오류(바탕이 다름 등)로 끝나도 서버를 남기지 않는다
+    return p
 
 
 def launch_controller_node(log_dir, scenario_path=None, policy=None, viz=False):

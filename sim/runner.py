@@ -129,14 +129,10 @@ class Simulation:
             self.scn["seed"] = seed
         self.spec = load_yaml(spec_path)
         t = self.scn["terrain"]
-        # window: MuJoCo에 올릴 로봇 주변 창의 반폭 (없으면 세계 지도 전체). 창은 window_snap(m) 단위로 옮긴다
-        self.terrain = TerrainMapService(t["size"], t["resolution"], t["z_range"], self.scn.get("seed", 0),
-                                         window=t.get("window"), snap=t.get("window_snap", 1.0))
+        self.terrain = TerrainMapService.from_scenario(self.scn)       # 시작 지형 (시작 패치까지)
         self.window_trigger = t.get("window_trigger", 1.0)   # 로봇이 창 중심에서 이만큼 멀어지면 창을 옮긴다 (m)
         # 발 근처 셀 갱신 보류 반경 (m). 로봇이 자기 발자국을 밟게 하려면 보폭보다 작게 (문서 §5.3)
         self.guard_radius = t.get("guard_radius", 0.15)
-        for p in t.get("patches", []):
-            self.terrain.add_patch(p)
         # 맵 서버 (sim/map_server.py): 시작 지형이 바탕, 이후 변경은 서버를 거친다 (결과는 같음).
         # map_client: 이름을 주면 별도 프로세스 서버(sim/map_server_node.py)의 원격 클라이언트 (--map-server)
         self.terrain.attach_server(remote=map_client)
@@ -480,9 +476,10 @@ def run(args):
     sensor_node = getattr(args, "sensor_node", False)
     # --sensor-node: 센서를 별도 프로세스(ROS2 스트림 구독)에서 계산하므로 러너 안에서는 센서를 켜지 않는다
     map_proc = None
-    if getattr(args, "map_server", False):          # 맵 서버를 별도 프로세스로 (docs/map_server.md 2단계)
+    if getattr(args, "map_server", False) or getattr(args, "map_base", None):   # 맵 서버를 별도 프로세스로 (docs/map_server.md 2단계)
+        from .map_base import prepare_base
         from .ros2_bridge import launch_map_server
-        map_proc = launch_map_server(ROOT / "build")
+        map_proc = launch_map_server(ROOT / "build", base=prepare_base(scenario, getattr(args, "map_base", None)))
     sim = Simulation(scenario, variant=args.variant, policy=args.policy,
                      sensors=None if sensor_node else getattr(args, "sensor", None),
                      map_client="sim" if map_proc is not None else None)
@@ -844,6 +841,8 @@ def main():
     ap.add_argument("--ros2", action="store_true", help="ROS2 /tf, /joint_states, /clock 발행")
     ap.add_argument("--map-server", action="store_true",
                     help="맵 서버를 별도 프로세스로 (sim/map_server_node.py, ROS2. docs/map_server.md 2단계). 없으면 같은 프로세스 안")
+    ap.add_argument("--map-base", metavar="DIR",
+                    help="미리 만든 바탕 파일 (python -m sim.map_base build). --map-server를 켠다. 시작 지형과 다르면 시작하지 않음")
     ap.add_argument("--rviz", action="store_true",
                     help="RViz로 가시화 (--ros2, --realtime 자동 적용. conda 환경에서 바로 실행 가능)")
     ap.add_argument("--mjviz", action="store_true",

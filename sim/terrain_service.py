@@ -44,6 +44,17 @@ class TerrainMapService:
         self.windowed = (self.wncol, self.wnrow) != (self.ncol, self.nrow)
         self.wr0, self.wc0 = self._window_origin(0.0, 0.0)
 
+    @classmethod
+    def from_scenario(cls, scn):
+        """시나리오의 시작 지형 (terrain 블록 + 시작 패치). 시뮬레이터와 바탕 파일(sim/map_base.py)이 같은 함수를 쓴다."""
+        t = scn["terrain"]
+        # window: MuJoCo에 올릴 로봇 주변 창의 반폭 (없으면 세계 지도 전체). 창은 window_snap(m) 단위로 옮긴다
+        terrain = cls(t["size"], t["resolution"], t["z_range"], scn.get("seed", 0), window=t.get("window"),
+                      snap=t.get("window_snap", 1.0))
+        for p in t.get("patches", []):
+            terrain.add_patch(p)
+        return terrain
+
     # ---- MuJoCo 모델 빌드용 파라미터 (창 기준) ----
     @property
     def hfield_size(self):
