@@ -779,6 +779,8 @@ def run(args):
         audit = sim.terrain.server.audit()
         mop.update(audit_mop(audit))
         print(f"맵 서버 대조: {audit}")
+        if getattr(args, "map_save", False):       # 끝난 지도: map_state/state.json (--resume), map_state/final/ (--base, --map-base)
+            print(f"맵 서버 저장: {sim.terrain.server.save(out / 'map_state')}")
     rec.save(mop)
     if sim.terrain.server is not None:             # 맵 서버 변경 기록 요약
         summary = sim.terrain.server.summary()
@@ -843,6 +845,8 @@ def main():
                     help="맵 서버를 별도 프로세스로 (sim/map_server_node.py, ROS2. docs/map_server.md 2단계). 없으면 같은 프로세스 안")
     ap.add_argument("--map-base", metavar="DIR",
                     help="미리 만든 바탕 파일 (python -m sim.map_base build). --map-server를 켠다. 시작 지형과 다르면 시작하지 않음")
+    ap.add_argument("--map-save", action="store_true",
+                    help="끝난 지도를 실행 폴더 map_state/에 저장 (state.json + final/ 바탕 파일, 약 3 MB). --map-server와 함께")
     ap.add_argument("--rviz", action="store_true",
                     help="RViz로 가시화 (--ros2, --realtime 자동 적용. conda 환경에서 바로 실행 가능)")
     ap.add_argument("--mjviz", action="store_true",

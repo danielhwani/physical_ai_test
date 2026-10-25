@@ -10,7 +10,10 @@
   아니라 지금 지도에서 시작한다. 지연: 자기 변경 왕복(echo), 다른 쪽 변경 반영(apply).
   바탕 파일 (2c): 서버를 바탕 파일로 띄우면 클라이언트는 격자 대신 타일 해시만 보내고 붙는다 (init이 작다). 타일 하나가 다른
   클라이언트는 그 타일을 적어 거부된다.
+  빈칸 (2d): 두 클라이언트가 보내기·받기의 10%를 일부러 버려도 다시 보내기·다시 받기로 메워져 두 사본과 서버가 같다. 서버가 그 구간을 더
+  들고 있지 않으면 스냅샷으로 다시 맞춘다. 서버를 껐다가(저장) 이어 시작해도, 꺼진 동안 쓴 것까지 다시 보내져 같아진다.
 """
+import json
 import shutil
 import tempfile
 import threading
@@ -141,6 +144,116 @@ def main():
         proc.terminate()
         proc.wait(timeout=10)
     base_files()
+    losses()
+    restart()
+
+
+def server(*args):
+    return subprocess.Popen([sys.executable, "-m", "sim.map_server_node", *args], cwd=ROOT,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+
+
+def pump(clients, s):
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < s:
+        for c in clients:
+            c.poll()
+        time.sleep(0.01)
+
+
+def losses():
+    """9, 10. 일부러 버린 메시지가 메워지는지."""
+    from sim.map_client import RemoteMap
+    proc = server()
+    try:
+        rng = np.random.default_rng(7)
+        base = rng.uniform(-0.02, 0.02, (300, 420))
+        a = RemoteMap(base, (-0.2, 0.2), name="a", drop=(0.1, 0.1), drop_seed=1)
+        b = RemoteMap(base, (-0.2, 0.2), name="b", drop=(0.1, 0.1), drop_seed=2)
+        b.set_owner(160, 300, 0, 420, "b_scm")
+        for k in range(200):                                       # A: 위쪽 반 파임, B: 아래쪽 반 소유 (칸이 겹치지 않음)
+            r0, c0 = rng.integers(0, 120), rng.integers(0, 380)
+            a.write("dig", "a_wheels", int(r0), int(c0), base[r0:r0 + 20, c0:c0 + 30] - rng.uniform(0, 0.03, (20, 30)))
+            b.write_cells("own", "b_scm", rng.integers(160, 300, 40), rng.integers(0, 420, 40), rng.uniform(-0.1, 0.05, 40))
+            if k % 10 == 0:
+                a.poll(), b.poll()
+        au = [c.audit() for c in (a, b)]
+        while au[0].get("server_version") != au[1].get("server_version"):   # B가 다시 보낸 것이 A 감사 뒤에 들어갔으면 다시
+            au = [c.audit() for c in (a, b)]
+        assert all(x.get("hash_mismatch") == 0 for x in au), au
+        assert np.array_equal(a.compose(0, 300, 0, 420), b.compose(0, 300, 0, 420))
+        g = [x["gaps"] for x in au]
+        assert all(x["dropped_test"]["out"] > 0 and x["dropped_test"]["in"] > 0 and x["resent"] > 0 for x in g), g
+        print(f"test_loss_recovered: OK (판 {au[0]['server_version']}, A 버림 {g[0]['dropped_test']} 다시 보냄 {g[0]['resent']} "
+              f"다시 받음 {g[0]['replayed']} 다시 맞춤 {g[0]['resyncs']}, 받는 쪽 빈칸 {g[0]['recv_side']} 알아챈 뒤 {g[0]['recv_recovery_ms']} ms, "
+              f"보낸 때부터 {au[0]['latency_ms']['apply_late']} ms, 서버 쪽 알아챈 뒤 {g[0]['server_side_recovery_ms']} ms, "
+              f"보낸 때부터 {g[0]['server_side_delay_ms']} ms)")
+
+        for c in (a, b):
+            c.close()
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+
+    # 10. 관찰자가 오래 못 받음 (서버가 들고 있는 60개를 넘김) -> 스냅샷으로 다시 맞춤
+    proc = server("--ring", "60")
+    try:
+        rng = np.random.default_rng(8)
+        base = rng.uniform(-0.02, 0.02, (300, 420))
+        a = RemoteMap(base, (-0.2, 0.2), name="a")
+        a.write("dig", "a_wheels", 0, 0, base[0:20, 0:30] - 0.01)
+        obs = RemoteMap(None, name="observer")
+        obs.drop = (0.0, 1.0)
+        for k in range(100):
+            r0, c0 = rng.integers(0, 120), rng.integers(0, 380)
+            a.write("dig", "a_wheels", int(r0), int(c0), base[r0:r0 + 20, c0:c0 + 30] - 0.05)
+        pump([a, obs], 0.5)
+        obs.drop = (0.0, 0.0)
+        au_o = obs.audit()
+        assert au_o["hash_mismatch"] == 0 and au_o["gaps"]["resyncs"] >= 1, au_o
+        assert np.array_equal(obs.compose(0, 300, 0, 420), a.compose(0, 300, 0, 420))
+        print(f"test_resync_too_old: OK (버림 {au_o['gaps']['dropped_test']['in']}, 다시 맞춤 {au_o['gaps']['resyncs']}, "
+              f"복구 {au_o['gaps']['recv_recovery_ms']} ms, 판 {au_o['client_version']})")
+        for c in (a, obs):
+            c.close()
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+
+
+def restart():
+    """11. 서버를 껐다가 저장한 상태로 이어 시작. 꺼진 동안 A가 쓴 것도 다시 보내져 들어간다."""
+    from sim.map_base import load_base
+    from sim.map_client import RemoteMap
+    tmp = Path(tempfile.mkdtemp(prefix="map_remote_save_"))
+    rng = np.random.default_rng(9)
+    base = rng.uniform(-0.02, 0.02, (300, 420))
+    proc = server("--save-dir", str(tmp))
+    try:
+        a = RemoteMap(base, (-0.2, 0.2), name="a")
+        for _ in range(50):
+            r0, c0 = rng.integers(0, 280), rng.integers(0, 390)
+            a.write("dig", "w", int(r0), int(c0), base[r0:r0 + 20, c0:c0 + 30] - rng.uniform(0, 0.03, (20, 30)))
+        v_saved = a.audit()["server_version"]
+        h_saved = a.compose(0, 300, 0, 420)
+        proc.terminate()                                           # SIGTERM: 서버가 저장하고 끝난다
+        proc.wait(timeout=10)
+        g, mf = load_base(tmp / "final")                           # 끝난 지형 = 다음 서버의 --base로 쓸 수 있는 바탕 파일
+        assert np.array_equal(g, h_saved) and json.loads((tmp / "state.json").read_text())["state"]["version"] == v_saved
+        for _ in range(20):                                        # 서버가 없는 동안 쓴다 (메아리가 안 온다)
+            r0, c0 = rng.integers(0, 280), rng.integers(0, 390)
+            a.write("dig", "w", int(r0), int(c0), base[r0:r0 + 20, c0:c0 + 30] - 0.04)
+        proc = server("--resume", str(tmp))
+        t0 = time.monotonic()
+        au = a.audit()
+        assert au.get("hash_mismatch") == 0 and au["server_version"] == v_saved + 20, au
+        print(f"test_restart_resume: OK (저장한 판 {v_saved}, 꺼진 동안 쓴 20개 다시 보냄 {au['gaps']['resent']}, "
+              f"이어 시작 뒤 맞기까지 {time.monotonic() - t0:.1f} s, 판 {au['server_version']})")
+        a.close()
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+        shutil.rmtree(tmp)
 
 
 def base_files():

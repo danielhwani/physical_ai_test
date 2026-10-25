@@ -8,9 +8,10 @@
     /map/write    클라이언트 -> 서버   {"type": "init" | "write" | "cells" | "owner", "writer", "from", "seq", "wall", ...}
     /map/updates  서버 -> 클라이언트   위 메시지에 서버가 매긴 판 "v"와 내보낸 번호 "n"을 붙여 그대로 (init 제외)
     /map/info     서버 (늦게 붙어도 받음) {"format", "rules", "tile", "grid", "z_range", "version", "n", "owners", "writers", ...}
-    /map/request  클라이언트 -> 서버   {"type": "audit" | "snapshot", "client", "id"}
+    /map/request  클라이언트 -> 서버   {"type": "audit" | "snapshot" | "replay" | "save", "client", "id", ...}
     /map/reply    서버 -> 클라이언트   audit: {"version", "seq": {클라이언트: 마지막 seq}, "hashes": {타일: sha256}}
-                                       snapshot: {"n", "state": 서버 상태 전체 (MapServer.state, 아래 enc_state)}
+                                       snapshot: {"n", "seq", "state": 서버 상태 전체 (MapServer.state, 아래 enc_state)}
+                                       replay: {"from", "to", "msgs" | "too_old"}, resend: {"from", "to"} (서버가 빈칸을 봄)
   보낸 클라이언트(from)마다 seq를 1부터 붙인다 (모든 메시지: init, owner, write, cells). 서버는 받은 순서로 판을 매긴다.
   판 = 적용한 지도 변경 메시지 수 (write, cells). init(접속·바탕)과 owner(소유 영역 선언)는 판을 올리지 않는다. 값이 실제로 안 바뀐
   변경(예: min에서 더 낮지 않은 값만)도 판을 하나 올린다. 그래서 seq = 판 + init + owner (이 클라이언트만 쓴 경우).
@@ -21,6 +22,11 @@
   지연 (wall 시각, 같은 PC): recv = 이 클라이언트가 보낸 때부터 서버가 받기까지 (서버가 잰다), apply = 다른 쪽 변경을 보낸 때부터 이
   사본에 반영하기까지 (poll 주기가 들어간다: 시뮬레이터는 지형 반영 5 Hz, 물리가 그 변경을 보는 시각). echo = 자기 변경이 서버를
   거쳐 돌아와 poll에서 확인되기까지 (poll 주기가 대부분이라 MOP에는 쓰지 않는다).
+  빈칸 (2d, 설계 7절): 보낸 것은 메아리가 올 때까지 들고 있다가 서버가 resend로 달라면, 또는 RESEND_S 동안 메아리가 없으면 다시 보낸다.
+  받는 쪽은 n이 이어질 때만 적용하고, 빈칸이 있으면(뒤 번호가 와 있거나 /map/info의 n보다 덜 받음) GAP_ASK_S마다 replay로 다시 달라고
+  한다. 서버가 그 구간을 더 들고 있지 않으면(too_old) 스냅샷으로 다시 맞추고, 서버가 아직 못 받은 자기 변경을 그 위에 다시 넣는다.
+  빈칸 지연: recovery = 빈칸을 알아챈 때부터 메워지기까지 (알아채는 데는 다음 메시지가 와야 해서 그 시간이 빠진다),
+  apply_late / server_side_delay = 빈칸 때문에 늦게 반영된 변경의 보낸 때부터 반영까지 (물리가 실제로 늦게 본 시간, MOP).
 """
 import argparse
 import base64
@@ -33,6 +39,8 @@ import numpy as np
 from .map_server import MapServer
 
 TOPICS = ("/map/write", "/map/updates", "/map/info", "/map/request", "/map/reply")
+GAP_ASK_S = 0.2       # 받는 쪽 빈칸: 이 주기로 다시 달라고 한다 (s)
+RESEND_S = 1.0        # 보낸 것의 메아리가 이만큼 없으면 다시 보낸다 (s)
 
 
 def enc(a):
@@ -85,8 +93,11 @@ def stats_ms(xs):
 
 def audit_mop(au):
     """감사 결과 -> MOP (설계 부록: 클라이언트 간 지형 일관성, 지형 동기화 지연). 서버가 답하지 않았으면 불일치 None."""
-    lat = au.get("latency_ms", {})
+    lat, g = au.get("latency_ms", {}), au.get("gaps", {})
+    rec = [v for v in (lat.get("apply_late", {}).get("max"), g.get("server_side_delay_ms", {}).get("max")) if v is not None]
     return {"map_hash_mismatch": au.get("hash_mismatch"),
+            "map_seq_gaps": None if not g else g["recv_side"] + g.get("server_side_recovery_ms", {}).get("n", 0),   # 빈칸 수 (받는 쪽 + 서버 쪽)
+            "map_gap_delay_max_ms": max(rec) if rec else None,           # 빈칸 때문에 늦은 변경: 보낸 때부터 반영까지 (알아채기까지 포함)
             "map_recv_latency_p95_ms": lat.get("recv", {}).get("p95"),      # 이 클라이언트가 보낸 변경이 서버에 닿기까지
             "map_apply_latency_p95_ms": lat.get("apply", {}).get("p95")}    # 다른 쪽 변경이 이 사본(물리)에 들어가기까지
 
@@ -107,9 +118,10 @@ def apply_message(server, m):
 
 class RemoteMap:
     """MapServer처럼 쓴다 (TerrainMapService.attach_server(remote=...)). name = 이 클라이언트 이름 (서버 안에서 하나뿐이어야 함).
-    base=None: 관찰자 (바탕을 보내지 않고 서버의 지금 지도를 받아 붙는다)."""
+    base=None: 관찰자 (바탕을 보내지 않고 서버의 지금 지도를 받아 붙는다).
+    drop: (보내기, 받기) 일부러 버릴 비율 (빈칸 복구 시험용, 0이면 없음). 버린 것은 다시 보내기·다시 받기로 메워져야 한다."""
 
-    def __init__(self, base, z_range=None, name="sim", wait_s=30.0):
+    def __init__(self, base, z_range=None, name="sim", wait_s=30.0, drop=(0.0, 0.0), drop_seed=0):
         import rclpy
         import rclpy.executors
         from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -128,10 +140,15 @@ class RemoteMap:
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE)
         self.pub = self.node.create_publisher(String, "/map/write", rel)
         self.pub_req = self.node.create_publisher(String, "/map/request", rel)
-        self.foreign = []                                        # 받은 다른 쪽 변경 (poll에서 적용)
+        self.pending = {}                                        # n -> 받은 /map/updates (자기 메아리 포함), n 순서대로 소비
+        self.next_n = 1                                          # 다음에 받을 서버 번호 n (그 앞은 사본에 다 들어 있다)
+        self.unacked = {}                                        # seq -> [JSON, 보낸 시각]: 메아리가 올 때까지 (다시 보내기)
+        self.gap = None                                          # 받는 쪽 빈칸 {"n": 빠진 첫 번호, "since", "asked"} (monotonic)
+        self.need_resync = False                                 # 서버가 빈칸 구간을 더 들고 있지 않다 (too_old): 다음 poll에서 스냅샷
+        self.stats = {"gaps": 0, "replayed": 0, "resyncs": 0, "resent": 0, "dropped_out": 0, "dropped_in": 0, "recovery": []}
+        self.drop, self._rng = drop, np.random.default_rng(drop_seed)
         self.rx = 0                                              # 받은 /map/updates 수 (자기 메아리 포함)
-        self.applied_n = 0                                       # 사본에 들어간 다른 쪽 변경의 마지막 서버 번호 n (스냅샷이면 그때의 n)
-        self.lat = {"echo": [], "apply": []}                     # 지연 (s)
+        self.lat = {"echo": [], "apply": [], "apply_late": []}   # 지연 (s). apply_late: 빈칸 때문에 늦게 반영된 것 (다시 받은 것 + 그 뒤에 기다린 것)
         self.replies, self.info = [], None
         self.req_id = 0                                          # 요청 번호 (이 클라이언트 안에서 계속 증가: 예전 응답을 잘못 집지 않게)
         self.joined = None                                       # 붙는 절차를 썼으면 {"version", "n", "s"}
@@ -162,6 +179,7 @@ class RemoteMap:
                                f"다른 타일 {a.get('bad_tiles')})")
         if a["result"] == "no_map":
             raise RuntimeError("맵 서버에 지도가 없다 (바탕 파일 없이 띄웠고 격자를 받지 못했다)")
+        self.next_n = a.get("n", 0) + 1                          # init을 받은 때까지 서버가 내보낸 것은 바탕 + 아래 스냅샷에 있다
         if a["result"] == "joined" and a.get("n", 0) > 0:      # 서버에 이미 변경이 있다: 그것까지 받는다 (없으면 바탕이 곧 지금 지도)
             self._join()
 
@@ -177,11 +195,14 @@ class RemoteMap:
                 raise RuntimeError(msg)
             self.executor.spin_once(timeout_sec=0.05)
 
-    def _request(self, kind, timeout=1.0):
-        """요청 하나 보내고 그 응답을 기다린다 (없으면 None)."""
+    def _publish_req(self, r):
         self.req_id += 1
-        k = self.req_id
-        self.pub_req.publish(self._String(data=json.dumps({"type": kind, "client": self.name, "id": k})))
+        self.pub_req.publish(self._String(data=json.dumps(dict(r, client=self.name, id=self.req_id))))
+        return self.req_id
+
+    def _request(self, kind, timeout=1.0, **extra):
+        """요청 하나 보내고 그 응답을 기다린다 (없으면 None)."""
+        k = self._publish_req({"type": kind, **extra})
         t1 = time.monotonic()
         got = None
         while got is None and time.monotonic() - t1 < timeout:
@@ -190,8 +211,7 @@ class RemoteMap:
         self.replies = [r for r in self.replies if r.get("id", 0) > k]   # 이번 것까지 다 본 응답은 버린다
         return got
 
-    def _join(self):
-        """붙는 절차 2, 3: 스냅샷으로 사본을 만들고, 쌓인 변경 중 스냅샷 뒤(n이 더 큰) 것만 poll에서 적용한다."""
+    def _snapshot(self):
         t0 = time.monotonic()
         snap = None
         while snap is None:
@@ -199,20 +219,71 @@ class RemoteMap:
             if snap is None and time.monotonic() - t0 > self.wait_s:
                 raise RuntimeError("맵 서버가 스냅샷을 주지 않는다")
         self.local = MapServer.from_state(dec_state(snap["state"]))
-        self.applied_n = snap["n"]
-        self.joined = {"version": self.local.version, "n": snap["n"], "s": round(time.monotonic() - t0, 3)}
+        self.next_n = snap["n"] + 1
+        self.pending = {k: v for k, v in self.pending.items() if k >= self.next_n}
+        return snap, time.monotonic() - t0
+
+    def _join(self):
+        """붙는 절차 2, 3: 스냅샷으로 사본을 만들고, 쌓인 변경 중 스냅샷 뒤(n이 더 큰) 것만 poll에서 적용한다."""
+        snap, took = self._snapshot()
+        self.joined = {"version": self.local.version, "n": snap["n"], "s": round(took, 3)}
         self.poll()
+
+    def _resync(self):
+        """다시 받을 수 없는 빈칸 (서버가 들고 있는 것보다 오래됨): 스냅샷으로 다시 맞추고, 서버가 아직 못 받은 자기 변경을 그 위에 다시 넣는다."""
+        snap, _ = self._snapshot()
+        done = snap["seq"].get(self.name, 0)
+        for s in [k for k in self.unacked if k <= done]:        # 서버가 이미 받았다 (메아리만 못 받음): 스냅샷에 들어 있다
+            del self.unacked[s]
+        for s in sorted(self.unacked):                           # 서버가 아직 못 받은 자기 변경: 스냅샷 위에 다시
+            apply_message(self.local, json.loads(self.unacked[s][0]))
+        if self.gap is not None and not self.pending:           # 빈칸이 스냅샷으로 메워졌다
+            self.stats["recovery"].append(time.monotonic() - self.gap["since"])
+            self.gap = None
+        self.stats["resyncs"] += 1
 
     def _send(self, m):
         self.seq += 1
         self.sent["write" if m["type"] in ("write", "cells") else m["type"]] += 1
         m["seq"], m["from"], m["wall"] = self.seq, self.name, time.time()   # from = 보낸 클라이언트, writer = 변경의 쓴 쪽
-        self.pub.publish(self._String(data=json.dumps(m)))
+        data = json.dumps(m)
+        if m["type"] != "init":                                  # 메아리가 올 때까지 들고 있다 (init은 답을 기다린다)
+            self.unacked[self.seq] = [data, time.monotonic()]
+            if self.drop[0] and self._rng.random() < self.drop[0]:
+                self.stats["dropped_out"] += 1                   # 시험: 보내지 않음 (서버가 빈칸을 보고 다시 달라거나, 시간이 지나 다시 보냄)
+                return
+        self.pub.publish(self._String(data=data))
+
+    def _resend(self, seqs):
+        for s in seqs:
+            if s in self.unacked:
+                self.pub.publish(self._String(data=self.unacked[s][0]))
+                self.unacked[s][1] = time.monotonic()
+                self.stats["resent"] += 1
+
+    def _take(self, m):
+        """/map/updates 하나 (또는 다시 받은 것): n 순서대로 소비하려고 쌓는다. 자기 메아리면 보낸 것을 내려놓는다."""
+        if m.get("from") == self.name:
+            if self.unacked.pop(m["seq"], None) is not None:
+                self.lat["echo"].append(time.time() - m["wall"])
+        if m["n"] >= self.next_n:
+            self.pending[m["n"]] = m
 
     def _on_reply(self, msg):
         self.n_cb += 1
         m = json.loads(msg.data)
-        if m.get("client") == self.name:                         # 다른 클라이언트의 응답(스냅샷 등)은 바로 버린다
+        if m.get("client") != self.name:                         # 다른 클라이언트의 응답(스냅샷 등)은 바로 버린다
+            return
+        if m["type"] == "resend":                                # 서버가 빈칸을 봄: 빠진 seq를 다시 보낸다
+            self._resend(range(m["from"], m["to"] + 1))
+        elif m["type"] == "replay":                              # 다시 받은 /map/updates (또는 너무 오래돼 없음)
+            if m.get("too_old"):
+                self.need_resync = True
+                return
+            for d in m["msgs"]:
+                self._take(json.loads(d))
+            self.stats["replayed"] += len(m["msgs"])
+        else:
             self.replies.append(m)
 
     def _on_info(self, msg):
@@ -222,14 +293,13 @@ class RemoteMap:
     def _on_update(self, msg):
         self.n_cb += 1
         self.rx += 1
-        m = json.loads(msg.data)
-        if m.get("from") == self.name:                           # 자기 변경은 이미 사본에 있다
-            self.lat["echo"].append(time.time() - m["wall"])   # applied_n은 건드리지 않는다 (아직 안 받은 앞 번호의 다른 쪽 변경이 걸러진다)
-        else:
-            self.foreign.append(m)
+        if self.drop[1] and self._rng.random() < self.drop[1]:
+            self.stats["dropped_in"] += 1                        # 시험: 받지 않은 것으로 (빈칸 -> 다시 받기)
+            return
+        self._take(json.loads(msg.data))
 
     def poll(self):
-        """받은 다른 쪽 변경을 사본에 반영. 반환: 반영한 개수."""
+        """받은 다른 쪽 변경을 n 순서대로 사본에 반영하고, 빈칸이 있으면 다시 달라고 한다. 반환: 반영한 개수 (다시 맞췄으면 1 더)."""
         # spin_once는 콜백을 하나만 부르고, timeout 0이면 남은 것이 있어도 번갈아 빈손으로 돌아온다 (Humble: 1, 0, 1, 0 ...).
         # 그래서 3번 연속 빈손이면 다 받은 것으로 본다 (기다리지 않음: 그 뒤에 온 것은 다음 poll에서)
         empty = 0
@@ -241,15 +311,39 @@ class RemoteMap:
                 break
         if not hasattr(self, "local"):                           # 붙기 전 (스냅샷을 기다리는 중): 쌓아 두기만
             return 0
-        n, now = 0, time.time()
-        for m in sorted(self.foreign, key=lambda m: m["n"]):
-            if m["n"] <= self.applied_n:                         # 스냅샷에 이미 들어 있다
-                continue
-            apply_message(self.local, m)
-            self.applied_n = m["n"]
-            self.lat["apply"].append(now - m["wall"])
+        n, now, mono = 0, time.time(), time.monotonic()
+        if self.need_resync:
+            self.need_resync = False
+            self._resync()
             n += 1
-        self.foreign = []
+        late = self.gap is not None                              # 빈칸이 열려 있었다: 이번에 반영하는 것은 그 때문에 늦었다
+        while self.next_n in self.pending:                       # n 순서대로 (자기 메아리는 이미 사본에 있어 건너뛴다)
+            m = self.pending.pop(self.next_n)
+            if m.get("from") != self.name:
+                apply_message(self.local, m)
+                self.lat["apply"].append(now - m["wall"])
+                if late:                                         # 보낸 때부터 (빈칸을 알아채기까지 걸린 시간 포함)
+                    self.lat["apply_late"].append(now - m["wall"])
+                n += 1
+            self.next_n += 1
+        if self.gap is not None and self.next_n > self.gap["n"]:   # 그 빈칸이 메워졌다 (빈칸마다 잰다)
+            self.stats["recovery"].append(mono - self.gap["since"])
+            self.gap = None
+        # 빈칸: 뒤 번호가 와 있거나, 서버가 알린 n보다 덜 받음 (마지막 것이 사라진 경우)
+        top = max(max(self.pending, default=0), (self.info or {}).get("n", 0))
+        if top >= self.next_n:
+            if self.gap is None:
+                self.gap = {"n": self.next_n, "since": mono, "asked": 0.0}
+                self.stats["gaps"] += 1
+            if mono - self.gap["asked"] > GAP_ASK_S:
+                hi = min(self.pending) - 1 if self.pending else top
+                self._publish_req({"type": "replay", "from": self.next_n, "to": hi})
+                self.gap["asked"] = mono
+        done = (self.info or {}).get("writers", {}).get(self.name, 0)   # 서버가 받았다고 알린 seq: 메아리를 못 받아도 내려놓는다
+        for s in [k for k in self.unacked if k <= done]:
+            del self.unacked[s]
+        old = [s for s, (_, t) in self.unacked.items() if mono - t > RESEND_S]   # 오래 메아리가 없다 (마지막 것이 사라졌을 수 있다)
+        self._resend(old)
         return n
 
     # ---- MapServer와 같은 쓰기 (사본에 먼저, 그다음 서버로) ----
@@ -275,26 +369,38 @@ class RemoteMap:
 
     # ---- 끝: 서버가 다 받았는지, 사본이 같은지 ----
     def audit(self, wait_s=30.0):
-        """서버가 이 클라이언트의 마지막 seq까지 받고, 이 클라이언트가 서버의 판까지 다 받을 때까지(같은 판에서 비교) 기다린 뒤
-        타일 해시를 대조. 반환: dict (summary에 넣는다)."""
+        """서버가 이 클라이언트의 마지막 seq까지 받고(다시 보내기 포함), 이 클라이언트가 서버의 판까지 빈칸 없이 다 받을 때까지(같은
+        판에서 비교) 기다린 뒤 타일 해시를 대조. 반환: dict (summary에 넣는다)."""
         t0 = time.monotonic()
         while True:
             got = self._request("audit")
             self.poll()
-            if got and got["seq"].get(self.name, 0) >= self.seq and got["version"] == self.local.version:
+            if (got and got["seq"].get(self.name, 0) >= self.seq and got["version"] == self.local.version
+                    and not self.unacked and self.gap is None):
                 break
             if time.monotonic() - t0 > wait_s:
                 return {"server": "no reply (서버가 끝났거나 없다)" if got is None else
-                        f"server got seq {got['seq'].get(self.name, 0)} / {self.seq}, version {got['version']} / {self.local.version}"}
+                        f"server got seq {got['seq'].get(self.name, 0)} / {self.seq}, version {got['version']} / {self.local.version}, "
+                        f"unacked {len(self.unacked)}, gap {self.gap is not None}"}
         mine = tile_hashes(self.local)
         bad = sorted(k for k in mine if got["hashes"].get(k) != mine[k])
+        st = self.stats
         out = {"server_version": got["version"], "client_version": self.local.version, "sent": dict(self.sent, total=self.seq),
                "tiles": len(mine), "hash_mismatch": len(bad), "mismatched_tiles": bad[:20],
                "wait_s": round(time.monotonic() - t0, 3),
-               "latency_ms": {"recv": got.get("recv_latency_ms", {"n": 0}), **{k: stats_ms(v) for k, v in self.lat.items()}}}
+               "latency_ms": {"recv": got.get("recv_latency_ms", {"n": 0}), **{k: stats_ms(v) for k, v in self.lat.items()}},
+               "gaps": {"recv_side": st["gaps"], "recv_recovery_ms": stats_ms(st["recovery"]), "replayed": st["replayed"],
+                        "resyncs": st["resyncs"], "resent": st["resent"], "server_side_recovery_ms": got.get("gap_recovery_ms", {"n": 0}),
+                        "server_side_delay_ms": got.get("gap_delay_ms", {"n": 0}),
+                        "dropped_test": {"out": st["dropped_out"], "in": st["dropped_in"]}}}
         if self.joined:
             out["joined"] = self.joined
         return out
+
+    def save(self, out):
+        """서버에 상태 저장을 요청한다 (out/state.json, out/final/ 바탕 파일 꼴: 다음 서버의 --resume / --base). 반환: 폴더 또는 None."""
+        r = self._request("save", timeout=30.0, dir=str(out))
+        return None if r is None else r.get("dir")
 
     def summary(self):
         s = self.local.summary()
@@ -312,10 +418,11 @@ def main():
     ap.add_argument("--observe", action="store_true", help="늦게 붙어 지금 지도를 받고 따라간다 (쓰지 않음)")
     ap.add_argument("--name", default="observer")
     ap.add_argument("--duration", type=float, default=0.0, help="이 시간(s) 뒤 감사하고 끝 (0: Ctrl+C까지)")
+    ap.add_argument("--drop", type=float, default=0.0, help="받은 변경을 일부러 버릴 비율 (빈칸 복구 보기, 예 0.2)")
     a = ap.parse_args()
     if not a.observe:
         ap.error("지금은 --observe만 있다")
-    m = RemoteMap(None, name=a.name)
+    m = RemoteMap(None, name=a.name, drop=(0.0, a.drop))
     print(f"붙음: 판 {m.local.version}, 서버 번호 n {m.joined['n']}, 스냅샷 {m.joined['s']} s, 격자 {m.local.nrow} x {m.local.ncol}, "
           f"소유 영역 {len(m.local.owners)}", flush=True)
     t0, last = time.monotonic(), 0.0
@@ -325,8 +432,11 @@ def main():
             if time.monotonic() - last >= 1.0:
                 last = time.monotonic()
                 s = stats_ms(m.lat["apply"][-200:])
+                g = m.stats
+                late = stats_ms(m.lat["apply_late"])
                 print(f"판 {m.local.version:5d}  받은 변경 {len(m.lat['apply']):5d}  반영 지연 p50 {s.get('p50', '-')} ms "
-                      f"p95 {s.get('p95', '-')} ms", flush=True)
+                      f"p95 {s.get('p95', '-')} ms  빈칸 {g['gaps']} (버림 {g['dropped_in']}, 다시 받음 {g['replayed']}, "
+                      f"빈칸 때문에 늦은 것 max {late.get('max', '-')} ms)", flush=True)
             time.sleep(0.02)
     except KeyboardInterrupt:
         pass
