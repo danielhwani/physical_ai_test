@@ -27,6 +27,9 @@
   한다. 서버가 그 구간을 더 들고 있지 않으면(too_old) 스냅샷으로 다시 맞추고, 서버가 아직 못 받은 자기 변경을 그 위에 다시 넣는다.
   빈칸 지연: recovery = 빈칸을 알아챈 때부터 메워지기까지 (알아채는 데는 다음 메시지가 와야 해서 그 시간이 빠진다),
   apply_late / server_side_delay = 빈칸 때문에 늦게 반영된 변경의 보낸 때부터 반영까지 (물리가 실제로 늦게 본 시간, MOP).
+  다시 받을 수 없는 빈칸: 받는 쪽은 스냅샷으로 다시 맞추므로 잃지 않는다. 보내는 쪽(이 클라이언트가 죽었거나 UNACKED_MAX를 넘어 버림)은
+  서버가 GIVEUP_S 뒤 건너뛰고 잃은 변경으로 센다 (MOP map_lost_changes). 소유 영역이 있으면 서버가 refresh_owned로 영역의 지금
+  높이를 통째로 달라고 하고, 이 클라이언트는 사본의 그 영역을 own 쓰기 하나로 보낸다 (절대 높이라 빠진 것과 상관없이 맞는다).
 """
 import argparse
 import base64
@@ -41,6 +44,7 @@ from .map_server import MapServer
 TOPICS = ("/map/write", "/map/updates", "/map/info", "/map/request", "/map/reply")
 GAP_ASK_S = 0.2       # 받는 쪽 빈칸: 이 주기로 다시 달라고 한다 (s)
 RESEND_S = 1.0        # 보낸 것의 메아리가 이만큼 없으면 다시 보낸다 (s)
+UNACKED_MAX = 10000   # 메아리를 기다리며 들고 있는 보낸 것의 상한 (넘으면 오래된 것부터 버린다: 서버가 오래 없을 때 메모리)
 
 
 def enc(a):
@@ -98,6 +102,7 @@ def audit_mop(au):
     return {"map_hash_mismatch": au.get("hash_mismatch"),
             "map_seq_gaps": None if not g else g["recv_side"] + g.get("server_side_recovery_ms", {}).get("n", 0),   # 빈칸 수 (받는 쪽 + 서버 쪽)
             "map_gap_delay_max_ms": max(rec) if rec else None,           # 빈칸 때문에 늦은 변경: 보낸 때부터 반영까지 (알아채기까지 포함)
+            "map_lost_changes": None if not g else sum(d.get("lost", 0) for d in g.get("server_lost", {}).values()),   # 서버가 끝내 적용 못 한 변경 (모든 클라이언트)
             "map_recv_latency_p95_ms": lat.get("recv", {}).get("p95"),      # 이 클라이언트가 보낸 변경이 서버에 닿기까지
             "map_apply_latency_p95_ms": lat.get("apply", {}).get("p95")}    # 다른 쪽 변경이 이 사본(물리)에 들어가기까지
 
@@ -121,7 +126,7 @@ class RemoteMap:
     base=None: 관찰자 (바탕을 보내지 않고 서버의 지금 지도를 받아 붙는다).
     drop: (보내기, 받기) 일부러 버릴 비율 (빈칸 복구 시험용, 0이면 없음). 버린 것은 다시 보내기·다시 받기로 메워져야 한다."""
 
-    def __init__(self, base, z_range=None, name="sim", wait_s=30.0, drop=(0.0, 0.0), drop_seed=0):
+    def __init__(self, base, z_range=None, name="sim", wait_s=30.0, drop=(0.0, 0.0), drop_seed=0, unacked_max=UNACKED_MAX):
         import rclpy
         import rclpy.executors
         from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -143,9 +148,12 @@ class RemoteMap:
         self.pending = {}                                        # n -> 받은 /map/updates (자기 메아리 포함), n 순서대로 소비
         self.next_n = 1                                          # 다음에 받을 서버 번호 n (그 앞은 사본에 다 들어 있다)
         self.unacked = {}                                        # seq -> [JSON, 보낸 시각]: 메아리가 올 때까지 (다시 보내기)
+        self.unacked_max = unacked_max
+        self.my_owners = []                                      # 이 클라이언트가 선언한 소유 영역 (r0, r1, c0, c1, 쓴 쪽): 다시 보내기용
         self.gap = None                                          # 받는 쪽 빈칸 {"n": 빠진 첫 번호, "since", "asked"} (monotonic)
         self.need_resync = False                                 # 서버가 빈칸 구간을 더 들고 있지 않다 (too_old): 다음 poll에서 스냅샷
-        self.stats = {"gaps": 0, "replayed": 0, "resyncs": 0, "resent": 0, "dropped_out": 0, "dropped_in": 0, "recovery": []}
+        self.stats = {"gaps": 0, "replayed": 0, "resyncs": 0, "resent": 0, "dropped_out": 0, "dropped_in": 0, "recovery": [],
+                      "evicted": 0, "refreshed": 0}
         self.drop, self._rng = drop, np.random.default_rng(drop_seed)
         self.rx = 0                                              # 받은 /map/updates 수 (자기 메아리 포함)
         self.lat = {"echo": [], "apply": [], "apply_late": []}   # 지연 (s). apply_late: 빈칸 때문에 늦게 반영된 것 (다시 받은 것 + 그 뒤에 기다린 것)
@@ -249,6 +257,9 @@ class RemoteMap:
         data = json.dumps(m)
         if m["type"] != "init":                                  # 메아리가 올 때까지 들고 있다 (init은 답을 기다린다)
             self.unacked[self.seq] = [data, time.monotonic()]
+            while len(self.unacked) > self.unacked_max:          # 상한: 가장 오래된 것을 버린다 (다시 보낼 수 없게 됨 -> 서버가 건너뜀)
+                del self.unacked[min(self.unacked)]
+                self.stats["evicted"] += 1
             if self.drop[0] and self._rng.random() < self.drop[0]:
                 self.stats["dropped_out"] += 1                   # 시험: 보내지 않음 (서버가 빈칸을 보고 다시 달라거나, 시간이 지나 다시 보냄)
                 return
@@ -276,6 +287,8 @@ class RemoteMap:
             return
         if m["type"] == "resend":                                # 서버가 빈칸을 봄: 빠진 seq를 다시 보낸다
             self._resend(range(m["from"], m["to"] + 1))
+        elif m["type"] == "refresh_owned":                       # 서버가 이 클라이언트의 변경을 건너뜀: 소유 영역을 통째로
+            self.refresh_owned()
         elif m["type"] == "replay":                              # 다시 받은 /map/updates (또는 너무 오래돼 없음)
             if m.get("too_old"):
                 self.need_resync = True
@@ -363,19 +376,27 @@ class RemoteMap:
                         "values": enc(np.asarray(values, float))})
         return out
 
+    def refresh_owned(self):
+        """소유 영역마다 사본의 지금 높이를 own 쓰기 하나로 보낸다 (서버가 건너뛴 소유 영역 쓰기를 메운다)."""
+        for r0, r1, c0, c1, writer in self.my_owners:
+            self.write("own", writer, r0, c0, self.local.compose(r0, r1, c0, c1))
+            self.stats["refreshed"] += 1
+
     def set_owner(self, r0, r1, c0, c1, writer):
+        self.my_owners.append((int(r0), int(r1), int(c0), int(c1), writer))
         self.local.set_owner(r0, r1, c0, c1, writer)
         self._send({"type": "owner", "writer": writer, "r0": int(r0), "r1": int(r1), "c0": int(c0), "c1": int(c1)})
 
     # ---- 끝: 서버가 다 받았는지, 사본이 같은지 ----
     def audit(self, wait_s=30.0):
-        """서버가 이 클라이언트의 마지막 seq까지 받고(다시 보내기 포함), 이 클라이언트가 서버의 판까지 빈칸 없이 다 받을 때까지(같은
-        판에서 비교) 기다린 뒤 타일 해시를 대조. 반환: dict (summary에 넣는다)."""
+        """서버가 이 클라이언트의 마지막 seq까지 받고(다시 보내기·건너뛰기 포함), 이 클라이언트가 서버가 내보낸 번호 n까지 빈칸 없이 다 받을
+        때까지 기다린 뒤 타일 해시를 대조. 판이 아니라 n으로 기다린다: 서버가 이 클라이언트의 변경을 건너뛰었으면 판이 끝내 같아지지
+        않는다 (그 차이를 해시 불일치로 드러낸다). 반환: dict (summary에 넣는다)."""
         t0 = time.monotonic()
         while True:
             got = self._request("audit")
             self.poll()
-            if (got and got["seq"].get(self.name, 0) >= self.seq and got["version"] == self.local.version
+            if (got and got["seq"].get(self.name, 0) >= self.seq and self.next_n > got["n"]
                     and not self.unacked and self.gap is None):
                 break
             if time.monotonic() - t0 > wait_s:
@@ -392,6 +413,7 @@ class RemoteMap:
                "gaps": {"recv_side": st["gaps"], "recv_recovery_ms": stats_ms(st["recovery"]), "replayed": st["replayed"],
                         "resyncs": st["resyncs"], "resent": st["resent"], "server_side_recovery_ms": got.get("gap_recovery_ms", {"n": 0}),
                         "server_side_delay_ms": got.get("gap_delay_ms", {"n": 0}),
+                        "evicted": st["evicted"], "refreshed": st["refreshed"], "server_lost": got.get("lost", {}),
                         "dropped_test": {"out": st["dropped_out"], "in": st["dropped_in"]}}}
         if self.joined:
             out["joined"] = self.joined

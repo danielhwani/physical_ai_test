@@ -11,6 +11,10 @@
   빈칸 (2d, 설계 7절): 클라이언트마다 seq 순서대로만 적용한다. 빈칸 뒤에 온 것은 쌓아 두고 /map/reply {"type": "resend"}로 빠진 seq를
         다시 달라고 한다 (0.5 s마다, 메워질 때까지). 이미 받은 seq는 버린다 (다시 보낸 것). 보낸 /map/updates는 최근 RING개를 들고 있다가
         클라이언트가 /map/request {"type": "replay", "from", "to"}로 달라면 다시 보낸다 (그보다 오래되면 "too_old": 클라이언트가 스냅샷).
+        건너뛰기: GIVEUP_S 동안 안 메워지는 seq는 건너뛰고 쌓아 둔 것을 적용한다 (안 그러면 그 클라이언트의 변경이 영원히 멈춘다).
+        그 클라이언트가 소유 영역을 가졌으면 영역의 지금 높이를 통째로 다시 달라고 한다 (/map/reply {"type": "refresh_owned"}: 절대
+        높이라 빠진 것과 상관없이 정확히 맞는다). 건너뛴 seq가 나중에 오면 파임(dig, min: 순서와 무관)은 적용하고, 나머지(own, add,
+        set: 순서가 결과를 바꿈)는 버린다. 버린 것 = 잃은 변경 (MOP map_lost_changes).
   감사: /map/request {"type": "audit"} -> /map/reply에 지금 판, 클라이언트별 마지막 seq, 타일 해시.
   스냅샷: /map/request {"type": "snapshot"} -> /map/reply에 상태 전체와 그때의 n, 클라이언트별 seq (늦게 붙기 6.1, 빈칸 복구).
   저장 (5.8): --save-dir DIR이면 끝날 때(SIGTERM, Ctrl+C), 또는 /map/request {"type": "save"}에 DIR/state.json (상태 전체)과
@@ -34,10 +38,11 @@ from .map_server import FORMAT, RULES, TILE, MapServer
 
 RING = 20000          # 다시 보내 줄 수 있게 들고 있는 /map/updates 수
 RESEND_S = 0.5        # 빈칸을 다시 달라고 하는 주기 (s)
+GIVEUP_S = 5.0        # 이만큼 안 메워지는 빈칸은 건너뛴다 (보낸 쪽이 죽었거나 그 메시지를 더 들고 있지 않다)
 
 
 class MapServerNode:
-    def __init__(self, base=None, save_dir=None, resume=None, ring=RING):
+    def __init__(self, base=None, save_dir=None, resume=None, ring=RING, giveup=GIVEUP_S):
         self.node = rclpy.create_node("map_server")
         rel = QoSProfile(depth=10000, reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST)
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE)
@@ -57,6 +62,10 @@ class MapServerNode:
         self.gap_log = {}                                           # 클라이언트 -> [빠진 seq를 알아챈 때부터 받기까지 s]
         self.gap_delay = {}                                         # 클라이언트 -> [빈칸 때문에 늦게 적용된 변경의 보낸 때부터 적용까지 s]
         self.dups = 0                                               # 이미 받은 seq (다시 보낸 것)
+        self.giveup = giveup
+        self.skipped = {}                                           # 클라이언트 -> {건너뛴 seq} (아직 안 온 것)
+        self.lost = {}                                              # 클라이언트 -> {"skipped": 건너뛰고 끝내 안 옴(감사 때), "late_dropped": 늦게 와서 버림, "late_dig": 늦게 와도 적용, "refresh": 소유 영역 다시 받음 요청}
+        self.owner_clients = set()                                  # 소유 영역을 선언한 클라이언트
         self.base_tiles, self.map_name, self.base_path = {}, None, None   # 타일별 바탕 해시, 지도 이름, 바탕 폴더
         self.save_dir = Path(save_dir) if save_dir else None
         log = self.node.get_logger()
@@ -79,14 +88,31 @@ class MapServerNode:
 
     def gap_stats(self):
         return {"held": {c: sorted(h) for c, h in self.held.items() if h}, "dups": self.dups,
-                "recovered": {c: stats_ms(v) for c, v in self.gap_log.items()}}
+                "recovered": {c: stats_ms(v) for c, v in self.gap_log.items()}, "lost": self.lost_stats()}
+
+    def lost_stats(self):
+        out = {}
+        for c in set(self.lost) | set(self.skipped):
+            d = dict(self.lost.get(c, {}))
+            d["skipped_pending"] = len(self.skipped.get(c, ()))
+            d["lost"] = d["skipped_pending"] + d.get("late_dropped", 0)
+            out[c] = d
+        return out
+
+    def _count(self, sender, k):
+        d = self.lost.setdefault(sender, {"late_dropped": 0, "late_dig": 0, "refresh": 0, "skipped_total": 0})
+        d[k] += 1
 
     def publish_info(self):
+        """2 s마다 (늦게 붙어도 받음). 지도 크기와 시간에 따라 커지지 않게 한다: 타일별 해시는 싣지 않고(타일 수에 비례: 1 km 지도면
+        약 1만 개, 2 s마다 750 KB. init 대조는 서버가 한다), 빈칸은 개수만 (자세한 것은 감사 응답)."""
         s = self.server
-        info = {"format": FORMAT, "rules": RULES, "dropped_before_init": self.dropped, "gaps": self.gap_stats(),
+        lost = self.lost_stats()
+        gaps = {"held": {c: len(h) for c, h in self.held.items() if h}, "dups": self.dups,
+                "lost": {c: d["lost"] for c, d in lost.items()}}
+        info = {"format": FORMAT, "rules": RULES, "dropped_before_init": self.dropped, "gaps": gaps,
                 "writers": self.seq, "base_sha256": self.base_hash, "joined": self.joined, "refused": self.refused,
-                "inits": self.inits, "n": self.n, "map_name": self.map_name, "base_path": self.base_path,
-                "base_tiles": self.base_tiles}
+                "inits": self.inits, "n": self.n, "map_name": self.map_name, "base_path": self.base_path}
         if s is not None:
             info.update(tile=s.tile, grid=[s.nrow, s.ncol], z_range=[s.z_min, s.z_max], version=s.version,
                         owners=[list(o) for o in s.owners])
@@ -104,8 +130,18 @@ class MapServerNode:
         if "wall" in m:                                           # init(바탕 격자 전체, 접속 직후)은 지연에서 뺀다: 401 x 401에 약 1.7 MB
             self.lat.setdefault(sender, []).append(time.time() - m["wall"])
         last = self.seq.get(sender, 0)
-        if m["seq"] <= last:                                      # 이미 받음 (클라이언트가 다시 보낸 것)
-            self.dups += 1
+        if m["seq"] <= last:
+            sk = self.skipped.get(sender, set())
+            if m["seq"] in sk:                                    # 건너뛴 뒤에 왔다
+                sk.discard(m["seq"])
+                if m["type"] in ("write", "cells") and m["op"] == "dig":   # min: 순서와 무관하니 늦게 넣어도 같다
+                    self.accept(sender, m, late=True, keep_seq=True)
+                    self._count(sender, "late_dig")
+                else:                                             # own, add, set, owner: 순서가 결과를 바꾼다 -> 버림 (잃은 변경)
+                    self._count(sender, "late_dropped")
+                    self.node.get_logger().warn(f"건너뛴 뒤 늦게 온 변경 버림: {sender} seq {m['seq']} ({m['type']} {m.get('op', '')})")
+            else:                                                 # 이미 받음 (클라이언트가 다시 보낸 것)
+                self.dups += 1
             return
         if m["seq"] > last + 1:                                   # 빈칸: 쌓아 두고 빠진 것을 달라고 한다
             held = self.held.setdefault(sender, {})
@@ -125,6 +161,31 @@ class MapServerNode:
         if not self.gap_since.get(sender):
             self.gap_since.pop(sender, None)
 
+    def give_up(self, sender, now):
+        """GIVEUP_S가 지난 빈칸을 건너뛰고 쌓아 둔 것을 적용한다. 소유 영역이 있는 클라이언트면 영역을 다시 달라고 한다."""
+        missing, held = self.gap_since.get(sender, {}), self.held.get(sender, {})
+        skipped = []
+        while True:
+            nxt = self.seq.get(sender, 0) + 1
+            if nxt in held:
+                self.accept(sender, held.pop(nxt), late=True)
+            elif nxt in missing and now - missing[nxt] > self.giveup:
+                missing.pop(nxt)
+                self.seq[sender] = nxt
+                self.skipped.setdefault(sender, set()).add(nxt)
+                self._count(sender, "skipped_total")
+                skipped.append(nxt)
+            else:
+                break
+        if not missing:
+            self.gap_since.pop(sender, None)
+        if skipped:
+            self.node.get_logger().warn(f"빈칸 건너뜀: {sender} seq {skipped} ({self.giveup} s 동안 안 옴)")
+            if sender in self.owner_clients:
+                self.pub_reply.publish(String(data=json.dumps({"type": "refresh_owned", "client": sender})))
+                self._count(sender, "refresh")
+            self.publish_info()
+
     def ask_resend(self, sender):
         held = self.held.get(sender, {})
         if not held:
@@ -132,11 +193,15 @@ class MapServerNode:
         r = {"type": "resend", "client": sender, "from": self.seq.get(sender, 0) + 1, "to": min(held) - 1}   # 첫 빈칸 (메워지면 다음 것)
         self.pub_reply.publish(String(data=json.dumps(r)))
 
-    def accept(self, sender, m, late=False):
-        """seq 순서대로 온 변경 하나: 적용하고 번호를 매겨 내보낸다. late: 빈칸 때문에 늦게 적용 (빠졌던 것, 그 뒤에 기다린 것)."""
+    def accept(self, sender, m, late=False, keep_seq=False):
+        """seq 순서대로 온 변경 하나: 적용하고 번호를 매겨 내보낸다. late: 빈칸 때문에 늦게 적용 (빠졌던 것, 그 뒤에 기다린 것).
+        keep_seq: 건너뛴 뒤에 온 파임 (seq 순서 밖에서 적용, 그 클라이언트의 seq는 그대로)."""
         if late and "wall" in m:
             self.gap_delay.setdefault(sender, []).append(time.time() - m["wall"])
-        self.seq[sender] = m["seq"]
+        if not keep_seq:
+            self.seq[sender] = m["seq"]
+        if m["type"] == "owner":
+            self.owner_clients.add(sender)
         t = self.gap_since.get(sender, {}).pop(m["seq"], None)
         if t is not None:                                         # 빠졌던 seq가 왔다 (빈칸마다 잰다)
             self.gap_log.setdefault(sender, []).append(time.monotonic() - t)
@@ -169,25 +234,30 @@ class MapServerNode:
                 bad = sorted(k for k in self.base_tiles if theirs.get(k) != self.base_tiles[k])
             result = "refused" if bad else "joined"
             if bad:                                               # 다른 바탕: 거부 (지형 상관이 깨진다)
-                self.refused.append(sender)
+                if sender not in self.refused:
+                    self.refused.append(sender)
                 self.node.get_logger().error(f"바탕이 다른 클라이언트 거부: {sender}, 타일 {bad[:10]}")
             else:                                                 # 같은 바탕: 붙기만 (변경이 있으면 클라이언트가 스냅샷을 받음)
-                self.joined.append(sender)
+                if sender not in self.joined:
+                    self.joined.append(sender)
                 self.node.get_logger().info(f"클라이언트 붙음: {sender} (판 {self.server.version})")
         if result != "refused" and sender in self.refused:
             self.refused.remove(sender)
-        self.inits[sender] = {"nonce": m.get("nonce"), "result": result, "bad_tiles": bad[:50], "n": self.n}
+        self.inits[sender] = {"nonce": m.get("nonce"), "result": result, "n": self.n}
+        if bad:
+            self.inits[sender]["bad_tiles"] = bad[:50]                # 거부할 때만 (클라이언트가 오류에 적는다)
         self.publish_info()
 
     def on_request(self, msg):
         m = json.loads(msg.data)
         reply = lambda r: self.pub_reply.publish(String(data=json.dumps(dict(r, client=m["client"], id=m.get("id")))))  # noqa: E731
         if m["type"] == "audit":
-            reply({"type": "audit", "version": None if self.server is None else self.server.version,
+            reply({"type": "audit", "version": None if self.server is None else self.server.version, "n": self.n,
                    "seq": self.seq, "hashes": {} if self.server is None else tile_hashes(self.server), "gaps": self.gap_stats(),
                    "recv_latency_ms": stats_ms(self.lat.get(m["client"], [])),
                    "gap_recovery_ms": stats_ms(self.gap_log.get(m["client"], [])),
-                   "gap_delay_ms": stats_ms(self.gap_delay.get(m["client"], []))})
+                   "gap_delay_ms": stats_ms(self.gap_delay.get(m["client"], [])),
+                   "lost": self.lost_stats()})
         elif m["type"] == "snapshot" and self.server is not None:   # 지금 상태 전체와 그때의 n (서버는 한 줄로 돌아 사이에 끼는 변경이 없다)
             reply({"type": "snapshot", "n": self.n, "seq": self.seq, "state": enc_state(self.server.state())})
             self.node.get_logger().info(f"스냅샷: {m['client']} (판 {self.server.version}, n {self.n})")
@@ -224,8 +294,9 @@ class MapServerNode:
         while rclpy.ok():
             rclpy.spin_once(self.node, timeout_sec=0.1)
             now = time.monotonic()
-            if now - last_resend > RESEND_S:                       # 아직 안 메워진 빈칸을 다시 달라고
+            if now - last_resend > RESEND_S:                       # 아직 안 메워진 빈칸을 다시 달라고, 너무 오래된 것은 건너뛴다
                 for c in list(self.gap_since):
+                    self.give_up(c, now)
                     self.ask_resend(c)
                 last_resend = now
             if now - last_info > 2.0:                              # 판이 바뀐 것을 가끔 알림 (늦게 붙는 쪽용)
@@ -239,10 +310,11 @@ def main():
     ap.add_argument("--save-dir", help="끝날 때 상태(state.json)와 끝난 지형(final/, 바탕 파일 꼴)을 쓸 폴더")
     ap.add_argument("--resume", help="저장한 상태(state.json이 있는 폴더)에서 이어 시작")
     ap.add_argument("--ring", type=int, default=RING, help="다시 보내 줄 수 있게 들고 있는 변경 수 (시험용으로 줄임)")
+    ap.add_argument("--gap-giveup", type=float, default=GIVEUP_S, help="이만큼(s) 안 메워지는 빈칸은 건너뛴다")
     a = ap.parse_args()
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))   # terminate()에도 저장하고 끝내게
     rclpy.init()
-    n = MapServerNode(base=a.base, save_dir=a.save_dir, resume=a.resume, ring=a.ring)
+    n = MapServerNode(base=a.base, save_dir=a.save_dir, resume=a.resume, ring=a.ring, giveup=a.gap_giveup)
     try:
         n.spin()
     except (KeyboardInterrupt, ExternalShutdownException):

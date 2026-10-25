@@ -12,6 +12,8 @@
   클라이언트는 그 타일을 적어 거부된다.
   빈칸 (2d): 두 클라이언트가 보내기·받기의 10%를 일부러 버려도 다시 보내기·다시 받기로 메워져 두 사본과 서버가 같다. 서버가 그 구간을 더
   들고 있지 않으면 스냅샷으로 다시 맞춘다. 서버를 껐다가(저장) 이어 시작해도, 꺼진 동안 쓴 것까지 다시 보내져 같아진다.
+  다시 받을 수 없는 빈칸: 보낸 쪽이 죽으면 서버가 건너뛰고 그 뒤 것을 적용한다 (잃은 변경 1). 건너뛴 뒤 늦게 온 파임은 적용, add는 버림.
+  메아리를 기다리는 것의 상한을 넘어 버린 소유 영역 쓰기는 서버가 건너뛰고 영역을 통째로 다시 받아 맞춘다.
 """
 import json
 import shutil
@@ -146,6 +148,7 @@ def main():
     base_files()
     losses()
     restart()
+    unrecoverable()
 
 
 def server(*args):
@@ -254,6 +257,94 @@ def restart():
         proc.terminate()
         proc.wait(timeout=10)
         shutil.rmtree(tmp)
+
+
+def unrecoverable():
+    """12 ~ 14. 다시 받을 수 없는 빈칸 (서버 건너뛰기 1 s)."""
+    from sim.map_client import RemoteMap
+    proc = server("--gap-giveup", "1.0")
+    try:
+        rng = np.random.default_rng(11)
+        base = rng.uniform(-0.02, 0.02, (300, 420))
+        obs = None
+        a = RemoteMap(base, (-0.2, 0.2), name="a")
+        obs = RemoteMap(None, name="observer")
+        blk = lambda r0, c0, d: base[r0:r0 + 10, c0:c0 + 10] - d   # noqa: E731
+
+        # 12. A가 보낸 것 하나가 사라진 뒤 A가 죽는다 (다시 보낼 쪽이 없다) -> 서버가 건너뛰고 그 뒤 것을 적용
+        a.write("dig", "w", 10, 10, blk(10, 10, 0.01))
+        a.drop = (1.0, 0.0)
+        a.write("dig", "w", 50, 50, blk(50, 50, 0.02))             # 사라짐
+        a.drop = (0.0, 0.0)
+        a.unacked.pop(a.seq)                                       # 다시 보낼 수 없음 (죽은 것과 같다)
+        a.write("dig", "w", 90, 90, blk(90, 90, 0.03))
+        a.write("dig", "w", 130, 130, blk(130, 130, 0.04))
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 10 and (obs.local.version < 3 or a.info["gaps"]["lost"].get("a", 0) < 1):
+            obs.poll(), a.poll()
+            time.sleep(0.02)
+        h = obs.compose(0, 300, 0, 420)
+        assert np.allclose(h[90:100, 90:100], blk(90, 90, 0.03)) and np.allclose(h[130:140, 130:140], blk(130, 130, 0.04))
+        assert np.array_equal(h[50:60, 50:60], base[50:60, 50:60]), "잃은 파임이 들어가 있다"
+        au_o = obs.audit()
+        lost = au_o["gaps"]["server_lost"]["a"]
+        assert au_o["hash_mismatch"] == 0 and lost["lost"] == 1, au_o
+        au_a = a.audit()
+        assert au_a.get("hash_mismatch", 0) >= 1, au_a              # A의 사본에는 잃은 파임이 있다: 감사가 드러낸다
+        print(f"test_skip_dead_sender: OK ({time.monotonic() - t0:.1f} s 뒤 건너뜀, 잃은 변경 {lost['lost']}, 관찰자 = 서버, "
+              f"A 사본 불일치 타일 {au_a['mismatched_tiles']})")
+        a.close()
+
+        # 13. 건너뛴 뒤에 늦게 온다: 파임은 적용 (min, 순서와 무관), add는 버림 (순서가 결과를 바꿈)
+        b = RemoteMap(base, (-0.2, 0.2), name="b")
+        b.drop = (1.0, 0.0)
+        b.write("dig", "w", 50, 200, blk(50, 200, 0.05))
+        late_dig = b.unacked.pop(b.seq)[0]
+        b.write("add", "op", 100, 200, np.full((10, 10), 0.03))
+        late_add = b.unacked.pop(b.seq)[0]
+        b.drop = (0.0, 0.0)
+        b.write("dig", "w", 150, 200, blk(150, 200, 0.01))
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 10 and b.info["gaps"]["lost"].get("b", 0) == 0:
+            b.poll(), obs.poll()
+            time.sleep(0.02)
+        pump([b, obs], 0.5)
+        for d in (late_dig, late_add):                             # 이제야 도착
+            b.pub.publish(b._String(data=d))
+        pump([b, obs], 1.0)
+        au_o = obs.audit()
+        lb = au_o["gaps"]["server_lost"]["b"]
+        h = obs.compose(0, 300, 0, 420)
+        assert lb["late_dig"] == 1 and lb["late_dropped"] == 1 and lb["lost"] == 1, lb
+        assert np.allclose(h[50:60, 200:210], blk(50, 200, 0.05)) and np.array_equal(h[100:110, 200:210], base[100:110, 200:210])
+        assert au_o["hash_mismatch"] == 0, au_o
+        print(f"test_late_after_skip: OK (늦게 온 파임 적용 {lb['late_dig']}, 늦게 온 add 버림 {lb['late_dropped']}, 잃은 변경 {lb['lost']})")
+        b.close()
+
+        # 14. 메아리를 기다리는 것의 상한(2)을 넘어 소유 영역 쓰기 2개를 다시 보낼 수 없다 -> 건너뛰고 영역을 통째로 다시 받는다
+        c = RemoteMap(base, (-0.2, 0.2), name="c", unacked_max=2)
+        c.set_owner(200, 300, 0, 200, "c_scm")
+        pump([c, obs], 0.3)
+        c.drop = (1.0, 0.0)
+        for _ in range(4):
+            c.write_cells("own", "c_scm", rng.integers(200, 300, 30), rng.integers(0, 200, 30), rng.uniform(-0.1, 0.05, 30))
+        c.drop = (0.0, 0.0)
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 10 and c.stats["refreshed"] == 0:
+            c.poll(), obs.poll()
+            time.sleep(0.02)
+        au_c = c.audit()
+        lc = au_c["gaps"]["server_lost"]["c"]
+        assert c.stats["evicted"] == 2 and c.stats["refreshed"] == 1 and lc["lost"] == 2 and lc["refresh"] == 1, (c.stats, lc)
+        assert au_c["hash_mismatch"] == 0, au_c                     # 잃은 2개가 있어도 영역을 통째로 받아 맞다
+        assert obs.audit()["hash_mismatch"] == 0 and np.array_equal(obs.compose(200, 300, 0, 200), c.compose(200, 300, 0, 200))
+        print(f"test_owned_refresh: OK (상한으로 버림 {c.stats['evicted']}, 서버가 건너뜀 {lc['lost']}, 영역 다시 보냄 {c.stats['refreshed']}, "
+              f"건너뛴 뒤 {time.monotonic() - t0:.1f} s 안에 불일치 0)")
+        c.close()
+        obs.close()
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
 
 
 def base_files():

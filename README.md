@@ -2073,7 +2073,8 @@ python -m sim.rt_link scenarios/flat_trot.yaml --brain ros --remote-brain --ros-
      2c (2026-10-25): 바탕 파일 `python -m sim.map_base build|verify` (타일 + 매니페스트 해시), 서버 `--base`, init은 타일 해시만
      (1.7 MB -> 874 바이트), `--map-base <폴더>` (미리 만든 바탕, 시작 지형과 다르면 시작하지 않음).
      2d (2026-10-25): `seq` 빈칸 다시 보내기·다시 받기 (10% 일부러 버려도 같아짐), 스냅샷으로 다시 맞추기, 서버 `--save-dir`·`--resume`,
-     시뮬레이터 `--map-save` (끝난 지도를 실행 폴더 `map_state/`에), MOP `map_seq_gaps`, `map_gap_delay_max_ms`. 2단계 끝.
+     시뮬레이터 `--map-save` (끝난 지도를 실행 폴더 `map_state/`에), MOP `map_seq_gaps`, `map_gap_delay_max_ms`, `map_lost_changes`. 다시 받을 수 없는 빈칸은 서버가 5 s 뒤 건너뛴다 (늦게 온 파임은 적용,
+     소유 영역은 통째로 다시 받음). 2단계 끝.
      다음: 3단계 (Chrono를 별도 클라이언트로, 운용자 편집, 렌더러를 맵 클라이언트로).
   4. **타당성 확인**: 지금 결과는 모두 단일 SCM과의 일관성이다. 실제 흙과 비교하려면 판 재하 시험이나 반복 주행 시험의 실측 자료와
      그에 맞춘 흙 매개변수가 필요하다. 자료를 구하는 것부터 정한다.
