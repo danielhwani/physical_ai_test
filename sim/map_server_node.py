@@ -1,9 +1,11 @@
 """맵 서버 프로세스 (docs/map_server.md 2단계). ROS2 노드 안에 sim/map_server.py의 MapServer를 들고, 클라이언트(sim/map_client.py)가
 보낸 변경을 같은 규칙으로 적용해 판을 매기고 다른 클라이언트에 다시 내보낸다. 메시지 규약은 sim/map_client.py 첫머리.
 
-    python -m sim.map_server_node [--base build/maps/<이름>] [--save-dir DIR] [--resume DIR]
+    python -m sim.map_server_node [--base build/maps/<이름>] [--save-dir DIR] [--resume DIR] [--tcp-port 0]
         (sim.runner / sim.rt_link --map-server가 띄운다. 이 PC 안에서만, 같은 ROS_DOMAIN_ID)
 
+  전송: ROS2 토픽과 TCP 입구(127.0.0.1 전용, 3c) 둘 다. TCP는 ROS2가 없는 클라이언트(예: Chrono 프로세스, Python 3.12)가 같은 JSON
+        규약을 한 줄씩 주고받는다 (sim/map_transport.py). 포트는 /map/info의 tcp_port (기본: OS가 고른 빈 포트).
   시작: --base가 있으면 바탕 파일(sim/map_base.py)을 읽고 해시를 확인해 바로 지도를 만든다 (2c). 없으면 첫 init의 바탕 격자로 만든다.
         --resume DIR: 저장한 상태(DIR/state.json)에서 이어 시작한다 (판, n, 클라이언트별 seq까지. 서버를 다시 띄워도 클라이언트가 이어 간다).
   init: 클라이언트는 타일 해시를 보낸다 (지도가 아직 없을 때만 격자도). 타일마다 대조해 다 같으면 붙이고, 다르면 그 타일들을 적어 거부한다.
@@ -23,7 +25,9 @@
 import argparse
 import collections
 import json
+import select
 import signal
+import socket
 import time
 from pathlib import Path
 
@@ -42,9 +46,22 @@ EDITS_KEPT = 1000     # rebase용으로 들고 있는 최근 편집 수 (편집�
 GIVEUP_S = 5.0        # 이만큼 안 메워지는 빈칸은 건너뛴다 (보낸 쪽이 죽었거나 그 메시지를 더 들고 있지 않다)
 
 
+class _Msg:
+    """TCP로 온 메시지를 ROS2 메시지처럼 (on_write, on_request는 .data만 본다)."""
+    def __init__(self, data):
+        self.data = data
+
+
 class MapServerNode:
-    def __init__(self, base=None, save_dir=None, resume=None, ring=RING, giveup=GIVEUP_S):
+    def __init__(self, base=None, save_dir=None, resume=None, ring=RING, giveup=GIVEUP_S, tcp_port=0):
         self.node = rclpy.create_node("map_server")
+        self.tcp, self.tcp_clients, self.last_info = None, {}, None   # TCP 입구 (127.0.0.1 전용), 연결 -> 받던 중인 바이트, 마지막 알림
+        if tcp_port >= 0:                                           # ROS2가 없는 클라이언트용 (Chrono 프로세스 등, sim/map_transport.py)
+            self.tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.tcp.bind(("127.0.0.1", tcp_port))                  # 이 PC 안에서만 (0이면 빈 포트를 OS가 고른다: /map/info의 tcp_port)
+            self.tcp.listen(16)
+            self.tcp.setblocking(False)
         rel = QoSProfile(depth=10000, reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST)
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE)
         self.pub_up = self.node.create_publisher(String, "/map/updates", rel)
@@ -116,11 +133,12 @@ class MapServerNode:
         info = {"format": FORMAT, "rules": RULES, "dropped_before_init": self.dropped, "gaps": gaps,
                 "rebased": {k: v for k, v in self.rebase_stats.items() if k != "by"},
                 "writers": self.seq, "base_sha256": self.base_hash, "joined": self.joined, "refused": self.refused,
-                "inits": self.inits, "n": self.n, "map_name": self.map_name, "base_path": self.base_path}
+                "inits": self.inits, "n": self.n, "map_name": self.map_name, "base_path": self.base_path,
+                "tcp_port": None if self.tcp is None else self.tcp.getsockname()[1]}
         if s is not None:
             info.update(tile=s.tile, grid=[s.nrow, s.ncol], z_range=[s.z_min, s.z_max], version=s.version,
                         owners=[list(o) for o in s.owners])
-        self.pub_info.publish(String(data=json.dumps(info)))
+        self.out("i", json.dumps(info))
 
     def on_write(self, msg):
         m = json.loads(msg.data)
@@ -207,7 +225,7 @@ class MapServerNode:
         if skipped:
             self.node.get_logger().warn(f"빈칸 건너뜀: {sender} seq {skipped} ({self.giveup} s 동안 안 옴)")
             if sender in self.owner_clients:
-                self.pub_reply.publish(String(data=json.dumps({"type": "refresh_owned", "client": sender})))
+                self.out("p", json.dumps({"type": "refresh_owned", "client": sender}))
                 self._count(sender, "refresh")
             self.publish_info()
 
@@ -216,7 +234,7 @@ class MapServerNode:
         if not held:
             return
         r = {"type": "resend", "client": sender, "from": self.seq.get(sender, 0) + 1, "to": min(held) - 1}   # 첫 빈칸 (메워지면 다음 것)
-        self.pub_reply.publish(String(data=json.dumps(r)))
+        self.out("p", json.dumps(r))
 
     def accept(self, sender, m, late=False, keep_seq=False):
         """seq 순서대로 온 변경 하나: 적용하고 번호를 매겨 내보낸다. late: 빈칸 때문에 늦게 적용 (빠졌던 것, 그 뒤에 기다린 것).
@@ -242,7 +260,7 @@ class MapServerNode:
             self.edits.append((self.n, sender, msg_edit(m)))
         data = json.dumps(m)
         self.ring.append((self.n, data))
-        self.pub_up.publish(String(data=data))
+        self.out("u", data)
         if m["type"] == "owner":
             self.publish_info()
 
@@ -281,7 +299,7 @@ class MapServerNode:
 
     def on_request(self, msg):
         m = json.loads(msg.data)
-        reply = lambda r: self.pub_reply.publish(String(data=json.dumps(dict(r, client=m["client"], id=m.get("id")))))  # noqa: E731
+        reply = lambda r: self.out("p", json.dumps(dict(r, client=m["client"], id=m.get("id"))))  # noqa: E731
         if m["type"] == "audit":
             reply({"type": "audit", "version": None if self.server is None else self.server.version, "n": self.n,
                    "seq": self.seq, "hashes": {} if self.server is None else tile_hashes(self.server), "gaps": self.gap_stats(),
@@ -320,10 +338,66 @@ class MapServerNode:
         self.node.get_logger().info(f"저장: {out} (판 {s.version}, n {self.n})")
         return str(out)
 
+    # ---- 내보내기: ROS2 토픽과 TCP 클라이언트에 같은 메시지 ----
+    def out(self, kind, data):
+        {"u": self.pub_up, "p": self.pub_reply, "i": self.pub_info}[kind].publish(String(data=data))
+        if kind == "i":
+            self.last_info = data
+        if self.tcp_clients:
+            line = (json.dumps({"t": kind, "d": data}, separators=(",", ":")) + "\n").encode()
+            for c in list(self.tcp_clients):
+                self._tcp_send(c, line)
+
+    def _tcp_send(self, c, line):
+        try:
+            c.setblocking(True)
+            c.settimeout(5.0)                                       # 느린 클라이언트가 서버를 오래 멈추지 않게
+            c.sendall(line)
+            c.setblocking(False)
+        except OSError:
+            self._tcp_drop(c)
+
+    def _tcp_drop(self, c):
+        self.tcp_clients.pop(c, None)
+        c.close()
+
+    def tcp_step(self, timeout):
+        """TCP 입구: 새 연결 받기 (지금 알림을 바로 보낸다), 받은 줄을 ROS2로 온 것과 같은 처리로."""
+        if self.tcp is None:
+            return
+        socks = [self.tcp] + list(self.tcp_clients)
+        ready = select.select(socks, [], [], timeout)[0]
+        for r in ready:
+            if r is self.tcp:
+                c, _ = self.tcp.accept()
+                c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                c.setblocking(False)
+                self.tcp_clients[c] = b""
+                if self.last_info is not None:
+                    self._tcp_send(c, (json.dumps({"t": "i", "d": self.last_info}, separators=(",", ":")) + "\n").encode())
+                continue
+            try:
+                chunk = r.recv(1 << 20)
+            except BlockingIOError:
+                continue
+            except OSError:
+                chunk = b""
+            if not chunk:
+                self._tcp_drop(r)
+                continue
+            *lines, rest = (self.tcp_clients[r] + chunk).split(b"\n")
+            self.tcp_clients[r] = rest
+            for ln in lines:
+                if not ln:
+                    continue
+                m = json.loads(ln)
+                (self.on_write if m["t"] == "w" else self.on_request)(_Msg(m["d"]))
+
     def spin(self):
         last_info = last_resend = 0.0
         while rclpy.ok():
-            rclpy.spin_once(self.node, timeout_sec=0.1)
+            rclpy.spin_once(self.node, timeout_sec=0.002 if self.tcp is not None else 0.1)
+            self.tcp_step(0.002)
             now = time.monotonic()
             if now - last_resend > RESEND_S:                       # 아직 안 메워진 빈칸을 다시 달라고, 너무 오래된 것은 건너뛴다
                 for c in list(self.gap_since):
@@ -342,10 +416,12 @@ def main():
     ap.add_argument("--resume", help="저장한 상태(state.json이 있는 폴더)에서 이어 시작")
     ap.add_argument("--ring", type=int, default=RING, help="다시 보내 줄 수 있게 들고 있는 변경 수 (시험용으로 줄임)")
     ap.add_argument("--gap-giveup", type=float, default=GIVEUP_S, help="이만큼(s) 안 메워지는 빈칸은 건너뛴다")
+    ap.add_argument("--tcp-port", type=int, default=0,
+                    help="TCP 입구 (127.0.0.1, ROS2가 없는 클라이언트용). 0: 빈 포트 (/map/info의 tcp_port), 음수: 끔")
     a = ap.parse_args()
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))   # terminate()에도 저장하고 끝내게
     rclpy.init()
-    n = MapServerNode(base=a.base, save_dir=a.save_dir, resume=a.resume, ring=a.ring, giveup=a.gap_giveup)
+    n = MapServerNode(base=a.base, save_dir=a.save_dir, resume=a.resume, ring=a.ring, giveup=a.gap_giveup, tcp_port=a.tcp_port)
     try:
         n.spin()
     except (KeyboardInterrupt, ExternalShutdownException):

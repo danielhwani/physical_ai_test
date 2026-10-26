@@ -65,9 +65,21 @@ class ChronoLink:
         hx, hy = scm["size"][0] / 2, scm["size"][1] / 2
         region = (np.abs(terrain.X - scm["center"][0]) <= hx) & (np.abs(terrain.Y - scm["center"][1]) <= hy)
         assert np.all(terrain.target[region] == 0.0), "SCM 영역의 기본 지형은 평평(높이 0)해야 한다"
-        if terrain.server is not None:                  # 맵 서버: SCM 패치 = Chrono 소유 영역 (docs/map_server.md 5.7)
-            rr, cc = np.nonzero(region)
-            terrain.server.set_owner(int(rr.min()), int(rr.max()) + 1, int(cc.min()), int(cc.max()) + 1, "chrono")
+        rr, cc = np.nonzero(region)
+        owner = [int(rr.min()), int(rr.max()) + 1, int(cc.min()), int(cc.max()) + 1]
+        self.map_name = None
+        send_cfg = cfg
+        if terrain.server is not None and hasattr(terrain.server, "hold"):
+            # 별도 프로세스 맵 서버 (3c): Chrono가 TCP 입구로 SCM 영역의 소유자로 직접 쓴다. 러너는 그 변경을 붙잡아 두었다가 교환 시각에 넣는다
+            self.map_name = f"chrono_{os.getpid()}"
+            terrain.server.hold(self.map_name)
+            terrain.server.no_log.add(self.map_name)
+            port = terrain.server.info.get("tcp_port")
+            assert port, "맵 서버에 TCP 입구가 없다 (sim.map_server_node --tcp-port)"
+            send_cfg = dict(cfg, map={"tcp": f"127.0.0.1:{port}", "name": self.map_name, "writer": "chrono", "owner": owner,
+                                      "r0": self.r0, "c0": self.c0})
+        elif terrain.server is not None:                # 같은 프로세스 맵 서버: SCM 패치 = Chrono 소유 영역 (docs/map_server.md 5.7)
+            terrain.server.set_owner(*owner, "chrono")
 
         log_path.parent.mkdir(parents=True, exist_ok=True)
         self.sock, child = socket.socketpair()
@@ -80,11 +92,13 @@ class ChronoLink:
 
         self.log_path = log_path
         try:
-            wire.send(self.sock, {"cmd": "init", "config": cfg})
+            wire.send(self.sock, {"cmd": "init", "config": send_cfg})
             info = wire.recv(self.sock)
         except ConnectionError:
             tail = "".join(open(log_path).readlines()[-5:])
             raise RuntimeError(f"Chrono 서버 시작 실패 (로그 {log_path}):\n{tail}") from None
+        if self.map_name is not None:                   # 소유 영역 선언을 지금 넣는다 (예전에 여기서 set_owner하던 것과 같게)
+            terrain.release_partner(self.map_name, info["map_seq"], bump=False)   # set_owner는 판을 올리지 않았다
         self.bodies = info["bodies"]
         self.names = [b["name"] for b in self.bodies]
         wire.send(self.sock, {"cmd": "advance", "t": 0.0, "terrain": False})
@@ -137,7 +151,9 @@ class ChronoLink:
         self.vehicle = r["vehicle"]
         self.foot_state = r.get("feet", [])
         tr = r["terrain"]
-        if tr:
+        if tr and "map_seq" in tr:                      # Chrono가 맵 서버에 썼다: 그 seq까지 받아 넣는다 (예전 set_cells 자리)
+            self.terrain.release_partner(self.map_name, tr["map_seq"])
+        elif tr:
             i = np.frombuffer(wire.unb64(tr["i"]), "<i4")
             j = np.frombuffer(wire.unb64(tr["j"]), "<i4")
             h = np.frombuffer(wire.unb64(tr["h"]), "<f4").astype(float)

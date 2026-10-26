@@ -34,6 +34,8 @@ class TerrainMapService:
         self.applied_version = 0    # 물리엔진 반영(applied)이 바뀔 때 증가 (렌더러 갱신 기준)
         self.received = 0           # 받은 다른 쪽 변경 수 (운용자 편집 등: 맵 서버에서 받았거나 재현 시나리오의 map_write)
         self.received_mask = None   # 그 변경이 닿은 칸 (변형 MOP에서 뺀다: 흙 변형과 섞이지 않게)
+        self.unrecorded = []        # 받아 넣었지만 아직 재현 시나리오에 안 적은 다른 쪽 변경 (release_partner 중에 들어온 것)
+        self.partner_wait = []      # release_partner가 같이 도는 물리엔진의 변경을 기다린 시간 (s)
 
         # MuJoCo heightfield 창 (window=None이면 세계 지도 전체 = 예전 방식)
         wx, wy = window if window is not None else size
@@ -120,6 +122,22 @@ class TerrainMapService:
         self.target = self.server.compose(0, self.nrow, 0, self.ncol)
         self.version += max(len(got), 1)            # 받은 변경마다 하나 (재현 시나리오에서 map_write 이벤트마다 하나씩 올리는 것과 같게)
         self._cand = None
+        return got
+
+    def release_partner(self, name, seq, bump=True):
+        """같이 도는 물리엔진(Chrono, 맵 서버 소유자로 직접 씀: 3c)의 변경을 seq까지 넣는다. 예전에 그 결과를 set_cells로 넣던 바로 그
+        자리에서 부른다 (같은 시각, 같은 값). 서버 번호 순서상 그 앞에 있던 다른 쪽 변경도 함께 들어가고, 재현 시나리오에 적으려고 남긴다."""
+        self.partner_wait.append(self.server.release(name, seq))
+        got, self.server.applied_log = self.server.applied_log, []
+        for m in got:
+            self._mark_received(m)
+        self.unrecorded += got
+        self.target = self.server.compose(0, self.nrow, 0, self.ncol)
+        self.version += int(bump) + len(got)       # set_cells 한 번 + 받은 변경마다 하나 (예전과 재현 시나리오와 같게)
+        self._cand = None
+
+    def take_unrecorded(self):
+        got, self.unrecorded = self.unrecorded, []
         return got
 
     def apply_map_message(self, m):

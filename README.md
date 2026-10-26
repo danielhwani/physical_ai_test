@@ -47,6 +47,7 @@ python conformance/test_map_remote.py                    # 맵 서버 2단계: �
 python conformance/test_map_base.py                      # 맵 서버 2c: 바탕 파일 (쓰고 읽기, 고친 타일 찾기, 시나리오 바탕 = 시작 지형)
 python conformance/test_map_edit.py                      # 맵 서버 3a: 실행 중 운용자 편집이 물리에 들어가고, 재현 시나리오가 비트 동일 (약 40초)
 python conformance/test_map_render.py                    # 맵 서버 3b: 변경 700개 뒤에 붙은 렌더러 (패치 토픽은 틀리고, 맵 서버는 같음)
+python conformance/test_map_chrono.py                    # 맵 서버 3c: TCP 입구, ROS2 없는 클라이언트, Chrono 소유자 비트 동일 (약 1분)
 python conformance/compare_variants.py [--policy card.yaml]   # cpu vs mjx 설정의 MOP 분포 비교
 python conformance/probe_scm_injection.py [--record build/scm_press.npz] [--plot PNG]   # SCM에 바깥 높이 넣기: 접촉은 따라가고 다짐 이력은 안 넘어감 (docs/map_server.md 5.5). 어느 환경이든: chrono 환경으로 다시 실행
 python conformance/probe_scm_compaction.py [--record build/scm_compaction.npz]   # 다짐 -> 단단한 흙 콜백: kphi ×25로 다짐 흉내 (약 1분)
@@ -620,6 +621,50 @@ python conformance/test_cosim.py                                   # 연동 시�
 python -m sim.runner scenarios/footprints.yaml --set chrono.scm.soil.bekker_kphi=2e7   # 값 바꿔 실행
 python -m sim.sweep scenarios/footprints.yaml --param chrono.scm.soil.bekker_kphi --values 2e6 1e7 5e7   # 스윕 비교표
 ```
+
+**맵 서버와 Chrono: 지형을 누가 쓰나** (2026-10-26, 맵 서버 3단계 3c. 자세한 것은 [`docs/map_server.md`](docs/map_server.md) 8절 "3c 결과")
+
+`--map-server`로 돌리면 **지형을 쓰는 권한이 시뮬레이터에서 Chrono로 옮겨 간다.** 물리 결과는 예전과 비트 단위로 같고, 바뀐 것은 지형이
+가는 길이다. 이 구조가 4단계(물리 프로세스 여럿)의 바탕이다.
+
+```
+3c 전:  Chrono ──(소켓: 바뀐 흙 노드)──▶ 시뮬레이터 ──(쓰기, 쓴 쪽 "sim")──▶ 맵 서버 ──▶ 다른 클라이언트
+3c 후:  Chrono ──(TCP 입구: SCM 영역의 소유자로 직접 쓰기)──────────────▶ 맵 서버 ──▶ 시뮬레이터, 렌더러, 관찰자
+        Chrono ──(소켓: 시각 맞추기, 차량 포즈, "어디까지 썼다")──▶ 시뮬레이터
+```
+- Chrono는 원래도 별도 프로세스(`chrono` 환경, Python 3.12)였지만 지형은 시뮬레이터를 거쳐 갔다. 이제는 Chrono가 SCM 영역의 소유 선언과
+  쓰기를 직접 하고(맵 서버 기록에 `chrono/own`, `chrono/set`), 시뮬레이터는 운용자 편집·렌더러처럼 서버에서 **받는 쪽**이다.
+- Chrono 환경은 ROS2(Humble, Python 3.10)를 쓸 수 없어서 맵 서버에 **TCP 입구**(127.0.0.1 전용, 같은 JSON 규약)를 두었다. ROS2 없는 다른
+  엔진(게임 엔진, 다른 PC의 도구)도 같은 길로 붙을 수 있다.
+- 그대로인 것: Chrono는 여전히 시뮬레이터가 띄우고, 시각 맞추기(0.04 s)와 차량 포즈는 소켓으로 간다. 시뮬레이터는 Chrono의 지형 변경을
+  붙잡아 두었다가 예전과 같은 교환 시각에 받아 넣는다 (그래서 물리가 보는 시각과 값이 같다. 기다린 시간은 MOP `map_partner_wait_max_ms`,
+  수 ms). Chrono 변경은 재현 시나리오와 받은 변경 MOP에 넣지 않는다 (물리를 다시 돌리면 다시 나온다).
+- **의미**: 예를 들어 HMMWV 두 대를 서로 다른 Chrono 프로세스로, 로봇을 또 다른 프로세스로 돌릴 때, 예전 구조면 모든 지형이 시뮬레이터
+  하나를 거친다 (병목이자 단일 고장점). 이제는 물리 엔진마다 자기 영역을 지도 하나에 직접 쓰고, 다른 프로세스는 그 지도에서 모두의 자국을
+  받는다 ("물리 엔진마다 자기 땅의 주인, 지도는 하나").
+- **아직 반쪽**: Chrono는 지도에 쓰기만 하고, 다른 쪽 변경(운용자 편집, 다른 차량 자국)을 자기 흙(SCM)에 넣지는 못한다 (사본은 받지만 SCM은
+  모른다: 설계 9절). 그래서 SCM 영역에 편집을 넣으면 다음 Chrono 쓰기가 덮는다. 두 Chrono가 서로의 자국을 밟으려면 이것이 필요하다
+  (높이 넣기는 확인함, 남은 것은 다짐 상태 전달: 아래 "맵 서버와 SCM 다짐 전달").
+- 확인: `python -m sim.runner scenarios/vehicle_crossing.yaml --map-server` (MOP `map_partner_wait_max_ms`, `map_received_changes 0`,
+  실행 폴더 `map_updates.json`의 `counts`가 `chrono/own`, `chrono/set`), `python conformance/test_map_chrono.py`.
+
+**로봇 발자국은 두 가지** (2026-10-26 정리). 시나리오에 따라 계산하는 곳과 지도에 들어가는지가 다르다.
+
+| | Chrono 발자국 | 차량 바퀴 자국 | MuJoCo 안 무른 흙 |
+|---|---|---|---|
+| 시나리오 | `footprints`, `footprints_free`, `dis_footprints` (`chrono.robot_feet`) | `vehicle_crossing` 등 (`chrono.vehicle`) | `soil_strip` (`foot_soil`) |
+| 계산 프로세스 | Chrono (별도, 차량과 같은 SCM) | Chrono (별도) | 시뮬레이터 안 (`sim/foot_soil.py`) |
+| 입력 | 시뮬레이터가 0.04 s마다 보낸 발 위치·수직 하중 | Chrono 안의 차량 | 시뮬레이터 안 |
+| 로봇에 돌아오는 것 | 패인 모양 (한 방향: 흙의 힘은 안 옴) | 패인 모양 | 힘 (양방향: 침하, 마찰, 쟁기질, CoT에 드러남) |
+| 패인 모양이 가는 곳 | 물리 지형 -> 맵 서버 (3c부터 Chrono가 직접) | 같음 | 자기 1 cm 침하 지도 + 화면 표시 깊이(`/sim/terrain_overlay`)만 |
+| 맵 서버에 있나 | 있음 | 있음 | 없음 (물리 지형, LiDAR, 지도에 안 들어감) |
+
+- Chrono 발자국은 흙 계산과 지형 쓰기가 Chrono 프로세스이고, 발 하중만 시뮬레이터가 보내는 입력이다 (차량 자국은 입력까지 Chrono 쪽).
+- MuJoCo 안 무른 흙은 흙이 로봇을 받치는 힘을 물리 스텝마다(1 ~ 2 ms) 돌려줘야 하는 양방향이라 별도 프로세스로 떼어 내기 어렵다 (매 스텝
+  주고받으면 느리고 실시간을 지키기 어렵다: 아래 "무른 흙과 로봇 발의 쌍방향 상호작용"에서 A를 고른 이유). Chrono 발자국은 한 방향이라
+  0.04 s 교환으로 된다. 무른 흙 자체는 "무른 흙과 로봇 발 (`foot_soil`)" 절.
+- 그래서 무른 흙 발자국은 맵 서버 밖이다. 다른 PC의 렌더러나 다른 물리 프로세스는 지도로 볼 수 없고 (Godot에 보이는 것은 시뮬레이터
+  화면 스트림이라서), 지도에서 나누려면 흙 모듈이 자기 층으로 써야 한다 (설계 5단계의 `soil_holes` 층).
 
 - **역할 분담**: Chrono = SCM 변형 지면 (+ 선택적으로 HMMWV, 로봇 발자국), MuJoCo = Go2. 로봇과 HMMWV 사이 물리 작용은 없고,
   근접은 논리 이벤트(`vehicle_near`, MOP `min_vehicle_distance_m`)로만 판정한다 (문서 §5.4).
@@ -2110,7 +2155,9 @@ python -m sim.rt_link scenarios/flat_trot.yaml --brain ros --remote-brain --ros-
      (rebase: 버리지 않음).
      3b (2026-10-26): Godot 렌더러가 지형을 맵 서버에서 받는다 (`--map-server --godot`, 또는 시뮬레이터를 `--map-server --ros2`로
      띄우고 나중에 `python -m viz.godot_launch`: 맵 서버가 있으면 스스로 거기서 받는다). 실행 중 언제 붙어도 같은 지형. 시뮬레이터 스트림이 없으면 Godot 정보판에
-     WAITING FOR SIMULATOR. 다음: 3c (Chrono를 별도 클라이언트로).
+     WAITING FOR SIMULATOR.
+     3c (2026-10-26): 맵 서버 TCP 입구 (127.0.0.1, ROS2 없는 클라이언트용). `--map-server`면 Chrono 프로세스(Python 3.12)가 SCM 영역의
+     소유자로 맵 서버에 직접 쓰고, 시뮬레이터는 교환 시각에 받아 넣는다 (2단계와 비트 동일). 3단계 끝. 다음: 4단계 (물리 프로세스 여럿).
   4. **타당성 확인**: 지금 결과는 모두 단일 SCM과의 일관성이다. 실제 흙과 비교하려면 판 재하 시험이나 반복 주행 시험의 실측 자료와
      그에 맞춘 흙 매개변수가 필요하다. 자료를 구하는 것부터 정한다.
 - 급하지 않은 것: Godot에 한글 글꼴 넣기 (지금 화면 글자는 영어와 숫자만), 다른 PC 두뇌 + 지형 인지 실시간 실행의 결과 흔들림

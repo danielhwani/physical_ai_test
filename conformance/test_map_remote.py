@@ -323,7 +323,7 @@ def unrecoverable():
             time.sleep(0.02)
         pump([b, obs], 0.5)
         for d in (late_dig, late_add):                             # 이제야 도착
-            b.pub.publish(b._String(data=d))
+            b.tx.send_write(d)
         pump([b, obs], 1.0)
         au_o = obs.audit()
         lb = au_o["gaps"]["server_lost"]["b"]

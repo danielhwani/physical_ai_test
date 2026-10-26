@@ -6,13 +6,19 @@
 로봇의 동역학은 모른다: 발자국은 러너가 보낸 발 위치와 수직 하중으로만 계산한다.
 러너가 정한 시각까지 진행한 뒤 차량 바디 포즈와 지형 높이 변경분을 돌려준다.
 
+맵 서버 소유자 (docs/map_server.md 3단계 3c): config에 "map"이 있으면 맵 서버의 TCP 입구에 직접 붙어(ROS2 없이, sim/map_transport.py)
+SCM 영역의 소유자로 쓴다. 지형 변경분을 응답에 싣지 않고 맵 서버에 쓰고 응답에는 어디까지 썼는지(map_seq)만 싣는다. 러너는 교환 시각에
+그 seq까지를 맵 서버에서 받아 넣는다 (예전 응답과 같은 시각, 같은 값).
+  map: {"tcp": "127.0.0.1:포트", "name": 클라이언트 이름, "writer": "chrono", "owner": [r0, r1, c0, c1], "r0", "c0": SCM 중심 칸}
+
 요청/응답 (cosim/wire.py)
-  {"cmd": "init", "config": {...}}            -> {"bodies": [...], "scm": {...}}
+  {"cmd": "init", "config": {...}}            -> {"bodies": [...], "scm": {...}, "map_seq": 소유 영역 선언까지의 seq (맵 서버일 때)}
   {"cmd": "advance", "t": T, "terrain": bool, "feet": [...]|null, "vehicle_cmd": {...}|null, "soil": {...}|null}
       robot_xy: 로봇 몸통 위치 (vehicle.yield_to_robot이면 차 앞 진로에 로봇이 있는 동안 제동하고 기다린다)
       vehicle_cmd: {"action": "start", "speed": m/s|null} 출발 (vehicle.t_start가 null이면 이 명령까지 제동하고 기다린다),
                    {"action": "stop"} 제동. soil: SCM 흙 값 (이번 구간부터)
                                               -> {"t": T, "poses": [...], "vehicle": {...}|null, "feet": [...], "terrain": {...}|null}
+      terrain: 맵 서버가 없으면 바뀐 노드 {"n", "i", "j", "h"}, 있으면 {"n", "map_seq"} (노드는 맵 서버에 썼다)
   {"cmd": "close"}
 """
 import argparse
@@ -73,9 +79,21 @@ class ChronoServer:
                                          chrono.ChVector3d(5, 3, 1))
         self.sent = {}                                  # 마지막으로 보낸 노드 높이
         self.feet = self._init_feet(cfg["robot_feet"]) if cfg.get("robot_feet") else []
-        return {"bodies": self.export_bodies() if self.car is not None else [],
-                "scm": {"center": [cx, cy], "size": scm["size"], "resolution": self.delta},
-                "feet": [f["name"] for f in self.feet]}
+        out = {"bodies": self.export_bodies() if self.car is not None else [],
+               "scm": {"center": [cx, cy], "size": scm["size"], "resolution": self.delta},
+               "feet": [f["name"] for f in self.feet]}
+        self.map = None
+        if cfg.get("map"):                              # 맵 서버의 소유자로 직접 쓴다 (TCP)
+            out["map_seq"] = self._init_map(cfg["map"])
+        return out
+
+    def _init_map(self, mc):
+        sys.path.insert(0, str(self.root))
+        from sim.map_client import RemoteMap            # numpy만 (ROS2 없이 TCP)
+        self.map_cfg = mc
+        self.map = RemoteMap(None, name=mc["name"], tcp=mc["tcp"])
+        self.map.set_owner(*mc["owner"], mc["writer"])  # SCM 영역 = 이 클라이언트의 소유 영역 (O <- 지금 물리 높이)
+        return self.map.seq
 
     def set_soil(self, soil):
         sp = {k: float(v) for k, v in soil.items()}     # YAML은 1.0e6을 문자열로 읽으므로 숫자로 변환
@@ -237,6 +255,8 @@ class ChronoServer:
         if feet:
             for f, tgt in zip(self.feet, feet):
                 f["target"] = tgt
+        if self.map is not None:
+            self.map.poll()                              # 사본을 따라가고, 메아리 없는 것은 다시 보낸다 (기다리지 않음)
         while self.sys.GetChTime() < t_target - 1e-9:
             t = self.sys.GetChTime()
             self._apply_feet()
@@ -266,10 +286,11 @@ class ChronoServer:
             vehicle = {"speed": v.GetSpeed(), "pos": vec(v.GetPos()), "stopped": self.stopped, "yielding": self.yielding}
         return {"t": self.sys.GetChTime(), "poses": poses, "vehicle": vehicle,
                 "feet": [{"z": f["body"].GetPos().z, "loaded": not f["lifted"]} for f in self.feet],
-                "terrain": self.terrain_changes() if want_terrain else None}
+                "terrain": self.terrain_changes(self.sys.GetChTime()) if want_terrain else None}
 
-    def terrain_changes(self):
-        """지난 응답 이후 높이가 바뀐 SCM 노드 (노드 인덱스는 기준 평면 원점 기준, 높이는 평면 기준)."""
+    def terrain_changes(self, t=None):
+        """지난 응답 이후 높이가 바뀐 SCM 노드 (노드 인덱스는 기준 평면 원점 기준, 높이는 평면 기준).
+        맵 서버가 있으면 거기에 쓰고 어디까지 썼는지만 돌려준다."""
         ii, jj, hh = [], [], []
         for node, h in self.terrain.GetModifiedNodes(True):
             key = (node.x, node.y)
@@ -278,8 +299,28 @@ class ChronoServer:
                 ii.append(node.x); jj.append(node.y); hh.append(h)
         if not ii:
             return None
+        if self.map is not None:
+            return {"n": len(ii), "map_seq": self.write_map(np.array(ii, "<i4"), np.array(jj, "<i4"), np.array(hh, "<f4"), t)}
         return {"n": len(ii), "i": wire.b64(np.array(ii, "<i4").tobytes()),
                 "j": wire.b64(np.array(jj, "<i4").tobytes()), "h": wire.b64(np.array(hh, "<f4").tobytes())}
+
+    def write_map(self, i, j, h, t):
+        """러너의 TerrainMapService.set_cells와 같은 규칙으로 맵 서버에 쓴다 (예전에 러너가 이 노드로 하던 것):
+        SCM 노드 (i, j) = 격자 (행 r0 + j, 열 c0 + i). 격자 밖은 버리고, 높이 범위로 자르고, 소유 영역이면 own, 아니면 set."""
+        m, mc = self.map, self.map_cfg
+        rows, cols, h = mc["r0"] + j.astype(int), mc["c0"] + i.astype(int), h.astype(float)
+        ok = (rows >= 0) & (rows < m.local.nrow) & (cols >= 0) & (cols < m.local.ncol)
+        r, c, v = rows[ok], cols[ok], np.clip(h[ok], m.local.z_min, m.local.z_max)
+        own = m.local.owned[r, c]
+        if own.any():
+            m.write_cells("own", mc["writer"], r[own], c[own], v[own], t=t)
+        if (~own).any():
+            m.write_cells("set", mc["writer"], r[~own], c[~own], v[~own], t=t)
+        return m.seq
+
+
+def server_map(server):
+    return getattr(server, "map", None)
 
 
 def main():
@@ -300,6 +341,8 @@ def main():
                                    msg.get("robot_xy"))
         elif msg["cmd"] == "close":
             wire.send(sock, {"busy_s": busy})
+            if server_map(server) is not None:
+                server.map.close()
             break
         else:
             reply = {"error": f"unknown cmd {msg['cmd']}"}

@@ -84,6 +84,8 @@ def terrain_deformation(before, after, threshold=0.005, terrain=None):
            "deform_max_m": round(float(dz.min()), 4) if dug.any() else 0.0}
     if terrain is not None:
         out.update(map_received_changes=terrain.received, map_received_cells=0 if mask is None else int(mask.sum()))
+        if terrain.partner_wait:                    # 같이 도는 물리엔진(Chrono)의 변경이 맵 서버를 거쳐 오기를 기다린 시간 (3c)
+            out["map_partner_wait_max_ms"] = round(1e3 * max(terrain.partner_wait), 2)
     return out
 
 
@@ -438,6 +440,8 @@ class Simulation:
         if self.cosim is not None:
             self.cosim.robot_xy = d.qpos[:2]      # 다음 Chrono 요청에 실림 (차량 양보 판단)
             self.cosim.sync(d.time)              # Chrono 결과 반영 (지형 원천 갱신 + 차량 포즈)
+            for m in self.terrain.take_unrecorded():   # 그때 같이 들어온 다른 쪽 변경 (3c: Chrono가 맵 서버에 직접 쓸 때)
+                self._record_map_write(m, verbose)
             dist = self.cosim.distance_to(d.qpos[:2])
             if dist < self.cosim.near_dist and not self.cosim.near_event_sent:
                 self.cosim.near_event_sent = True

@@ -482,6 +482,8 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
         c = sim.cosim
         c.robot_xy = np.array(base_xy[:2], float)                  # 다음 Chrono 요청에 실림 (차량 양보 판단)
         c.sync(t_now, block=lockstep)                              # 결과 반영 (지형 원천 갱신 + 차량 포즈)
+        for m in sim.terrain.take_unrecorded():                    # 그때 같이 들어온 다른 쪽 변경 (3c, sim.runner와 같다)
+            sim._record_map_write(m, verbose, t=t_now)
         if not lockstep:
             lag = c.lag(t_now)
             chrono_lag[0] = max(chrono_lag[0], lag)
@@ -795,6 +797,8 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
                     dis_srv.after_events()                        # 일시정지 중에도 재개 요청과 주기 보고
                 if chrono_hold["on"]:                              # Chrono 따라잡기 (코어는 멈춰 있다)
                     sim.cosim.sync(sim.data.time, block=False)
+                    for m in sim.terrain.take_unrecorded():
+                        sim._record_map_write(m, verbose, t=sim.data.time)
                     if sim.cosim.lag(sim.data.time) <= chrono_max_lag / 2:
                         chrono_hold["on"] = False
                         chrono_hold["wall"] += time.monotonic() - chrono_hold["since"]

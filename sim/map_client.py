@@ -176,25 +176,13 @@ class RemoteMap:
     base=None: 관찰자 (바탕을 보내지 않고 서버의 지금 지도를 받아 붙는다).
     drop: (보내기, 받기) 일부러 버릴 비율 (빈칸 복구 시험용, 0이면 없음). 버린 것은 다시 보내기·다시 받기로 메워져야 한다."""
 
-    def __init__(self, base, z_range=None, name="sim", wait_s=30.0, drop=(0.0, 0.0), drop_seed=0, unacked_max=UNACKED_MAX):
-        import rclpy
-        import rclpy.executors
-        from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-        from std_msgs.msg import String
-        if not rclpy.ok():
-            rclpy.init()
-        self._String = String
+    def __init__(self, base, z_range=None, name="sim", wait_s=30.0, drop=(0.0, 0.0), drop_seed=0, unacked_max=UNACKED_MAX,
+                 tcp=None):
+        """tcp: "127.0.0.1:포트"면 ROS2 대신 맵 서버의 TCP 입구로 (ROS2가 없는 클라이언트, sim/map_transport.py)."""
+        from .map_transport import RosTransport, TcpTransport
         self.name, self.seq, self.wait_s = name, 0, wait_s
         self.sent = {"init": 0, "owner": 0, "write": 0}              # 보낸 메시지 종류별 수 (write = write + cells, 지도 변경)
-        self.node = rclpy.create_node(f"map_client_{name}")
-        # 자기 실행기: rclpy.spin_once(node)는 전역 실행기라 한 프로세스의 다른 노드(클라이언트 둘, 브리지 등) 콜백도 돌린다
-        self.executor = rclpy.executors.SingleThreadedExecutor()
-        self.executor.add_node(self.node)
-        self.n_cb = 0                                            # 이 노드의 콜백 수 (poll이 더 받을 것이 없을 때까지 돌기 위해)
-        rel = QoSProfile(depth=10000, reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST)
-        latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE)
-        self.pub = self.node.create_publisher(String, "/map/write", rel)
-        self.pub_req = self.node.create_publisher(String, "/map/request", rel)
+        self.n_cb = 0                                            # 받은 콜백 수 (poll이 더 받을 것이 없을 때까지 돌기 위해)
         self.pending = {}                                        # n -> 받은 /map/updates (자기 메아리 포함), n 순서대로 소비
         self.next_n = 1                                          # 다음에 받을 서버 번호 n (그 앞은 사본에 다 들어 있다)
         self.unacked = {}                                        # seq -> [JSON, 보낸 시각]: 메아리가 올 때까지 (다시 보내기)
@@ -203,6 +191,7 @@ class RemoteMap:
         self.inflight = []                                       # 사본에 먼저 넣고 아직 서버 순서로 확인 안 된 자기 편집 [(seq, edit)]
         self.applied_log = []                                    # 사본에 넣은 다른 쪽 변경 (바꾼 뒤): 시뮬레이터가 재현 시나리오에 적는다
         self.keep_applied = False                                # 켜는 쪽(시뮬레이터)만 쌓는다: 관찰자·렌더러가 오래 돌면 메모리가 는다
+        self.no_log = set()                                      # 쌓지 않는 쓴 쪽 (같이 도는 물리엔진 Chrono: 다시 돌리면 다시 나온다)
         self.rebased = {"msgs": 0, "cells": 0}                   # 자기 편집에 맞춰 바꾼 다른 쪽 변경
         self.gap = None                                          # 받는 쪽 빈칸 {"n": 빠진 첫 번호, "since", "asked"} (monotonic)
         self.need_resync = False                                 # 서버가 빈칸 구간을 더 들고 있지 않다 (too_old): 다음 poll에서 스냅샷
@@ -214,11 +203,12 @@ class RemoteMap:
         self.replies, self.info = [], None
         self.req_id = 0                                          # 요청 번호 (이 클라이언트 안에서 계속 증가: 예전 응답을 잘못 집지 않게)
         self.joined = None                                       # 붙는 절차를 썼으면 {"version", "n", "s"}
-        self.sub_up = self.node.create_subscription(String, "/map/updates", self._on_update, rel)   # 붙는 절차 1: 먼저 구독
-        self.node.create_subscription(String, "/map/reply", self._on_reply, rel)
-        self.node.create_subscription(String, "/map/info", self._on_info, latched)
-        self._wait(lambda: self.pub.get_subscription_count() > 0 and self.node.count_publishers("/map/updates") > 0,
-                   no_server_message(wait_s))                     # 안 기다리면 init이 사라진다
+        self.held, self.released, self.applied_seq = set(), {}, {}   # 붙잡아 둔 쓴 쪽, 거기서 풀어 준 seq, 쓴 쪽별 사본에 넣은 마지막 seq
+        if tcp:                                                  # 붙는 절차 1: 받기부터 (먼저 구독)
+            self.tx = TcpTransport(tcp, self._on_update, self._on_reply, self._on_info, connect_s=wait_s)
+        else:
+            self.tx = RosTransport(name, self._on_update, self._on_reply, self._on_info)
+        self._wait(self.tx.ready, no_server_message(wait_s))      # 안 기다리면 init이 사라진다
         if base is None:                                         # 관찰자: 서버에 지도가 있을 때까지
             self._wait(lambda: self.info and "grid" in self.info, "맵 서버에 아직 지도가 없다 (첫 클라이언트의 init 전)")
             # 짧은 init: 같은 이름이 전에 붙었으면 서버의 seq가 남아 있어 이 클라이언트의 쓰기(seq 1부터)를 중복으로 버린다
@@ -260,11 +250,11 @@ class RemoteMap:
         while not cond():
             if time.monotonic() - t0 > self.wait_s:
                 raise RuntimeError(msg)
-            self.executor.spin_once(timeout_sec=0.05)
+            self.tx.spin_once(0.05)
 
     def _publish_req(self, r):
         self.req_id += 1
-        self.pub_req.publish(self._String(data=json.dumps(dict(r, client=self.name, id=self.req_id))))
+        self.tx.send_request(json.dumps(dict(r, client=self.name, id=self.req_id)))
         return self.req_id
 
     def _request(self, kind, timeout=1.0, **extra):
@@ -273,7 +263,7 @@ class RemoteMap:
         t1 = time.monotonic()
         got = None
         while got is None and time.monotonic() - t1 < timeout:
-            self.executor.spin_once(timeout_sec=0.05)
+            self.tx.spin_once(0.05)
             got = next((r for r in self.replies if r.get("id") == k), None)
         self.replies = [r for r in self.replies if r.get("id", 0) > k]   # 이번 것까지 다 본 응답은 버린다
         return got
@@ -327,12 +317,12 @@ class RemoteMap:
             if self.drop[0] and self._rng.random() < self.drop[0]:
                 self.stats["dropped_out"] += 1                   # 시험: 보내지 않음 (서버가 빈칸을 보고 다시 달라거나, 시간이 지나 다시 보냄)
                 return
-        self.pub.publish(self._String(data=data))
+        self.tx.send_write(data)
 
     def _resend(self, seqs):
         for s in seqs:
             if s in self.unacked:
-                self.pub.publish(self._String(data=self.unacked[s][0]))
+                self.tx.send_write(self.unacked[s][0])
                 self.unacked[s][1] = time.monotonic()
                 self.stats["resent"] += 1
 
@@ -344,9 +334,9 @@ class RemoteMap:
         if m["n"] >= self.next_n:
             self.pending[m["n"]] = m
 
-    def _on_reply(self, msg):
+    def _on_reply(self, data):
         self.n_cb += 1
-        m = json.loads(msg.data)
+        m = json.loads(data)
         if m.get("client") != self.name:                         # 다른 클라이언트의 응답(스냅샷 등)은 바로 버린다
             return
         if m["type"] == "resend":                                # 서버가 빈칸을 봄: 빠진 seq를 다시 보낸다
@@ -363,17 +353,17 @@ class RemoteMap:
         else:
             self.replies.append(m)
 
-    def _on_info(self, msg):
+    def _on_info(self, data):
         self.n_cb += 1
-        self.info = json.loads(msg.data)
+        self.info = json.loads(data)
 
-    def _on_update(self, msg):
+    def _on_update(self, data):
         self.n_cb += 1
         self.rx += 1
         if self.drop[1] and self._rng.random() < self.drop[1]:
             self.stats["dropped_in"] += 1                        # 시험: 받지 않은 것으로 (빈칸 -> 다시 받기)
             return
-        self._take(json.loads(msg.data))
+        self._take(json.loads(data))
 
     def poll(self):
         """받은 다른 쪽 변경을 n 순서대로 사본에 반영하고, 빈칸이 있으면 다시 달라고 한다. 반환: 반영한 개수 (다시 맞췄으면 1 더)."""
@@ -382,7 +372,7 @@ class RemoteMap:
         empty = 0
         for _ in range(100000):
             before = self.n_cb
-            self.executor.spin_once(timeout_sec=0.0)
+            self.tx.spin_once(0.0)
             empty = 0 if self.n_cb != before else empty + 1
             if empty >= 3:
                 break
@@ -396,7 +386,10 @@ class RemoteMap:
         late = self.gap is not None                              # 빈칸이 열려 있었다: 이번에 반영하는 것은 그 때문에 늦었다
         zr = (self.local.z_min, self.local.z_max)
         while self.next_n in self.pending:                       # n 순서대로 (자기 메아리는 이미 사본에 있어 건너뛴다)
-            m = self.pending.pop(self.next_n)
+            m = self.pending[self.next_n]
+            if m.get("from") in self.held and m["seq"] > self.released.get(m["from"], 0):
+                break                                            # 붙잡아 둔 쓴 쪽: 풀어 줄 때까지 여기서 멈춘다 (n 순서는 지킨다)
+            del self.pending[self.next_n]
             if m.get("from") == self.name:
                 self.inflight = [x for x in self.inflight if x[0] != m["seq"]]   # 서버 순서가 확인된 자기 편집
             else:
@@ -407,9 +400,10 @@ class RemoteMap:
                         if k:
                             self.rebased["msgs"] += 1
                             self.rebased["cells"] += k
-                if self.keep_applied:
+                if self.keep_applied and m.get("from") not in self.no_log:
                     self.applied_log.append(m)
                 apply_message(self.local, m)
+                self.applied_seq[m["from"]] = m["seq"]
                 self.lat["apply"].append(now - m["wall"])
                 if late:                                         # 보낸 때부터 (빈칸을 알아채기까지 걸린 시간 포함)
                     self.lat["apply_late"].append(now - m["wall"])
@@ -434,6 +428,24 @@ class RemoteMap:
         old = [s for s, (_, t) in self.unacked.items() if mono - t > RESEND_S]   # 오래 메아리가 없다 (마지막 것이 사라졌을 수 있다)
         self._resend(old)
         return n
+
+    # ---- 다른 클라이언트의 변경을 정한 때에만 넣기 (3c: Chrono 결과를 예전과 같은 시각에) ----
+    def hold(self, sender):
+        """sender의 변경을 release할 때까지 사본에 넣지 않는다 (받아 두기만, 서버 번호 순서는 지킨다)."""
+        self.held.add(sender)
+
+    def release(self, sender, seq, wait_s=30.0):
+        """sender의 변경을 seq까지 사본에 넣는다. 다 넣을 때까지 기다린다 (이미 보낸 것이라 받기만 하면 된다). 반환: 기다린 s."""
+        self.released[sender] = max(self.released.get(sender, 0), seq)
+        t0 = time.monotonic()
+        while self.applied_seq.get(sender, 0) < seq:
+            self.poll()
+            if self.applied_seq.get(sender, 0) >= seq:
+                break
+            if time.monotonic() - t0 > wait_s:
+                raise RuntimeError(f"{sender}의 변경 seq {seq}가 {wait_s} s 동안 오지 않는다 (지금 {self.applied_seq.get(sender, 0)})")
+            self.tx.spin_once(0.002)
+        return time.monotonic() - t0
 
     # ---- MapServer와 같은 쓰기 (사본에 먼저, 그다음 서버로) ----
     def write(self, op, writer, r0, c0, block, t=None):
@@ -468,6 +480,8 @@ class RemoteMap:
         """서버가 이 클라이언트의 마지막 seq까지 받고(다시 보내기·건너뛰기 포함), 이 클라이언트가 서버가 내보낸 번호 n까지 빈칸 없이 다 받을
         때까지 기다린 뒤 타일 해시를 대조. 판이 아니라 n으로 기다린다: 서버가 이 클라이언트의 변경을 건너뛰었으면 판이 끝내 같아지지
         않는다 (그 차이를 해시 불일치로 드러낸다). 반환: dict (summary에 넣는다)."""
+        for s in self.held:                                      # 끝: 붙잡아 둔 것을 다 푼다 (같이 도는 물리엔진이 미리 계산해 서버에만 쓴
+            self.released[s] = float("inf")                      # 마지막 구간. 물리와 MOP는 이미 끝났다)
         t0 = time.monotonic()
         while True:
             got = self._request("audit")
@@ -507,9 +521,7 @@ class RemoteMap:
         return s
 
     def close(self):
-        self.executor.remove_node(self.node)
-        self.executor.shutdown()
-        self.node.destroy_node()
+        self.tx.close()
 
 
 def main():
