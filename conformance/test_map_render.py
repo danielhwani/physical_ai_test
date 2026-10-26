@@ -5,6 +5,7 @@
   늦게 붙는 렌더러: 변경 700개 뒤에 Godot 중계기를 붙인다.
     패치 토픽(/sim/terrain_patch, 늦게 붙으면 최근 500개만 다시 줌)으로 받는 예전 방식은 앞의 200개를 놓쳐 서버와 다르다 (문제가 실제로 있다).
     맵 서버 관찰자로 받으면 스냅샷 + 그 뒤 변경이라 서버와 비트 단위로 같고, 붙은 뒤의 변경도 따라간다.
+  지형 출처 auto: 맵 서버가 떠 있으면 맵 서버를, 없으면 2 s 뒤 시뮬레이터 스트림을 고른다.
   Godot 쪽은 띄우지 않는다 (중계기가 Godot에 보낼 지형 격자를 본다).
 """
 import json
@@ -73,15 +74,20 @@ def main():
         assert writer.audit()["hash_mismatch"] == 0
         truth = writer.compose(0, T.nrow, 0, T.ncol).astype(np.float32)
 
-        old = GodotBridge(0)                                     # 예전 방식: 패치 토픽 (최근 500개만 다시 받음)
+        old = GodotBridge(0, terrain="stream")                   # 예전 방식: 패치 토픽 (최근 500개만 다시 받음)
         spin([old, pubn], 3.0)
+        old.decide_source(time.monotonic())
         assert old.grid is not None
         bad_old = int(np.count_nonzero(old.grid.heights != truth))
         assert bad_old > 0, "패치 토픽으로도 맞았다 (500개를 넘겼는데)"
         print(f"test_late_renderer_patch_topic: OK (문제가 있다: 늦게 붙은 예전 방식은 {bad_old}칸이 서버와 다르다)")
 
-        new = GodotBridge(0, map_server=True)                    # 맵 서버 관찰자
-        spin([new, pubn], 3.0)
+        new = GodotBridge(0, terrain="auto")                     # 스스로 고른다: 맵 서버가 떠 있으니 맵 서버
+        t0 = time.monotonic()
+        while new.source is None and time.monotonic() - t0 < 10:
+            spin([new, pubn], 0.1)
+            new.decide_source(time.monotonic())
+        assert new.source == "map", new.source
         assert new.map is not None and np.array_equal(new.grid.heights, truth), "맵 서버로 받은 지형이 서버와 다르다"
         joined = new.map.joined
         for _ in range(20):                                      # 붙은 뒤의 변경도 따라간다
@@ -96,18 +102,31 @@ def main():
         assert new.map.audit()["hash_mismatch"] == 0
         msg = new.terrain_msg()                                  # Godot에 보낼 메시지도 만들어진다
         assert msg["type"] == "terrain" and msg["nrow"] > 0
-        print(f"test_late_renderer_map_server: OK (판 {joined['version']}에서 붙어 서버와 같음, 그 뒤 변경 20개 "
-              f"{time.monotonic() - t0:.2f} s 안에 따라감)")
+        print(f"test_late_renderer_map_server: OK (auto가 맵 서버를 고름, 판 {joined['version']}에서 붙어 서버와 같음, "
+              f"그 뒤 변경 20개 {time.monotonic() - t0:.2f} s 안에 따라감)")
         for n in (old, new, pubn):
             if getattr(n, "map", None) is not None:
                 n.map.close()
             n.destroy_node()
         writer.close()
     finally:
-        if rclpy.ok():
-            rclpy.shutdown()
         proc.terminate()
         proc.wait(timeout=10)
+    try:                                                         # 맵 서버가 없으면 auto는 2 s 뒤 시뮬레이터 스트림으로
+        alone = GodotBridge(0, terrain="auto")
+        mpub = rclpy.create_node("fake_sim_stream2")
+        mp = mpub.create_publisher(String, "/sim/scene_manifest", QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        mp.publish(String(data=json.dumps(build_manifest(sim.model, T))))
+        t0 = time.monotonic()
+        while alone.source is None and time.monotonic() - t0 < 10:
+            spin([alone, mpub], 0.1)
+            alone.decide_source(time.monotonic())
+        assert alone.source == "stream" and alone.map is None, alone.source
+        print(f"test_auto_without_map_server: OK (맵 서버 없음 -> 시뮬레이터 스트림, {time.monotonic() - t0:.1f} s 뒤 정함)")
+        alone.destroy_node(), mpub.destroy_node()
+    finally:
+        if rclpy.ok():
+            rclpy.shutdown()
         shutil.rmtree(tmp)
 
 

@@ -717,7 +717,8 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
             displays.append(("MuJoCo viewer", launch_mujoco_viewer(log_dir)))
         if "godot" in viz:
             from .ros2_bridge import launch_godot
-            godot, godot_bridge = launch_godot(log_dir, points="godot_lidar" in viz, map_server=map_proc is not None)
+            godot, godot_bridge = launch_godot(log_dir, points="godot_lidar" in viz,
+                                               terrain="map" if map_proc is not None else "stream")   # 시뮬레이터는 출처를 안다
             displays.append(("Godot", godot)); helpers.append(godot_bridge)
         if displays:
             if verbose:

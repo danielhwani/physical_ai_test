@@ -1,15 +1,16 @@
 """Godot 4 어댑터의 중계기: 중립 렌더 스트림(ROS2) -> TCP (127.0.0.1, 한 줄에 JSON 하나) -> Godot 프로젝트(godot/).
 
-    python -m viz.godot_bridge [--port 4243] [--points] [--map-server]   (sim.runner / sim.rt_link --godot,
-                                                                          또는 python -m viz.godot_launch가 Godot와 함께 실행)
+    python -m viz.godot_bridge [--port 4243] [--points] [--terrain auto|map|stream]   (sim.runner / sim.rt_link --godot,
+                                                                                    또는 python -m viz.godot_launch가 Godot와 함께 실행)
 
 GDScript는 ROS2를 직접 받지 못하므로 이 중계기가 받아 Godot가 바로 쓸 형태로 넘긴다. 좌표는 ROS(REP-103) 그대로 보내고,
 Godot 쪽에서 장면 맨 위 노드 하나를 X축 -90° 돌려(ROS (x, y, z) -> Godot (x, z, -y)) 변환을 한 곳에서 끝낸다.
 
   입력  /sim/scene_manifest, /sim/terrain_patch, /sim/terrain_overlay, /tf, /sim/status
-        --map-server: 지형은 /sim/terrain_patch 대신 맵 서버에서 (관찰자로 붙어 스냅샷 + 그 뒤 변경, docs/map_server.md 3b).
-        실행 중 언제 붙어도 지금 지형 전체를 받는다 (/sim/terrain_patch는 최근 500개만 다시 준다). 화면은 서버 지도(원천)라 물리 반영보다
-        조금 앞설 수 있다 (물리는 5 Hz로 반영하고 발 근처 칸은 발이 떠날 때까지 미룬다).
+        지형 출처 (--terrain, 기본 auto): 장면 매니페스트가 오면 맵 서버(/map/info)를 2 s까지 찾아, 있으면 맵 서버 관찰자로(스냅샷 + 그 뒤
+        변경, docs/map_server.md 3b), 없으면 /sim/terrain_patch로 받는다. 맵 서버면 실행 중 언제 붙어도 지금 지형 전체를 받는다 (패치 토픽은
+        최근 500개만 다시 준다). 맵 서버 격자가 장면과 다르면 (같은 도메인의 다른 지도) 알리고 패치 토픽으로. 화면은 서버 지도(원천)라 물리
+        반영보다 조금 앞설 수 있다 (물리는 5 Hz로 반영하고 발 근처 칸은 발이 떠날 때까지 미룬다). map / stream은 한쪽으로 정한다.
   출력  {"type": "scene", ...}    바디 이름, 외형(OBJ 절대 경로, 바디 좌표 pos/quat, 색), 흙 지역
         {"type": "terrain", ...}  로봇 주변 창의 표시 높이 격자(지형 - 화면 발자국 깊이)와 꼭짓점 색 (RViz와 같은 색 규칙), base64 float32
         {"type": "poses", ...}    바디 월드 포즈 {이름: [x, y, z, qx, qy, qz, qw]} (약 30 Hz)
@@ -150,9 +151,11 @@ def markers_to_world(msg, poses):
 
 
 class GodotBridge(Node):
-    def __init__(self, port, points=False, map_server=False):
+    def __init__(self, port, points=False, terrain="stream"):
         super().__init__("godot_bridge")
-        self.use_map, self.map = map_server, None       # 맵 서버 관찰자 (manifest를 받은 뒤 붙는다)
+        assert terrain in ("auto", "map", "stream"), terrain
+        self.terrain_mode, self.source, self.map = terrain, None, None   # 지형 출처: 정한 것("map" / "stream"), 맵 서버 관찰자
+        self.manifest_t = None
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         history = QoSProfile(depth=500, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(String, "/sim/scene_manifest", self.on_manifest, latched)
@@ -183,27 +186,57 @@ class GodotBridge(Node):
         res = 2 * t["half_size"][0] / (t["ncol"] - 1)
         half = min(TERRAIN_HALF, max(1.0, np.floor(res * np.sqrt(MAX_CELLS) / 2)))
         self.window = TerrainWindow(t, half=half, max_cells=0)
-        if self.use_map:                                 # 지형은 맵 서버에서 (패치 토픽은 쓰지 않는다)
-            self.pending = []
-            self.attach_map()
-        for p in self.pending:
-            self.grid.apply(p)
         for p in self.pending_overlay:
             self.overlay.apply(p)
-        self.pending = self.pending_overlay = []
-        self.terrain_dirty = True
+        self.pending_overlay = []
+        self.manifest_t = time.monotonic()
+        if self.source == "map":                         # 시뮬레이터가 다시 매니페스트를 냄: 지금 맵 사본으로 다시 채운다
+            self.attach_map()
+        elif self.source == "stream" or self.terrain_mode == "stream":
+            self.use_stream()
+        elif self.terrain_mode == "map":
+            self.attach_map()
+        self.terrain_dirty = True                        # auto: decide_source가 run에서 고른다
         self.send_scene()
+
+    def decide_source(self, now):
+        """auto: 매니페스트가 온 뒤 맵 서버가 보이면 거기서, 2 s 안에 안 보이면 패치 토픽에서."""
+        if self.source is not None or self.manifest is None or self.terrain_mode != "auto":
+            return
+        if self.count_publishers("/map/info") > 0:
+            try:
+                self.attach_map()
+            except (RuntimeError, AssertionError) as e:   # 서버가 없어졌거나 격자가 다르다 (같은 도메인의 다른 지도)
+                self.get_logger().warn(f"맵 서버를 쓰지 않는다: {e}")
+                if self.map is not None:
+                    self.map.close()
+                    self.map = None
+                self.use_stream()
+        elif now - self.manifest_t > 2.0:
+            self.use_stream()
+
+    def use_stream(self):
+        self.source = "stream"
+        for p in self.pending:
+            self.grid.apply(p)
+        self.pending = []
+        self.terrain_dirty = True
+        self.get_logger().info("지형: 시뮬레이터 스트림 (/sim/terrain_patch)")
 
     def attach_map(self):
         from sim.map_client import RemoteMap                 # 물리엔진이 아니라 지도 사본 (numpy만)
         if self.map is None:
-            self.map = RemoteMap(None, name=f"godot_{os.getpid()}")
-            j = self.map.joined
-            self.get_logger().info(f"맵 서버에 붙음: 판 {self.map.local.version} (스냅샷 {j['s']} s)")
+            self.map = RemoteMap(None, name=f"godot_{os.getpid()}", wait_s=10.0)
+            g = self.grid
+            assert (self.map.local.nrow, self.map.local.ncol) == (g.nrow, g.ncol), \
+                f"맵 서버 격자 {self.map.local.nrow} x {self.map.local.ncol}가 장면의 {g.nrow} x {g.ncol}와 다르다"
+            self.get_logger().info(f"지형: 맵 서버 (붙은 판 {self.map.local.version}, 스냅샷 {self.map.joined['s']} s)")
+        self.source = "map"
+        self.pending = []
         g = self.grid
-        assert (self.map.local.nrow, self.map.local.ncol) == (g.nrow, g.ncol), "맵 서버 격자와 장면 매니페스트 격자가 다르다"
         g.heights = self.map.local.compose(0, g.nrow, 0, g.ncol).astype(np.float32)
         g.version = self.map.local.version
+        self.terrain_dirty = True
 
     def poll_map(self):
         if self.map is not None and self.map.poll() > 0:
@@ -213,10 +246,10 @@ class GodotBridge(Node):
             self.terrain_dirty = True
 
     def on_patch(self, msg):
-        if self.use_map:
+        if self.source == "map":
             return
         p = json.loads(msg.data)
-        if self.grid is None:
+        if self.grid is None or self.source is None:     # 지형 출처를 아직 안 정함: 쌓아 둔다 (패치 토픽으로 정하면 넣는다)
             self.pending.append(p)
         else:
             self.grid.apply(p)
@@ -322,11 +355,19 @@ class GodotBridge(Node):
         self.send_scene()                                  # 늦게 붙어도 지금 장면 전체
         self.terrain_dirty = self.poses_dirty = self.status_dirty = True
 
+    def waiting_lines(self):
+        """장면 매니페스트가 안 올 때 Godot 정보판 문구 (ASCII만: 한글은 Godot을 멈춘다). 시뮬레이터가 ROS2 스트림을 내지 않으면 빈 화면이다."""
+        dom = os.environ.get("ROS_DOMAIN_ID") or "0 (unset)"
+        return ["WAITING FOR SIMULATOR", "no scene on /sim/scene_manifest",
+                "start the simulator with --ros2 (or --rviz / --godot)", f"same ROS_DOMAIN_ID on both sides: here {dom}"]
+
     def run(self):
         next_pose = next_terrain = next_points = next_find = next_markers = 0.0
+        t_start, next_wait, warned = time.monotonic(), 0.0, False
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.005)
             self.poll_map()
+            self.decide_source(time.monotonic())
             self.accept()
             now = time.monotonic()
             if now >= next_find:
@@ -334,6 +375,13 @@ class GodotBridge(Node):
                 next_find = now + 1.0
             if self.client is None:
                 continue
+            if self.manifest is None and now - t_start > 5.0 and now >= next_wait:   # 시뮬레이터 스트림이 없다: 빈 화면 대신 알림
+                self.send({"type": "status", "lines": self.waiting_lines(), "alert": True})
+                next_wait = now + 2.0
+                if not warned:
+                    self.get_logger().warn("장면 매니페스트가 안 온다 (/sim/scene_manifest): 시뮬레이터를 --ros2 (또는 --rviz, --godot)로, "
+                                           f"같은 ROS_DOMAIN_ID ({os.environ.get('ROS_DOMAIN_ID') or '0, 정하지 않음'})로 띄운다")
+                    warned = True
             if self.poses_dirty and now >= next_pose:
                 self.send({"type": "poses", "p": self.poses})
                 self.poses_dirty, next_pose = False, now + 1.0 / POSE_HZ
@@ -343,7 +391,7 @@ class GodotBridge(Node):
                 self.send({"type": "status", "lines": lines, "alert": alert,
                            **{k: s[k] for k in ("base_pos", "yaw", "command", "feet") if k in s}})
                 self.status_dirty = False
-            if self.terrain_dirty and self.window is not None and now >= next_terrain:
+            if self.terrain_dirty and self.window is not None and self.source is not None and now >= next_terrain:
                 self.send(self.terrain_msg())
                 self.terrain_dirty, next_terrain = False, now + 1.0 / TERRAIN_HZ
             if self.clouds and now >= next_points:
@@ -358,10 +406,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--points", action="store_true", help="LiDAR 점군과 알고리즘 지형 지도도 넘긴다")
-    ap.add_argument("--map-server", action="store_true", help="지형을 맵 서버에서 (언제 붙어도 지금 지형 전체)")
+    ap.add_argument("--terrain", choices=("auto", "map", "stream"), default="auto",
+                    help="지형 출처: auto (맵 서버가 있으면 거기서, 없으면 시뮬레이터 스트림), map, stream")
     a = ap.parse_args()
     rclpy.init()
-    node = GodotBridge(a.port, points=a.points, map_server=a.map_server)
+    node = GodotBridge(a.port, points=a.points, terrain=a.terrain)
     try:
         node.run()
     except (KeyboardInterrupt, ExternalShutdownException):     # 실행기가 끝나며 멈춤 신호를 보냄

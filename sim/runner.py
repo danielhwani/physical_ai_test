@@ -593,7 +593,7 @@ def run(args):
         if getattr(args, "godot", False):
             from .ros2_bridge import launch_godot
             godot, godot_bridge = launch_godot(out, points=getattr(args, "godot_lidar", False),
-                                               map_server=map_proc is not None)   # 맵 서버가 있으면 지형은 거기서 (3b)
+                                               terrain="map" if map_proc is not None else "stream")   # 시뮬레이터는 출처를 안다 (3b)
             displays.append(("Godot", godot))
             helpers.append(godot_bridge)
         if sensor_node:

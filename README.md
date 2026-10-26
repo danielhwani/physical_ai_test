@@ -497,10 +497,35 @@ python -m sim.runner scenarios/flat_trot.yaml --godot                       # Py
 python -m sim.rt_link scenarios/soil_strip.yaml --brain shm --godot         # C++ 코어 (실시간)
 python -m sim.runner scenarios/vehicle_crossing.yaml --godot                # HMMWV (Chrono)
 python -m sim.runner scenarios/vehicle_crossing.yaml --map-server --godot   # 지형을 맵 서버에서 (3b)
-python -m viz.godot_launch --map-server                                     # 돌고 있는 --map-server 시뮬레이터에 나중에 붙이기 (시뮬레이터는 --godot 없이)
+python -m sim.runner scenarios/vehicle_crossing.yaml --map-server --ros2 --realtime   # 렌더러를 나중에 붙일 시뮬레이터 (--ros2: 바디·상태 스트림)
+python -m viz.godot_launch                                                  # 다른 터미널에서 나중에 붙이기 (맵 서버가 있으면 거기서: 늦게 열어도 이미 생긴 자국이 보인다)
 python -m sim.rt_link scenarios/rut_crossing.yaml --brain shm --godot-lidar  # + LiDAR 점군
 python conformance/test_render_stream.py                                    # 중계기 메시지 시험 포함
 ```
+
+**Godot을 띄우는 방법** (2026-10-26). 같은 시뮬레이션을 보되, 렌더러를 누가 언제 띄우고 지형을 어디서 받느냐가 다르다.
+
+| | 1. `--godot` | 2. `--map-server --godot` | 3. `--map-server --ros2` + `viz.godot_launch` |
+|---|---|---|---|
+| 터미널 | 하나 | 하나 | 둘 (시뮬레이터, 렌더러) |
+| Godot 띄우는 쪽 | 시뮬레이터 (시작할 때) | 시뮬레이터 (시작할 때) | 사용자 (실행 중 아무 때나) |
+| 지형 출처 | 시뮬레이터 스트림 (`/sim/terrain_patch`) | 맵 서버 | 맵 서버 (있으면 스스로 고름) |
+| 늦게 붙기 | 해당 없음 (처음부터 같이) | 해당 없음 | 됨: 그 전에 생긴 자국까지 보인다 |
+| 창을 닫으면 | 시험도 끝남 | 시험도 끝남 | 시험은 계속됨 (다시 열어도 됨) |
+| 쓰는 때 | 그냥 보기 (가장 간단) | 맵 서버 시험을 보면서 | 렌더러를 나중에 붙이거나 3b 확인 |
+
+```bash
+python -m sim.runner scenarios/vehicle_crossing_lidar.yaml --godot                          # 1. 로봇이 자국을 넘는 모습 보기
+python -m sim.runner scenarios/vehicle_crossing_lidar.yaml --map-server --godot             # 2
+python -m sim.runner scenarios/vehicle_crossing_lidar.yaml --map-server --ros2 --realtime   # 3. 터미널 1
+python -m viz.godot_launch                                                                  # 3. 터미널 2 (같은 ROS_DOMAIN_ID)
+```
+- 3에서 시뮬레이터에 `--godot`을 같이 주면 렌더러와 같은 포트(4243)를 써서 부딪힌다. `--ros2`만 준다 (바디·위치·상태·장면 매니페스트는
+  이 스트림에서 온다. 없으면 Godot 정보판에 `WAITING FOR SIMULATOR`).
+- `viz.godot_launch`는 맵 서버를 띄우지 않는다. 떠 있는 맵 서버가 있으면 거기서 받고, 없으면 시뮬레이터 스트림에서 받는다 (`--terrain
+  map|stream`으로 정할 수 있다). 어느 쪽으로 정했는지는 `build/godot_view/godot_bridge.log`의 `지형:` 줄.
+- 늦게 붙으면 시뮬레이터 스트림은 최근 패치 500개만 다시 준다: 실행이 길면 앞부분을 놓친다. 맵 서버는 스냅샷으로 지금 지형 전체를 준다
+  (`conformance/test_map_render.py`: 변경 700개 뒤에 붙으면 스트림은 약 18000칸이 틀리고 맵 서버는 같다).
 
 ```
 [시뮬레이터] ── ROS2 중립 스트림 ──▶ viz/godot_bridge.py ── TCP 127.0.0.1:4243 (한 줄에 JSON) ──▶ godot/ (Godot 4 프로젝트)
@@ -586,7 +611,8 @@ python conformance/test_terrain_window.py                     # 창 시험
 ## Chrono 연동 (두 번째 물리엔진, 문서 §5)
 
 ```bash
-python -m sim.runner scenarios/vehicle_crossing.yaml --rviz        # 단단한 흙: 자국 약 5.5 cm
+python -m sim.runner scenarios/vehicle_crossing.yaml --rviz        # 단단한 흙: 자국 약 5.5 cm (지형을 보지 않는 보행기: 첫 자국에 걸림)
+python -m sim.runner scenarios/vehicle_crossing_lidar.yaml --godot # 같은 시나리오, 지형 인지 보행기 (시연용: 두 자국을 넘음, 5.04 m)
 python -m sim.runner scenarios/vehicle_crossing_soft.yaml --rviz   # 무른 흙: 자국 약 15 cm
 python -m sim.runner scenarios/hmmwv_follow.yaml --rviz            # HMMWV 뒤를 따라 왼발이 바퀴 자국 안을 걷기
 python -m sim.runner scenarios/footprints.yaml --rviz              # 로봇 발자국 (HMMWV 없이 Chrono를 변형 지면 계산기로만)
@@ -2082,8 +2108,9 @@ python -m sim.rt_link scenarios/flat_trot.yaml --brain ros --remote-brain --ros-
      3a (2026-10-26): 운용자 편집 `python -m sim.map_edit bump|ramp|rough|rut|set ...` (실행 중인 `--map-server` 시뮬레이터에 다른
      터미널에서). 받은 편집은 `scenario_replay.yaml`에 받은 시각으로 적혀 다시 돌리면 비트 동일. 엇갈린 편집은 서버 번호로 바꿔 맞춘다
      (rebase: 버리지 않음).
-     3b (2026-10-26): Godot 렌더러가 지형을 맵 서버에서 받는다 (`--map-server --godot`, 또는 나중에 `python -m viz.godot_launch
-     --map-server`). 실행 중 언제 붙어도 같은 지형. 다음: 3c (Chrono를 별도 클라이언트로).
+     3b (2026-10-26): Godot 렌더러가 지형을 맵 서버에서 받는다 (`--map-server --godot`, 또는 시뮬레이터를 `--map-server --ros2`로
+     띄우고 나중에 `python -m viz.godot_launch`: 맵 서버가 있으면 스스로 거기서 받는다). 실행 중 언제 붙어도 같은 지형. 시뮬레이터 스트림이 없으면 Godot 정보판에
+     WAITING FOR SIMULATOR. 다음: 3c (Chrono를 별도 클라이언트로).
   4. **타당성 확인**: 지금 결과는 모두 단일 SCM과의 일관성이다. 실제 흙과 비교하려면 판 재하 시험이나 반복 주행 시험의 실측 자료와
      그에 맞춘 흙 매개변수가 필요하다. 자료를 구하는 것부터 정한다.
 - 급하지 않은 것: Godot에 한글 글꼴 넣기 (지금 화면 글자는 영어와 숫자만), 다른 PC 두뇌 + 지형 인지 실시간 실행의 결과 흔들림
