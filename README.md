@@ -45,6 +45,7 @@ python conformance/test_render_stream.py                 # 렌더 스트림 계�
 python conformance/test_map_server.py                    # 맵 서버 1단계: 합치는 규칙 (min, NaN, 순서), 소유 영역, 서버 없이 / 있게 비트 동일
 python conformance/test_map_remote.py                    # 맵 서버 2단계: 별도 프로세스 서버 + 클라이언트 (주고받기, 다른 바탕 거부, 감사, 늦게 붙기, 지연, 바탕 파일, 빈칸 복구, 이어 시작)
 python conformance/test_map_base.py                      # 맵 서버 2c: 바탕 파일 (쓰고 읽기, 고친 타일 찾기, 시나리오 바탕 = 시작 지형)
+python conformance/test_map_edit.py                      # 맵 서버 3a: 실행 중 운용자 편집이 물리에 들어가고, 재현 시나리오가 비트 동일 (약 40초)
 python conformance/compare_variants.py [--policy card.yaml]   # cpu vs mjx 설정의 MOP 분포 비교
 python conformance/probe_scm_injection.py [--record build/scm_press.npz] [--plot PNG]   # SCM에 바깥 높이 넣기: 접촉은 따라가고 다짐 이력은 안 넘어감 (docs/map_server.md 5.5). 어느 환경이든: chrono 환경으로 다시 실행
 python conformance/probe_scm_compaction.py [--record build/scm_compaction.npz]   # 다짐 -> 단단한 흙 콜백: kphi ×25로 다짐 흉내 (약 1분)
@@ -2075,7 +2076,9 @@ python -m sim.rt_link scenarios/flat_trot.yaml --brain ros --remote-brain --ros-
      2d (2026-10-25): `seq` 빈칸 다시 보내기·다시 받기 (10% 일부러 버려도 같아짐), 스냅샷으로 다시 맞추기, 서버 `--save-dir`·`--resume`,
      시뮬레이터 `--map-save` (끝난 지도를 실행 폴더 `map_state/`에), MOP `map_seq_gaps`, `map_gap_delay_max_ms`, `map_lost_changes`. 다시 받을 수 없는 빈칸은 서버가 5 s 뒤 건너뛴다 (늦게 온 파임은 적용,
      소유 영역은 통째로 다시 받음). 2단계 끝.
-     다음: 3단계 (Chrono를 별도 클라이언트로, 운용자 편집, 렌더러를 맵 클라이언트로).
+     3a (2026-10-26): 운용자 편집 `python -m sim.map_edit bump|ramp|rough|rut|set ...` (실행 중인 `--map-server` 시뮬레이터에 다른
+     터미널에서). 받은 편집은 `scenario_replay.yaml`에 받은 시각으로 적혀 다시 돌리면 비트 동일. 엇갈린 편집은 서버 번호로 바꿔 맞춘다
+     (rebase: 버리지 않음). 다음: 3b (렌더러를 맵 클라이언트로), 3c (Chrono를 별도 클라이언트로).
   4. **타당성 확인**: 지금 결과는 모두 단일 SCM과의 일관성이다. 실제 흙과 비교하려면 판 재하 시험이나 반복 주행 시험의 실측 자료와
      그에 맞춘 흙 매개변수가 필요하다. 자료를 구하는 것부터 정한다.
 - 급하지 않은 것: Godot에 한글 글꼴 넣기 (지금 화면 글자는 영어와 숫자만), 다른 PC 두뇌 + 지형 인지 실시간 실행의 결과 흔들림

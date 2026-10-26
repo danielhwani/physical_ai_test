@@ -340,7 +340,7 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
         scn_dict = scenario if isinstance(scenario, dict) else load_yaml(scenario)
         map_proc = launch_map_server(out_dir or ROOT / "build/rt", base=prepare_base(scn_dict, map_base))
     sim = Simulation(scenario, policy=policy, variant=variant, map_client="sim" if map_proc is not None else None)
-    supported = ("set_command", "add_patch", "inject_fault", "clear_fault", "create_entity", "remove_entity", "set_soil")
+    supported = ("set_command", "add_patch", "inject_fault", "clear_fault", "create_entity", "remove_entity", "set_soil", "map_write")
     unsupported = [e["action"] for e in sim.events if e["action"] not in supported]
     if unsupported:
         sim.close()
@@ -409,6 +409,9 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
             elif e["action"] == "stop":
                 sim.stop_requested = True
                 stop_after[0] = step_next
+            elif e["action"] == "map_write":               # 실행 때 맵 서버에서 받은 다른 쪽 변경 (재현 시나리오)
+                sim.terrain.time = t_next
+                sim.terrain.apply_map_message(e["msg"])
             elif e["action"] == "add_patch":
                 sim.terrain.time = t_next                  # 맵 서버 변경 기록의 시각
                 delta = patch_ready.pop(id(e), None)
@@ -506,7 +509,9 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
         changed = False
         if t_now >= next_commit[0]:
             T = sim.terrain
-            T.poll_server()                                              # 원격 맵 서버의 다른 쪽 변경 (sim.runner와 같은 자리)
+            T.time = t_now
+            for m in T.poll_server():                                    # 원격 맵 서버의 다른 쪽 변경 (재현 시나리오에 map_write로 적는다)
+                sim._record_map_write(m, verbose, t=t_now)
             if T.recenter(*base_xy, trigger=sim.window_trigger):          # 지형 창 이동
                 sim.data.mocap_pos[sim.terrain_mocap] = [*T.window_center, 0.0]
                 T.write_all(sim.model, sim.hfield_id)
@@ -824,7 +829,7 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
             "noise_underruns": int(st.noise_underruns), "mlockall": bool(st.locked), "sched_fifo": bool(st.rt_ok),
         }
         mop["min_vehicle_distance_m"] = round(sim.cosim.min_dist, 3) if sim.cosim is not None and np.isfinite(sim.cosim.min_dist) else None   # 차가 한 번도 안 나왔으면 None
-        mop.update(terrain_deformation(terrain0, sim.terrain.applied))
+        mop.update(terrain_deformation(terrain0, sim.terrain.applied, terrain=sim.terrain))
         if sim.foot_soil is not None:
             mop.update(sim.foot_soil.mop())
         if rec is not None:
@@ -877,6 +882,8 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
             if out_dir is not None:                                    # 콘솔 이벤트를 적용 시각으로 넣은 시나리오
                 (out_dir / "scenario_replay.yaml").write_text(yaml.safe_dump(sim.replay_scenario(), allow_unicode=True,
                                                                              sort_keys=False))
+        elif out_dir is not None and any(e["action"] == "map_write" for e in sim.event_log):   # 맵 서버에서 받은 변경
+            (out_dir / "scenario_replay.yaml").write_text(yaml.safe_dump(sim.replay_scenario(), allow_unicode=True, sort_keys=False))
         if displays and k_truth > 0:                                # 마지막 상태와 최종 MOP를 화면에 남기고 창이 닫힐 때까지
             publish_viz(link.truth(k_truth - 1) or link.shm.truth[(k_truth - 1) % R.TRUTH_RING], final_mop=mop)
             if any(p.poll() is None for _, p in displays):

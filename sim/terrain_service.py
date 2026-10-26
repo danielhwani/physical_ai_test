@@ -32,6 +32,8 @@ class TerrainMapService:
         self.server = None          # 맵 서버 (attach_server 뒤). target은 그 서버가 합친 물리 높이의 사본
         self.time = 0.0             # 변경 기록에 붙일 시뮬레이션 시각 (호출하는 쪽이 갱신)
         self.applied_version = 0    # 물리엔진 반영(applied)이 바뀔 때 증가 (렌더러 갱신 기준)
+        self.received = 0           # 받은 다른 쪽 변경 수 (운용자 편집 등: 맵 서버에서 받았거나 재현 시나리오의 map_write)
+        self.received_mask = None   # 그 변경이 닿은 칸 (변형 MOP에서 뺀다: 흙 변형과 섞이지 않게)
 
         # MuJoCo heightfield 창 (window=None이면 세계 지도 전체 = 예전 방식)
         wx, wy = window if window is not None else size
@@ -105,13 +107,40 @@ class TerrainMapService:
         return self.server
 
     def poll_server(self):
-        """원격 맵 서버에서 받은 다른 쪽 변경을 반영. 바뀌었으면 True (commit 전에 부른다)."""
+        """원격 맵 서버에서 받은 다른 쪽 변경을 반영. 반환: 사본에 넣은 다른 쪽 변경 목록 (바꾼 뒤의 메시지: 재현 시나리오에 적는다).
+        commit 전에 부른다."""
         if self.server is None or not hasattr(self.server, "poll") or self.server.poll() == 0:
-            return False
+            if self.server is not None and hasattr(self.server, "applied_log"):
+                self.server.applied_log.clear()
+            return []
+        got, self.server.applied_log = self.server.applied_log, []
+        for m in got:
+            self._mark_received(m)
+        self.target = self.server.compose(0, self.nrow, 0, self.ncol)
+        self.version += max(len(got), 1)            # 받은 변경마다 하나 (재현 시나리오에서 map_write 이벤트마다 하나씩 올리는 것과 같게)
+        self._cand = None
+        return got
+
+    def apply_map_message(self, m):
+        """재현 시나리오의 map_write 이벤트: 실행 때 다른 쪽(운용자 편집 등)에서 받아 넣은 변경을 같은 시각에 그대로 넣는다."""
+        from .map_client import apply_message
+        apply_message(self.server, m)
+        self._mark_received(m)
         self.target = self.server.compose(0, self.nrow, 0, self.ncol)
         self.version += 1
         self._cand = None
-        return True
+
+    def _mark_received(self, m):
+        """받은 변경이 바꾼 칸을 표시 (add는 0이 아닌 칸, 나머지는 NaN이 아닌 칸)."""
+        from .map_client import msg_cells
+        if m.get("type") not in ("write", "cells"):
+            return
+        rows, cols, vals = msg_cells(m)
+        sel = (vals != 0) if m["op"] == "add" else ~np.isnan(vals)
+        if self.received_mask is None:
+            self.received_mask = np.zeros((self.nrow, self.ncol), bool)
+        self.received_mask[rows[sel], cols[sel]] = True
+        self.received += 1
 
     # ---- 패치 생성 ----
     def add_patch(self, p):

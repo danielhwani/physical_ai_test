@@ -16,6 +16,8 @@
 import numpy as np
 
 RULES = {"dig": "min", "add": "ordered", "set": "ordered", "own": "owned"}
+EDIT_OPS = ("add", "set")         # 편집: 다른 쪽이 모르고 만든 쓰기를 이것에 맞춰 바꾼다 (rebase)
+ABS_OPS = ("dig", "set", "own")   # 절대 높이 쓰기
 TILE = 200
 FORMAT = 1
 
@@ -23,6 +25,37 @@ FORMAT = 1
 def merge_dig(d, new):
     """파임 합치기 (min). new의 NaN은 안 바꿈. 순서·중복과 무관."""
     return np.fmin(d, new)
+
+
+def rebase(op, rows, cols, vals, edit, z_range):
+    """편집 edit을 모르고 만든 쓰기 W(op, 칸 rows/cols, 값 vals)를, 편집 뒤에 적용해도 "편집 전에 W가 있었던 것"과 같게 바꾼다.
+    edit = (편집 op, r0, c0, block): add면 block = 변화량 (0 = 안 바꿈), set이면 절대 높이 (NaN = 안 바꿈).
+    S·W·E == S·E·W' (W' = 반환값):
+      E = add δ: 절대 높이 쓰기(dig, set, own)는 겹친 칸에 δ를 더한다 (편집이 그 값을 옮겼을 것이다). add끼리는 그대로 (더하기는 바꿔도 같다).
+      E = set:   겹친 칸의 W를 버린다 (set이 나중이라 이긴다). 절대 높이 쓰기는 NaN, add는 0.
+    반환: (새 값, 바꾼 칸 수). 높이 범위 끝에서 add끼리는 자르기 때문에 정확히 같지 않을 수 있다 (드묾)."""
+    eop, er0, ec0, eb = edit
+    rr, cc = rows - er0, cols - ec0
+    inside = (rr >= 0) & (rr < eb.shape[0]) & (cc >= 0) & (cc < eb.shape[1])
+    ev = np.full(vals.shape, np.nan)
+    ev[inside] = eb[rr[inside], cc[inside]]
+    out = np.array(vals, dtype=float)
+    if eop == "add":
+        m = inside & ~np.isnan(ev) & (ev != 0)
+        if op in ABS_OPS:
+            m &= ~np.isnan(out)
+            out[m] = np.clip(out[m] + ev[m], *z_range)
+        else:
+            m[:] = False
+    else:
+        m = inside & ~np.isnan(ev)
+        if op == "add":
+            m &= out != 0
+            out[m] = 0.0
+        else:
+            m &= ~np.isnan(out)
+            out[m] = np.nan
+    return out, int(m.sum())
 
 
 def merge_own(o, new):

@@ -4,8 +4,8 @@
 
   주고받기: 두 클라이언트가 서로 다른 칸을 쓰면 서로의 변경을 받아 두 사본과 서버가 같다 (타일 해시 대조).
   바탕이 다른 클라이언트는 거부된다.
-  감사가 어긋남을 잡는다: A의 파임이 서버에 먼저 들어간 뒤 B가 그걸 받기 전에 같은 칸을 add로 편집하면, B의 사본은 적용 순서가 서버와
-  달라 어긋난다 (설계 5.6 "늦게 온 이른 파임", 아직 구현 안 함). 감사가 그 타일을 불일치로 보고해야 한다.
+  엇갈린 편집 (3a, rebase): A의 파임이 서버에 먼저 들어간 뒤 B가 그걸 받기 전에 같은 칸을 add로 편집하면, B는 받은 파임을 자기 add에
+  맞춰 바꿔 넣는다 (2a에서는 B만 어긋났다). 반대로 운용자 편집을 모르고 만든 파임은 서버가 바꾼다. 둘 다 서버와 같다.
   늦게 붙기 (2b): 관찰자가 A가 쓰는 도중에 붙어도(스냅샷 + 그 뒤 변경) 서버와 같다. 바탕이 같은 클라이언트가 나중에 붙으면 바탕이
   아니라 지금 지도에서 시작한다. 지연: 자기 변경 왕복(echo), 다른 쪽 변경 반영(apply).
   바탕 파일 (2c): 서버를 바탕 파일로 띄우면 클라이언트는 격자 대신 타일 해시만 보내고 붙는다 (init이 작다). 타일 하나가 다른
@@ -83,7 +83,7 @@ def main():
             assert "바탕이 다르다" in str(e), e
         print("test_refuse_other_base: OK")
 
-        # 3. 감사가 어긋남을 잡는다
+        # 3. 엇갈린 편집: 서버 순서는 A 파임 -> B add, B 사본에는 B add가 먼저 -> B가 받은 파임을 바꿔 넣는다 (클라이언트 쪽 rebase)
         r0, c0 = 50, 50
         blk = a.compose(r0, r0 + 4, c0, c0 + 4) - 0.05
         a.write("dig", "a_wheels", r0, c0, blk)
@@ -91,9 +91,22 @@ def main():
         b.write("add", "b_operator", r0, c0, np.full((4, 4), 0.02))
         settle(a, b, version=62)
         au_a, au_b = a.audit(), b.audit()
-        assert au_a["hash_mismatch"] == 0, au_a                 # A: 파임 -> add (서버와 같은 순서)
-        assert au_b["hash_mismatch"] >= 1 and "0,0" in au_b["mismatched_tiles"], au_b   # B: add -> 파임 (순서가 다름)
-        print(f"test_audit_catches_order: OK (B 불일치 타일 {au_b['mismatched_tiles']})")
+        assert au_a["hash_mismatch"] == 0 and au_b["hash_mismatch"] == 0, (au_a, au_b)
+        assert au_b["gaps"]["rebased_here"]["cells"] == 16, au_b["gaps"]
+        assert np.array_equal(a.compose(0, 300, 0, 420), b.compose(0, 300, 0, 420))
+        print(f"test_concurrent_edit_client_rebase: OK (B가 바꾼 칸 {au_b['gaps']['rebased_here']['cells']}, 불일치 0. 2a에서는 B만 어긋남)")
+
+        # 3b. 반대: B가 편집(add)을 넣었는데 A가 그걸 받기 전에 같은 칸을 판다 -> 서버가 A의 파임을 편집에 맞춰 바꾼다 (서버 쪽 rebase)
+        r0, c0 = 80, 80
+        b.write("add", "b_operator", r0, c0, np.full((6, 6), 0.03))
+        b.audit()                                               # 서버가 편집을 받음 (A는 아직 poll 안 함)
+        a.write("dig", "a_wheels", r0 + 2, c0 + 2, a.compose(r0 + 2, r0 + 8, c0 + 2, c0 + 8) - 0.04)   # 편집 전 지형 기준
+        settle(a, b, version=64)
+        au_a, au_b = a.audit(), b.audit()
+        rs = au_a["gaps"]["rebased_server"]
+        assert au_a["hash_mismatch"] == 0 and au_b["hash_mismatch"] == 0 and rs["cells"] == 16, (au_a, rs)
+        assert np.array_equal(a.compose(0, 300, 0, 420), b.compose(0, 300, 0, 420))
+        print(f"test_concurrent_edit_server_rebase: OK (서버가 바꾼 칸 {rs['cells']}, 불일치 0)")
 
         # 4. 관찰자가 A가 쓰는 도중에 붙는다 (A는 다른 스레드에서 계속 쓴다: 스냅샷과 스트림 사이 경합)
         stop = threading.Event()
@@ -109,7 +122,7 @@ def main():
         time.sleep(0.1)
         obs = RemoteMap(None, name="observer")
         th.join()
-        assert obs.joined["version"] > 62, obs.joined                # A가 쓰던 도중에 붙었다
+        assert obs.joined["version"] > 64, obs.joined                # A가 쓰던 도중에 붙었다
         v = a.local.version
         settle(obs, version=v)
         au_o = obs.audit()

@@ -33,11 +33,12 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from std_msgs.msg import String
 
 from .map_base import load_base, tile_shas, write_base
-from .map_client import apply_message, dec, dec_state, enc_state, sha, stats_ms, tile_hashes
-from .map_server import FORMAT, RULES, TILE, MapServer
+from .map_client import apply_message, dec, dec_state, enc_state, msg_edit, rebase_msg, sha, stats_ms, tile_hashes
+from .map_server import EDIT_OPS, FORMAT, RULES, TILE, MapServer
 
 RING = 20000          # 다시 보내 줄 수 있게 들고 있는 /map/updates 수
 RESEND_S = 0.5        # 빈칸을 다시 달라고 하는 주기 (s)
+EDITS_KEPT = 1000     # rebase용으로 들고 있는 최근 편집 수 (편집은 드물다)
 GIVEUP_S = 5.0        # 이만큼 안 메워지는 빈칸은 건너뛴다 (보낸 쪽이 죽었거나 그 메시지를 더 들고 있지 않다)
 
 
@@ -66,6 +67,8 @@ class MapServerNode:
         self.skipped = {}                                           # 클라이언트 -> {건너뛴 seq} (아직 안 온 것)
         self.lost = {}                                              # 클라이언트 -> {"skipped": 건너뛰고 끝내 안 옴(감사 때), "late_dropped": 늦게 와서 버림, "late_dig": 늦게 와도 적용, "refresh": 소유 영역 다시 받음 요청}
         self.owner_clients = set()                                  # 소유 영역을 선언한 클라이언트
+        self.edits = collections.deque(maxlen=EDITS_KEPT)           # 최근 편집 (n, 쓴 클라이언트, (op, r0, c0, block)): rebase용
+        self.rebase_stats = {"writes": 0, "cells": 0, "unresolved": 0}
         self.base_tiles, self.map_name, self.base_path = {}, None, None   # 타일별 바탕 해시, 지도 이름, 바탕 폴더
         self.save_dir = Path(save_dir) if save_dir else None
         log = self.node.get_logger()
@@ -111,6 +114,7 @@ class MapServerNode:
         gaps = {"held": {c: len(h) for c, h in self.held.items() if h}, "dups": self.dups,
                 "lost": {c: d["lost"] for c, d in lost.items()}}
         info = {"format": FORMAT, "rules": RULES, "dropped_before_init": self.dropped, "gaps": gaps,
+                "rebased": {k: v for k, v in self.rebase_stats.items() if k != "by"},
                 "writers": self.seq, "base_sha256": self.base_hash, "joined": self.joined, "refused": self.refused,
                 "inits": self.inits, "n": self.n, "map_name": self.map_name, "base_path": self.base_path}
         if s is not None:
@@ -161,6 +165,27 @@ class MapServerNode:
         if not self.gap_since.get(sender):
             self.gap_since.pop(sender, None)
 
+    def rebase(self, sender, m):
+        """쓴 쪽이 모르고 만든 편집(다른 클라이언트가 넣었고, 번호가 쓴 쪽의 seen_n보다 큼)에 맞춰 쓰기를 바꾼다 (sim/map_server.py rebase).
+        서버 순서는 편집 -> 이 쓰기지만 쓴 쪽 사본은 이 쓰기 -> 편집이라, 바꿔야 두 결과가 같다 (버리지 않는다)."""
+        if self.edits and self.edits[0][0] > m["seen_n"] + 1 and len(self.edits) == self.edits.maxlen:
+            self.rebase_stats["unresolved"] += 1                      # 필요한 편집이 이미 빠졌을 수 있다 (아주 오래 못 받은 쪽)
+        later = [e for n, s, e in self.edits if n > m["seen_n"] and s != sender]
+        if not later:
+            return m
+        zr = (self.server.z_min, self.server.z_max)
+        total = 0
+        for e in later:
+            m, k = rebase_msg(m, e, zr)
+            total += k
+        if total:
+            self.rebase_stats["writes"] += 1
+            self.rebase_stats["cells"] += total
+            self.rebase_stats.setdefault("by", {}).setdefault(sender, 0)
+            self.rebase_stats["by"][sender] += 1
+            m["rebased_cells"] = total
+        return m
+
     def give_up(self, sender, now):
         """GIVEUP_S가 지난 빈칸을 건너뛰고 쌓아 둔 것을 적용한다. 소유 영역이 있는 클라이언트면 영역을 다시 달라고 한다."""
         missing, held = self.gap_since.get(sender, {}), self.held.get(sender, {})
@@ -208,9 +233,13 @@ class MapServerNode:
         if self.server is None or sender in self.refused:         # 지도 전, 또는 바탕이 달라 거부한 클라이언트의 변경은 버린다
             self.dropped += 1
             return
+        if m["type"] in ("write", "cells") and m.get("seen_n") is not None:
+            m = self.rebase(sender, m)
         apply_message(self.server, m)
         self.n += 1
         m["v"], m["n"] = self.server.version, self.n
+        if m["type"] in ("write", "cells") and m["op"] in EDIT_OPS:       # 편집: 뒤에 오는 다른 쪽 쓰기를 이것에 맞춰 바꾼다
+            self.edits.append((self.n, sender, msg_edit(m)))
         data = json.dumps(m)
         self.ring.append((self.n, data))
         self.pub_up.publish(String(data=data))
@@ -219,7 +248,9 @@ class MapServerNode:
 
     def on_init(self, m, sender):
         bad = []
-        if self.server is None and "base" in m:                   # 바탕 파일 없이 시작한 서버의 첫 init: 이 격자로 지도를 만든다
+        if m.get("observer"):                                     # 관찰자 (바탕 없이 붙음): seq만 1부터 다시, 스냅샷은 클라이언트가 받는다
+            result = "joined" if self.server is not None else "no_map"
+        elif self.server is None and "base" in m:                   # 바탕 파일 없이 시작한 서버의 첫 init: 이 격자로 지도를 만든다
             h = dec(m["base"], tuple(m["shape"]))
             self.server = MapServer(h, tuple(m["z_range"]))
             self.base_hash, self.base_tiles, result = sha(h), tile_shas(h), "first"
@@ -257,7 +288,7 @@ class MapServerNode:
                    "recv_latency_ms": stats_ms(self.lat.get(m["client"], [])),
                    "gap_recovery_ms": stats_ms(self.gap_log.get(m["client"], [])),
                    "gap_delay_ms": stats_ms(self.gap_delay.get(m["client"], [])),
-                   "lost": self.lost_stats()})
+                   "lost": self.lost_stats(), "rebased": self.rebase_stats})
         elif m["type"] == "snapshot" and self.server is not None:   # 지금 상태 전체와 그때의 n (서버는 한 줄로 돌아 사이에 끼는 변경이 없다)
             reply({"type": "snapshot", "n": self.n, "seq": self.seq, "state": enc_state(self.server.state())})
             self.node.get_logger().info(f"스냅샷: {m['client']} (판 {self.server.version}, n {self.n})")

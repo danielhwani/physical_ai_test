@@ -73,6 +73,53 @@ def test_owned_region():
     assert refused, "소유 영역 밖에 own으로 쓰는 것이 막히지 않았다"
 
 
+def test_rebase_exact():
+    """편집 E를 모르고 만든 쓰기 W: 쓴 쪽 사본은 S·W·E, 서버는 S·E·W' (W' = rebase). 두 결과가 비트 단위로 같다 (add끼리만 반올림 차이).
+    모든 종류 짝, 소유 영역 안팎, 이미 자국이 있는 칸."""
+    from sim.map_server import rebase
+    rng = np.random.default_rng(3)
+    zr = (-0.3, 0.3)
+    for k in range(400):
+        base = rng.uniform(-0.05, 0.05, (40, 40))
+        prior = rng.uniform(-0.04, 0.0, (40, 40))                    # 이미 있는 자국 (D가 있는 칸)
+        eop = ("add", "set")[k % 2]
+        wop = ("dig", "set", "own", "add")[(k // 2) % 4]
+        er0, ec0, eh, ew = rng.integers(0, 20), rng.integers(0, 20), rng.integers(1, 20), rng.integers(1, 20)
+        if eop == "add":
+            eb = np.where(rng.random((eh, ew)) < 0.7, rng.uniform(-0.03, 0.03, (eh, ew)), 0.0)
+        else:
+            eb = np.where(rng.random((eh, ew)) < 0.7, rng.uniform(-0.05, 0.05, (eh, ew)), np.nan)
+        wr0, wc0, wh, ww = rng.integers(0, 20), rng.integers(0, 20), rng.integers(1, 20), rng.integers(1, 20)
+        if wop == "add":
+            wb = np.where(rng.random((wh, ww)) < 0.7, rng.uniform(-0.03, 0.03, (wh, ww)), 0.0)
+        else:
+            wb = np.where(rng.random((wh, ww)) < 0.7, rng.uniform(-0.08, 0.05, (wh, ww)), np.nan)
+        owned = wop == "own" or k % 3 == 0                           # 소유 영역 [0, 40) x [20, 40) (own은 그 안에만)
+        if wop == "own":
+            wc0 = max(wc0, 20)
+            wb = wb[:, :max(1, min(ww, 40 - wc0))]
+
+        def fresh():
+            s = MapServer(base, zr)
+            s.write("dig", "x", 0, 0, prior)
+            if owned:
+                s.set_owner(0, 40, 20, 40, "o")
+            return s
+        rows, cols = np.meshgrid(np.arange(wr0, wr0 + wb.shape[0]), np.arange(wc0, wc0 + wb.shape[1]), indexing="ij")
+        wb2, _ = rebase(wop, rows.ravel(), cols.ravel(), wb.ravel(), (eop, er0, ec0, eb), zr)
+        a, b = fresh(), fresh()
+        a.write(wop, "w", wr0, wc0, wb)                              # 쓴 쪽 사본: W 다음 E
+        a.write(eop, "e", er0, ec0, eb)
+        b.write(eop, "e", er0, ec0, eb)                              # 서버: E 다음 W'
+        b.write(wop, "w", wr0, wc0, wb2.reshape(wb.shape))
+        ha, hb = a.compose(0, 40, 0, 40), b.compose(0, 40, 0, 40)
+        inner = (ha > zr[0] + 0.02) & (ha < zr[1] - 0.02)             # 높이 범위 끝(자르기)은 뺀다
+        if wop == eop == "add":           # add끼리: 더하는 순서가 바뀌어 마지막 자리 반올림만 다를 수 있다 ((e+a)+b != (e+b)+a)
+            assert np.allclose(ha[inner], hb[inner], atol=1e-15, rtol=0), (k, np.abs(ha - hb)[inner].max())
+        else:                             # 나머지 짝: 비트 단위로 같다
+            assert np.array_equal(ha[inner], hb[inner]), (k, wop, eop, np.abs(ha - hb)[inner].max())
+
+
 def _terrain():
     t = TerrainMapService((5.0, 3.0), 0.05, (-0.2, 0.4), seed=3, window=(2.0, 2.0))
     t.add_patch({"kind": "rough", "amplitude": 0.015, "region": [1.0, -2.0, 4.0, 2.0]})

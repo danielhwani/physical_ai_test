@@ -70,13 +70,21 @@ class PauseControl:
 STATUS_DT = 0.1      # 상태 스트림 발행 주기 (시뮬레이션 시간 s)
 
 
-def terrain_deformation(before, after, threshold=0.005):
-    """실행 중 지면이 파인 정도 (Chrono 바퀴 자국, 발자국, 시나리오 이벤트). threshold 이상 내려간 셀 기준."""
+def terrain_deformation(before, after, threshold=0.005, terrain=None):
+    """실행 중 지면이 파인 정도 (Chrono 바퀴 자국, 발자국, 시나리오 이벤트). threshold 이상 내려간 셀 기준.
+    terrain: TerrainMapService를 주면 받은 다른 쪽 변경(운용자 편집 등)이 닿은 칸은 빼고 세고, 받은 변경은 map_received_*로 따로 낸다
+    (흙 변형 MOP에 편집이 섞이지 않게. 받은 칸과 자국이 겹친 칸도 빠진다: map_received_cells로 그 크기를 안다)."""
     dz = after - before
+    mask = None if terrain is None else terrain.received_mask
+    if mask is not None:
+        dz = np.where(mask, 0.0, dz)
     dug = dz < -threshold
-    return {"deformed_cells": int(dug.sum()),
-            "deform_mean_m": round(float(dz[dug].mean()), 4) if dug.any() else 0.0,
-            "deform_max_m": round(float(dz.min()), 4) if dug.any() else 0.0}
+    out = {"deformed_cells": int(dug.sum()),
+           "deform_mean_m": round(float(dz[dug].mean()), 4) if dug.any() else 0.0,
+           "deform_max_m": round(float(dz.min()), 4) if dug.any() else 0.0}
+    if terrain is not None:
+        out.update(map_received_changes=terrain.received, map_received_cells=0 if mask is None else int(mask.sum()))
+    return out
 
 
 def parse_value(text):
@@ -256,6 +264,8 @@ class Simulation:
                     self.controller.set_command(*self.command)
             elif e["action"] == "add_patch":
                 self.terrain.add_patch(e["patch"])
+            elif e["action"] == "map_write":       # 실행 때 맵 서버에서 받은 다른 쪽 변경 (재현 시나리오)
+                self.terrain.apply_map_message(e["msg"])
             elif e["action"] == "inject_fault":
                 self._set_fault(e["fault"], e.get("duration"), e.get("params") or {})
             elif e["action"] == "clear_fault":
@@ -279,6 +289,8 @@ class Simulation:
                 desc += f" vx={e['vx']:.2f} yaw={e.get('yaw_rate', 0.0):.2f}"
             elif e["action"] == "add_patch":
                 desc += f" {e['patch']['kind']}"
+            elif e["action"] == "map_write":
+                desc += f" {e['msg']['op']} {e['msg']['writer']}"
             elif e["action"] in ("create_entity", "remove_entity"):
                 desc += f" {e.get('entity_type', 'HMMWV')}"
             elif e["action"] == "set_soil":
@@ -288,6 +300,18 @@ class Simulation:
             self.last_event = (self.data.time, desc)
             if verbose:
                 print(f"[t={self.data.time:6.2f}] event: {desc}" + (f"  (DIS {e['request']})" if e.get("source") == "dis" else ""))
+
+    def _record_map_write(self, m, verbose, t=None):
+        """맵 서버에서 받아 넣은 다른 쪽 변경을 이벤트 기록에 (재현 시나리오: 같은 시각에 map_write로 그대로 넣는다).
+        t: 받은 시각 (없으면 self.data.time. 실시간 경로는 코어 시각을 준다)."""
+        t = self.data.time if t is None else t
+        keep = ("type", "op", "writer", "t", "r0", "c0", "nrow", "ncol", "data", "n_cells", "rows", "cols", "values")
+        e = {"t": t, "applied_t": t, "action": "map_write", "source": "map", "msg": {k: m[k] for k in keep if k in m}}
+        self.event_log.append(e)
+        self.last_event = (t, f"map_write {m['op']} {m['writer']}")
+        if verbose:
+            print(f"[t={t:6.2f}] map: {m['op']} from {m['writer']}"
+                  + (f" (rebased {m['rebased_cells']} cells)" if m.get("rebased_cells") else ""))
 
     def replay_scenario(self):
         """이번 실행을 그대로 다시 돌리는 시나리오: 이벤트 = 적용된 이벤트(적용 시각으로, 콘솔 이벤트 포함) + 아직 안 된 시나리오 이벤트.
@@ -406,6 +430,11 @@ class Simulation:
         self._apply_events(verbose)
         if self.dis is not None:
             self.dis.after_events()              # 적용된 요청에 Complete, 주기 보고
+        commit_due = d.time >= self.next_terrain_commit
+        if commit_due:                           # 원격 맵 서버의 다른 쪽 변경: 이벤트 바로 뒤 (재현 시나리오에서 같은 시각 이벤트와 같은 자리)
+            self.terrain.time = d.time
+            for m in self.terrain.poll_server():
+                self._record_map_write(m, verbose)
         if self.cosim is not None:
             self.cosim.robot_xy = d.qpos[:2]      # 다음 Chrono 요청에 실림 (차량 양보 판단)
             self.cosim.sync(d.time)              # Chrono 결과 반영 (지형 원천 갱신 + 차량 포즈)
@@ -416,8 +445,7 @@ class Simulation:
                 if verbose:
                     print(f"[t={d.time:6.2f}] event: vehicle_near ({dist:.2f} m)")
         terrain_changed = False
-        if d.time >= self.next_terrain_commit:
-            self.terrain.poll_server()                 # 원격 맵 서버의 다른 쪽 변경 (없으면 아무 일 없음)
+        if commit_due:
             if self.terrain.recenter(*d.qpos[:2], trigger=self.window_trigger):
                 # 창 이동: 지형 mocap 바디를 새 창 중심으로 옮기고 창 영역을 다시 채운다 (월드 좌표의 높이는 그대로)
                 d.mocap_pos[self.terrain_mocap] = [*self.terrain.window_center, 0.0]
@@ -480,6 +508,8 @@ def run(args):
         from .map_base import prepare_base
         from .ros2_bridge import launch_map_server
         map_proc = launch_map_server(ROOT / "build", base=prepare_base(scenario, getattr(args, "map_base", None)))
+        from .map_client import domain_id
+        print(f"맵 서버: 별도 프로세스, ROS_DOMAIN_ID {domain_id()} (편집 도구·관찰자도 같은 값으로: python -m sim.map_edit ...)")
     sim = Simulation(scenario, variant=args.variant, policy=args.policy,
                      sensors=None if sensor_node else getattr(args, "sensor", None),
                      map_client="sim" if map_proc is not None else None)
@@ -758,7 +788,7 @@ def run(args):
         "mean_speed_mps": round(dist / max(d.time - 1.0, 1e-6), 3),
         "cost_of_transport": round(energy_total / (sim.total_mass * 9.81 * max(dist, 1e-6)), 3),
         "min_vehicle_distance_m": round(sim.cosim.min_dist, 3) if sim.cosim is not None and np.isfinite(sim.cosim.min_dist) else None,   # 차가 한 번도 안 나왔으면 None
-        **terrain_deformation(terrain0, sim.terrain.applied),
+        **terrain_deformation(terrain0, sim.terrain.applied, terrain=sim.terrain),
         # 보행 알고리즘의 상태 추정 오차 (알고리즘은 참값을 모른다. 여기서 판정만 한다)
         "est_speed_rmse_mps": round(float(np.sqrt(np.mean(np.square(est_err_v[25:])))), 4) if len(est_err_v) > 25 else None,
         "est_yaw_err_end_deg": round(float(np.degrees(est_err_yaw[-1])), 2) if est_err_yaw else None,
@@ -796,6 +826,9 @@ def run(args):
                               "forward_x_m": mop["forward_x_m"], "fell": mop["fell"]})
         sim.dis.close()
         (out / "scenario_replay.yaml").write_text(yaml.safe_dump(sim.replay_scenario(), allow_unicode=True, sort_keys=False))
+    elif any(e["action"] == "map_write" for e in sim.event_log):   # 맵 서버에서 받은 다른 쪽 변경(운용자 편집 등)을 받은 시각으로 넣은 시나리오
+        (out / "scenario_replay.yaml").write_text(yaml.safe_dump(sim.replay_scenario(), allow_unicode=True, sort_keys=False))
+        print(f"받은 지형 변경 {sum(e['action'] == 'map_write' for e in sim.event_log)}개 -> {out.relative_to(ROOT)}/scenario_replay.yaml")
     for name, scans in scan_log.items():      # LiDAR 원시 출력: 프레임별 센서 좌표 점군 + 센서 월드 자세
         np.savez_compressed(out / f"{name}.npz", t=np.array([s["t"] for s in scans]),
                             frame=np.concatenate([np.full(len(s["points"]), i, np.int32) for i, s in enumerate(scans)]),

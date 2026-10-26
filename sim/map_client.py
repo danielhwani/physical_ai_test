@@ -39,7 +39,7 @@ import time
 
 import numpy as np
 
-from .map_server import MapServer
+from .map_server import EDIT_OPS, MapServer, rebase
 
 TOPICS = ("/map/write", "/map/updates", "/map/info", "/map/request", "/map/reply")
 GAP_ASK_S = 0.2       # 받는 쪽 빈칸: 이 주기로 다시 달라고 한다 (s)
@@ -86,6 +86,19 @@ def tile_hashes(server):
     return out
 
 
+def domain_id():
+    import os
+    return os.environ.get("ROS_DOMAIN_ID") or "0 (정하지 않음)"
+
+
+def no_server_message(wait_s):
+    return (f"맵 서버가 없다 ({wait_s:g} s 기다림, 이 터미널의 ROS_DOMAIN_ID = {domain_id()}). 확인할 것:\n"
+            f"  - 시뮬레이터 터미널과 ROS_DOMAIN_ID가 같은가 (두 터미널에서 echo $ROS_DOMAIN_ID)\n"
+            f"  - 시뮬레이터를 --map-server (또는 --map-base)로 띄웠는가, 아직 돌고 있는가 (이미 끝났으면 서버도 끝난다)\n"
+            f"  - 시뮬레이터가 모델을 다 만들고 걷기 시작했는가 (몇 초 걸린다)\n"
+            f"  - 서버만 따로 띄울 때: python -m sim.map_server_node --base build/maps/<이름>")
+
+
 def stats_ms(xs):
     """지연 분포 (s 목록 -> ms 요약)."""
     if not xs:
@@ -105,6 +118,43 @@ def audit_mop(au):
             "map_lost_changes": None if not g else sum(d.get("lost", 0) for d in g.get("server_lost", {}).values()),   # 서버가 끝내 적용 못 한 변경 (모든 클라이언트)
             "map_recv_latency_p95_ms": lat.get("recv", {}).get("p95"),      # 이 클라이언트가 보낸 변경이 서버에 닿기까지
             "map_apply_latency_p95_ms": lat.get("apply", {}).get("p95")}    # 다른 쪽 변경이 이 사본(물리)에 들어가기까지
+
+
+def msg_cells(m):
+    """write / cells 메시지 -> (rows, cols, 값) 1차원 (rebase용)."""
+    if m["type"] == "write":
+        b = dec(m["data"], (m["nrow"], m["ncol"]))
+        rows, cols = np.meshgrid(np.arange(m["r0"], m["r0"] + m["nrow"]), np.arange(m["c0"], m["c0"] + m["ncol"]), indexing="ij")
+        return rows.ravel(), cols.ravel(), b.ravel()
+    return (np.frombuffer(base64.b64decode(m["rows"]), "<i4").astype(int), np.frombuffer(base64.b64decode(m["cols"]), "<i4").astype(int),
+            dec(m["values"], (m["n_cells"],)))
+
+
+def msg_with_values(m, vals):
+    m = dict(m)
+    if m["type"] == "write":
+        m["data"] = enc(np.asarray(vals).reshape(m["nrow"], m["ncol"]))
+    else:
+        m["values"] = enc(vals)
+    return m
+
+
+def msg_edit(m):
+    """편집 메시지(add, set) -> rebase에 넘길 (op, r0, c0, block). 흩어진 칸은 감싸는 사각형으로 (add는 0, set은 NaN으로 채움)."""
+    if m["type"] == "write":
+        return m["op"], m["r0"], m["c0"], dec(m["data"], (m["nrow"], m["ncol"]))
+    rows, cols, vals = msg_cells(m)
+    r0, c0 = rows.min(), cols.min()
+    block = np.full((rows.max() - r0 + 1, cols.max() - c0 + 1), 0.0 if m["op"] == "add" else np.nan)
+    block[rows - r0, cols - c0] = vals
+    return m["op"], int(r0), int(c0), block
+
+
+def rebase_msg(m, edit, z_range):
+    """메시지 m을 편집 edit에 맞춰 바꾼다 (sim/map_server.py rebase). 반환: (새 메시지, 바꾼 칸 수)."""
+    rows, cols, vals = msg_cells(m)
+    out, k = rebase(m["op"], rows, cols, vals, edit, z_range)
+    return (msg_with_values(m, out), k) if k else (m, 0)
 
 
 def apply_message(server, m):
@@ -150,6 +200,9 @@ class RemoteMap:
         self.unacked = {}                                        # seq -> [JSON, 보낸 시각]: 메아리가 올 때까지 (다시 보내기)
         self.unacked_max = unacked_max
         self.my_owners = []                                      # 이 클라이언트가 선언한 소유 영역 (r0, r1, c0, c1, 쓴 쪽): 다시 보내기용
+        self.inflight = []                                       # 사본에 먼저 넣고 아직 서버 순서로 확인 안 된 자기 편집 [(seq, edit)]
+        self.applied_log = []                                    # 사본에 넣은 다른 쪽 변경 (바꾼 뒤): 시뮬레이터가 재현 시나리오에 적는다
+        self.rebased = {"msgs": 0, "cells": 0}                   # 자기 편집에 맞춰 바꾼 다른 쪽 변경
         self.gap = None                                          # 받는 쪽 빈칸 {"n": 빠진 첫 번호, "since", "asked"} (monotonic)
         self.need_resync = False                                 # 서버가 빈칸 구간을 더 들고 있지 않다 (too_old): 다음 poll에서 스냅샷
         self.stats = {"gaps": 0, "replayed": 0, "resyncs": 0, "resent": 0, "dropped_out": 0, "dropped_in": 0, "recovery": [],
@@ -164,9 +217,14 @@ class RemoteMap:
         self.node.create_subscription(String, "/map/reply", self._on_reply, rel)
         self.node.create_subscription(String, "/map/info", self._on_info, latched)
         self._wait(lambda: self.pub.get_subscription_count() > 0 and self.node.count_publishers("/map/updates") > 0,
-                   "맵 서버가 없다 (python -m sim.map_server_node)")     # 안 기다리면 init이 사라진다
+                   no_server_message(wait_s))                     # 안 기다리면 init이 사라진다
         if base is None:                                         # 관찰자: 서버에 지도가 있을 때까지
             self._wait(lambda: self.info and "grid" in self.info, "맵 서버에 아직 지도가 없다 (첫 클라이언트의 init 전)")
+            # 짧은 init: 같은 이름이 전에 붙었으면 서버의 seq가 남아 있어 이 클라이언트의 쓰기(seq 1부터)를 중복으로 버린다
+            nonce = hashlib.sha256(f"{name} {time.time_ns()} {id(self)}".encode()).hexdigest()[:16]
+            self._send({"type": "init", "writer": name, "observer": True, "nonce": nonce})
+            self._wait(lambda: (self.info or {}).get("inits", {}).get(name, {}).get("nonce") == nonce,
+                       "맵 서버가 init에 답하지 않는다 (/map/info)")
             self._join()
             return
         from .map_base import tile_shas
@@ -245,6 +303,7 @@ class RemoteMap:
             del self.unacked[s]
         for s in sorted(self.unacked):                           # 서버가 아직 못 받은 자기 변경: 스냅샷 위에 다시
             apply_message(self.local, json.loads(self.unacked[s][0]))
+        self.inflight = [x for x in self.inflight if x[0] > done]
         if self.gap is not None and not self.pending:           # 빈칸이 스냅샷으로 메워졌다
             self.stats["recovery"].append(time.monotonic() - self.gap["since"])
             self.gap = None
@@ -254,6 +313,10 @@ class RemoteMap:
         self.seq += 1
         self.sent["write" if m["type"] in ("write", "cells") else m["type"]] += 1
         m["seq"], m["from"], m["wall"] = self.seq, self.name, time.time()   # from = 보낸 클라이언트, writer = 변경의 쓴 쪽
+        if hasattr(self, "local"):
+            m["seen_n"] = self.next_n - 1                        # 이 쓰기를 만들 때 사본에 들어 있던 서버 번호 (서버가 rebase에 쓴다)
+        if m["type"] in ("write", "cells") and m["op"] in EDIT_OPS:
+            self.inflight.append((self.seq, msg_edit(m)))
         data = json.dumps(m)
         if m["type"] != "init":                                  # 메아리가 올 때까지 들고 있다 (init은 답을 기다린다)
             self.unacked[self.seq] = [data, time.monotonic()]
@@ -330,9 +393,20 @@ class RemoteMap:
             self._resync()
             n += 1
         late = self.gap is not None                              # 빈칸이 열려 있었다: 이번에 반영하는 것은 그 때문에 늦었다
+        zr = (self.local.z_min, self.local.z_max)
         while self.next_n in self.pending:                       # n 순서대로 (자기 메아리는 이미 사본에 있어 건너뛴다)
             m = self.pending.pop(self.next_n)
-            if m.get("from") != self.name:
+            if m.get("from") == self.name:
+                self.inflight = [x for x in self.inflight if x[0] != m["seq"]]   # 서버 순서가 확인된 자기 편집
+            else:
+                # 서버는 이것을 아직 확인 안 된 자기 편집보다 앞에 놓았지만 사본에는 그 편집이 먼저 들어 있다: 편집에 맞춰 바꾼다
+                if m["type"] in ("write", "cells"):
+                    for _, e in self.inflight:
+                        m, k = rebase_msg(m, e, zr)
+                        if k:
+                            self.rebased["msgs"] += 1
+                            self.rebased["cells"] += k
+                self.applied_log.append(m)
                 apply_message(self.local, m)
                 self.lat["apply"].append(now - m["wall"])
                 if late:                                         # 보낸 때부터 (빈칸을 알아채기까지 걸린 시간 포함)
@@ -414,6 +488,7 @@ class RemoteMap:
                         "resyncs": st["resyncs"], "resent": st["resent"], "server_side_recovery_ms": got.get("gap_recovery_ms", {"n": 0}),
                         "server_side_delay_ms": got.get("gap_delay_ms", {"n": 0}),
                         "evicted": st["evicted"], "refreshed": st["refreshed"], "server_lost": got.get("lost", {}),
+                        "rebased_here": dict(self.rebased), "rebased_server": got.get("rebased", {}),
                         "dropped_test": {"out": st["dropped_out"], "in": st["dropped_in"]}}}
         if self.joined:
             out["joined"] = self.joined

@@ -108,7 +108,8 @@ class Ros2StreamPublisher:
 
         self._T, self._Twist, self._Clock, self._JS, self._TF, self._String = (
             TransformStamped, TwistStamped, Clock, JointState, TFMessage, String)
-        rclpy.init()
+        if not rclpy.ok():              # 맵 클라이언트(--map-server)가 같은 프로세스에서 먼저 초기화했을 수 있다
+            rclpy.init()
         self.node = rclpy.create_node("mujoco_sim")
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.pub_tf = self.node.create_publisher(TFMessage, "/tf", 10)
