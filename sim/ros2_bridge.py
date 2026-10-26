@@ -71,23 +71,7 @@ def launch_controller_node(log_dir, scenario_path=None, policy=None, viz=False):
     return subprocess.Popen(cmd, cwd=ROOT, stdout=open(log_dir / "controller_node.log", "w"), stderr=subprocess.STDOUT)
 
 
-GODOT_BIN = os.environ.get("GODOT_BIN", str(Path.home() / "Applications/godot/Godot_v4.7.2-stable_linux.x86_64"))
-GODOT_PORT = 4243
-
-
-def launch_godot(log_dir, port=GODOT_PORT, points=False):
-    """Godot 4 렌더러: 중계기(중립 스트림 -> TCP)와 Godot 프로젝트(godot/). (godot, 중계기) 프로세스를 반환.
-    points: LiDAR 점군과 알고리즘 지형 지도도 그린다 (--godot-lidar).
-    GODOT_BIN으로 실행 파일을, GODOT_ARGS로 Godot 쪽 추가 인자(예: 시험용 --shot=경로 --shot-frames=N)를 바꾼다."""
-    bridge = subprocess.Popen([sys.executable, "-m", "viz.godot_bridge", "--port", str(port), *(["--points"] if points else [])],
-                              cwd=ROOT,
-                              stdout=open(log_dir / "godot_bridge.log", "w"), stderr=subprocess.STDOUT)
-    if not Path(GODOT_BIN).exists():
-        raise SystemExit(f"Godot 실행 파일이 없다: {GODOT_BIN} (README \"Godot 4 렌더러\", 또는 GODOT_BIN)")
-    extra = os.environ.get("GODOT_ARGS", "").split()
-    godot = subprocess.Popen([GODOT_BIN, "--path", str(ROOT / "godot"), "--", f"--port={port}", *extra], cwd=ROOT,
-                             stdout=open(log_dir / "godot.log", "w"), stderr=subprocess.STDOUT)
-    return godot, bridge
+from viz.godot_launch import GODOT_BIN, GODOT_PORT, launch_godot  # noqa: E402,F401  (Godot 렌더러 띄우기는 viz에 한 곳)
 
 
 def launch_mujoco_viewer(log_dir):

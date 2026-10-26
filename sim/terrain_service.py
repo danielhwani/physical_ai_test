@@ -97,6 +97,7 @@ class TerrainMapService:
         if remote:
             from .map_client import RemoteMap
             self.server = RemoteMap(self.target, (self.z_min, self.z_max), name=remote)
+            self.server.keep_applied = True              # 받은 변경을 재현 시나리오에 적는다 (poll_server가 비운다)
             if self.server.joined:                       # 나중에 붙음: 서버에 이미 있던 변경까지 받은 지도에서 시작
                 self.target = self.server.compose(0, self.nrow, 0, self.ncol)
                 self.version += 1

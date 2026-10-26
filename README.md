@@ -46,6 +46,7 @@ python conformance/test_map_server.py                    # 맵 서버 1단계: �
 python conformance/test_map_remote.py                    # 맵 서버 2단계: 별도 프로세스 서버 + 클라이언트 (주고받기, 다른 바탕 거부, 감사, 늦게 붙기, 지연, 바탕 파일, 빈칸 복구, 이어 시작)
 python conformance/test_map_base.py                      # 맵 서버 2c: 바탕 파일 (쓰고 읽기, 고친 타일 찾기, 시나리오 바탕 = 시작 지형)
 python conformance/test_map_edit.py                      # 맵 서버 3a: 실행 중 운용자 편집이 물리에 들어가고, 재현 시나리오가 비트 동일 (약 40초)
+python conformance/test_map_render.py                    # 맵 서버 3b: 변경 700개 뒤에 붙은 렌더러 (패치 토픽은 틀리고, 맵 서버는 같음)
 python conformance/compare_variants.py [--policy card.yaml]   # cpu vs mjx 설정의 MOP 분포 비교
 python conformance/probe_scm_injection.py [--record build/scm_press.npz] [--plot PNG]   # SCM에 바깥 높이 넣기: 접촉은 따라가고 다짐 이력은 안 넘어감 (docs/map_server.md 5.5). 어느 환경이든: chrono 환경으로 다시 실행
 python conformance/probe_scm_compaction.py [--record build/scm_compaction.npz]   # 다짐 -> 단단한 흙 콜백: kphi ×25로 다짐 흉내 (약 1분)
@@ -495,6 +496,8 @@ RViz, MuJoCo 화면과 같은 중립 렌더 스트림을 받는 세 번째 렌�
 python -m sim.runner scenarios/flat_trot.yaml --godot                       # Python
 python -m sim.rt_link scenarios/soil_strip.yaml --brain shm --godot         # C++ 코어 (실시간)
 python -m sim.runner scenarios/vehicle_crossing.yaml --godot                # HMMWV (Chrono)
+python -m sim.runner scenarios/vehicle_crossing.yaml --map-server --godot   # 지형을 맵 서버에서 (3b)
+python -m viz.godot_launch --map-server                                     # 돌고 있는 --map-server 시뮬레이터에 나중에 붙이기 (시뮬레이터는 --godot 없이)
 python -m sim.rt_link scenarios/rut_crossing.yaml --brain shm --godot-lidar  # + LiDAR 점군
 python conformance/test_render_stream.py                                    # 중계기 메시지 시험 포함
 ```
@@ -2078,7 +2081,9 @@ python -m sim.rt_link scenarios/flat_trot.yaml --brain ros --remote-brain --ros-
      소유 영역은 통째로 다시 받음). 2단계 끝.
      3a (2026-10-26): 운용자 편집 `python -m sim.map_edit bump|ramp|rough|rut|set ...` (실행 중인 `--map-server` 시뮬레이터에 다른
      터미널에서). 받은 편집은 `scenario_replay.yaml`에 받은 시각으로 적혀 다시 돌리면 비트 동일. 엇갈린 편집은 서버 번호로 바꿔 맞춘다
-     (rebase: 버리지 않음). 다음: 3b (렌더러를 맵 클라이언트로), 3c (Chrono를 별도 클라이언트로).
+     (rebase: 버리지 않음).
+     3b (2026-10-26): Godot 렌더러가 지형을 맵 서버에서 받는다 (`--map-server --godot`, 또는 나중에 `python -m viz.godot_launch
+     --map-server`). 실행 중 언제 붙어도 같은 지형. 다음: 3c (Chrono를 별도 클라이언트로).
   4. **타당성 확인**: 지금 결과는 모두 단일 SCM과의 일관성이다. 실제 흙과 비교하려면 판 재하 시험이나 반복 주행 시험의 실측 자료와
      그에 맞춘 흙 매개변수가 필요하다. 자료를 구하는 것부터 정한다.
 - 급하지 않은 것: Godot에 한글 글꼴 넣기 (지금 화면 글자는 영어와 숫자만), 다른 PC 두뇌 + 지형 인지 실시간 실행의 결과 흔들림

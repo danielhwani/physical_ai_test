@@ -202,6 +202,7 @@ class RemoteMap:
         self.my_owners = []                                      # 이 클라이언트가 선언한 소유 영역 (r0, r1, c0, c1, 쓴 쪽): 다시 보내기용
         self.inflight = []                                       # 사본에 먼저 넣고 아직 서버 순서로 확인 안 된 자기 편집 [(seq, edit)]
         self.applied_log = []                                    # 사본에 넣은 다른 쪽 변경 (바꾼 뒤): 시뮬레이터가 재현 시나리오에 적는다
+        self.keep_applied = False                                # 켜는 쪽(시뮬레이터)만 쌓는다: 관찰자·렌더러가 오래 돌면 메모리가 는다
         self.rebased = {"msgs": 0, "cells": 0}                   # 자기 편집에 맞춰 바꾼 다른 쪽 변경
         self.gap = None                                          # 받는 쪽 빈칸 {"n": 빠진 첫 번호, "since", "asked"} (monotonic)
         self.need_resync = False                                 # 서버가 빈칸 구간을 더 들고 있지 않다 (too_old): 다음 poll에서 스냅샷
@@ -406,7 +407,8 @@ class RemoteMap:
                         if k:
                             self.rebased["msgs"] += 1
                             self.rebased["cells"] += k
-                self.applied_log.append(m)
+                if self.keep_applied:
+                    self.applied_log.append(m)
                 apply_message(self.local, m)
                 self.lat["apply"].append(now - m["wall"])
                 if late:                                         # 보낸 때부터 (빈칸을 알아채기까지 걸린 시간 포함)

@@ -1,11 +1,15 @@
 """Godot 4 어댑터의 중계기: 중립 렌더 스트림(ROS2) -> TCP (127.0.0.1, 한 줄에 JSON 하나) -> Godot 프로젝트(godot/).
 
-    python -m viz.godot_bridge [--port 4243] [--points]   (sim.runner / sim.rt_link --godot가 Godot와 함께 자동 실행)
+    python -m viz.godot_bridge [--port 4243] [--points] [--map-server]   (sim.runner / sim.rt_link --godot,
+                                                                          또는 python -m viz.godot_launch가 Godot와 함께 실행)
 
 GDScript는 ROS2를 직접 받지 못하므로 이 중계기가 받아 Godot가 바로 쓸 형태로 넘긴다. 좌표는 ROS(REP-103) 그대로 보내고,
 Godot 쪽에서 장면 맨 위 노드 하나를 X축 -90° 돌려(ROS (x, y, z) -> Godot (x, z, -y)) 변환을 한 곳에서 끝낸다.
 
   입력  /sim/scene_manifest, /sim/terrain_patch, /sim/terrain_overlay, /tf, /sim/status
+        --map-server: 지형은 /sim/terrain_patch 대신 맵 서버에서 (관찰자로 붙어 스냅샷 + 그 뒤 변경, docs/map_server.md 3b).
+        실행 중 언제 붙어도 지금 지형 전체를 받는다 (/sim/terrain_patch는 최근 500개만 다시 준다). 화면은 서버 지도(원천)라 물리 반영보다
+        조금 앞설 수 있다 (물리는 5 Hz로 반영하고 발 근처 칸은 발이 떠날 때까지 미룬다).
   출력  {"type": "scene", ...}    바디 이름, 외형(OBJ 절대 경로, 바디 좌표 pos/quat, 색), 흙 지역
         {"type": "terrain", ...}  로봇 주변 창의 표시 높이 격자(지형 - 화면 발자국 깊이)와 꼭짓점 색 (RViz와 같은 색 규칙), base64 float32
         {"type": "poses", ...}    바디 월드 포즈 {이름: [x, y, z, qx, qy, qz, qw]} (약 30 Hz)
@@ -19,6 +23,7 @@ Godot 쪽에서 장면 맨 위 노드 하나를 X축 -90° 돌려(ROS (x, y, z) 
 import argparse
 import base64
 import json
+import os
 import re
 import socket
 import time
@@ -145,8 +150,9 @@ def markers_to_world(msg, poses):
 
 
 class GodotBridge(Node):
-    def __init__(self, port, points=False):
+    def __init__(self, port, points=False, map_server=False):
         super().__init__("godot_bridge")
+        self.use_map, self.map = map_server, None       # 맵 서버 관찰자 (manifest를 받은 뒤 붙는다)
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         history = QoSProfile(depth=500, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(String, "/sim/scene_manifest", self.on_manifest, latched)
@@ -177,6 +183,9 @@ class GodotBridge(Node):
         res = 2 * t["half_size"][0] / (t["ncol"] - 1)
         half = min(TERRAIN_HALF, max(1.0, np.floor(res * np.sqrt(MAX_CELLS) / 2)))
         self.window = TerrainWindow(t, half=half, max_cells=0)
+        if self.use_map:                                 # 지형은 맵 서버에서 (패치 토픽은 쓰지 않는다)
+            self.pending = []
+            self.attach_map()
         for p in self.pending:
             self.grid.apply(p)
         for p in self.pending_overlay:
@@ -185,7 +194,27 @@ class GodotBridge(Node):
         self.terrain_dirty = True
         self.send_scene()
 
+    def attach_map(self):
+        from sim.map_client import RemoteMap                 # 물리엔진이 아니라 지도 사본 (numpy만)
+        if self.map is None:
+            self.map = RemoteMap(None, name=f"godot_{os.getpid()}")
+            j = self.map.joined
+            self.get_logger().info(f"맵 서버에 붙음: 판 {self.map.local.version} (스냅샷 {j['s']} s)")
+        g = self.grid
+        assert (self.map.local.nrow, self.map.local.ncol) == (g.nrow, g.ncol), "맵 서버 격자와 장면 매니페스트 격자가 다르다"
+        g.heights = self.map.local.compose(0, g.nrow, 0, g.ncol).astype(np.float32)
+        g.version = self.map.local.version
+
+    def poll_map(self):
+        if self.map is not None and self.map.poll() > 0:
+            g = self.grid
+            g.heights = self.map.local.compose(0, g.nrow, 0, g.ncol).astype(np.float32)
+            g.version = self.map.local.version
+            self.terrain_dirty = True
+
     def on_patch(self, msg):
+        if self.use_map:
+            return
         p = json.loads(msg.data)
         if self.grid is None:
             self.pending.append(p)
@@ -297,6 +326,7 @@ class GodotBridge(Node):
         next_pose = next_terrain = next_points = next_find = next_markers = 0.0
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.005)
+            self.poll_map()
             self.accept()
             now = time.monotonic()
             if now >= next_find:
@@ -328,14 +358,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--points", action="store_true", help="LiDAR 점군과 알고리즘 지형 지도도 넘긴다")
+    ap.add_argument("--map-server", action="store_true", help="지형을 맵 서버에서 (언제 붙어도 지금 지형 전체)")
     a = ap.parse_args()
     rclpy.init()
-    node = GodotBridge(a.port, points=a.points)
+    node = GodotBridge(a.port, points=a.points, map_server=a.map_server)
     try:
         node.run()
     except (KeyboardInterrupt, ExternalShutdownException):     # 실행기가 끝나며 멈춤 신호를 보냄
         pass
     finally:
+        if node.map is not None:
+            node.map.close()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
