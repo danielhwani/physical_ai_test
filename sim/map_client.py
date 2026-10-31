@@ -5,7 +5,8 @@
     python -m sim.map_client --observe        늦게 붙는 관찰자: 지금 지도를 받아 따라가며 판, 지연을 찍는다 (Ctrl+C로 끝내면 감사)
 
   전송 (ROS2 std_msgs/String, JSON. 높이는 float64 little-endian base64: 사본이 비트 단위로 같아야 해서)
-    /map/write    클라이언트 -> 서버   {"type": "init" | "write" | "cells" | "owner", "writer", "from", "seq", "wall", ...}
+    /map/write    클라이언트 -> 서버   {"type": "init" | "write" | "cells" | "owner" | "traj", "writer", "from", "seq", "wall", ...}
+                                       traj: 바퀴 궤적 (지도는 안 바뀐다. 서버 번호만 받아 전달. 받는 물리 엔진이 고스트 바퀴로 재생, 4단계 시제품)
     /map/updates  서버 -> 클라이언트   위 메시지에 서버가 매긴 판 "v"와 내보낸 번호 "n"을 붙여 그대로 (init 제외)
     /map/info     서버 (늦게 붙어도 받음) {"format", "rules", "tile", "grid", "z_range", "version", "n", "owners", "writers", ...}
     /map/request  클라이언트 -> 서버   {"type": "audit" | "snapshot" | "replay" | "save", "client", "id", ...}
@@ -167,6 +168,8 @@ def apply_message(server, m):
                            np.frombuffer(base64.b64decode(m["cols"]), "<i4"), dec(m["values"], (n,)), t=m.get("t"))
     elif m["type"] == "owner":
         server.set_owner(m["r0"], m["r1"], m["c0"], m["c1"], m["writer"])
+    elif m["type"] == "traj":                                    # 바퀴 궤적: 지도는 안 바뀐다 (받는 물리 엔진이 고스트 바퀴로 재생, 4단계)
+        pass
     else:
         raise ValueError(f"모르는 메시지: {m['type']}")
 
@@ -181,7 +184,7 @@ class RemoteMap:
         """tcp: "127.0.0.1:포트"면 ROS2 대신 맵 서버의 TCP 입구로 (ROS2가 없는 클라이언트, sim/map_transport.py)."""
         from .map_transport import RosTransport, TcpTransport
         self.name, self.seq, self.wait_s = name, 0, wait_s
-        self.sent = {"init": 0, "owner": 0, "write": 0}              # 보낸 메시지 종류별 수 (write = write + cells, 지도 변경)
+        self.sent = {"init": 0, "owner": 0, "write": 0, "traj": 0}   # 보낸 메시지 종류별 수 (write = write + cells, 지도 변경)
         self.n_cb = 0                                            # 받은 콜백 수 (poll이 더 받을 것이 없을 때까지 돌기 위해)
         self.pending = {}                                        # n -> 받은 /map/updates (자기 메아리 포함), n 순서대로 소비
         self.next_n = 1                                          # 다음에 받을 서버 번호 n (그 앞은 사본에 다 들어 있다)
@@ -192,6 +195,7 @@ class RemoteMap:
         self.applied_log = []                                    # 사본에 넣은 다른 쪽 변경 (바꾼 뒤): 시뮬레이터가 재현 시나리오에 적는다
         self.keep_applied = False                                # 켜는 쪽(시뮬레이터)만 쌓는다: 관찰자·렌더러가 오래 돌면 메모리가 는다
         self.no_log = set()                                      # 쌓지 않는 쓴 쪽 (같이 도는 물리엔진 Chrono: 다시 돌리면 다시 나온다)
+        self.traj_in = []                                        # 받은 다른 쪽 바퀴 궤적 메시지 (서버 번호 순서). 쓰는 쪽이 꺼내 간다
         self.seen_override = None                                # 있으면 seen_n으로 이 번호를 알린다 (Chrono: 사본이 아니라 SCM에 넣은 번호)
         self.no_rebase_from = None                               # 있으면 이 클라이언트들의 편집에는 서버가 맞추지 않는다
         self.rebased = {"msgs": 0, "cells": 0}                   # 자기 편집에 맞춰 바꾼 다른 쪽 변경
@@ -397,6 +401,9 @@ class RemoteMap:
             del self.pending[self.next_n]
             if m.get("from") == self.name:
                 self.inflight = [x for x in self.inflight if x[0] != m["seq"]]   # 서버 순서가 확인된 자기 편집
+            elif m["type"] == "traj":
+                self.traj_in.append(m)
+                self.applied_seq[m["from"]] = m["seq"]
             else:
                 # 서버는 이것을 아직 확인 안 된 자기 편집보다 앞에 놓았지만 사본에는 그 편집이 먼저 들어 있다: 편집에 맞춰 바꾼다
                 if m["type"] in ("write", "cells"):
@@ -474,6 +481,12 @@ class RemoteMap:
         for r0, r1, c0, c1, writer in self.my_owners:
             self.write("own", writer, r0, c0, self.local.compose(r0, r1, c0, c1))
             self.stats["refreshed"] += 1
+
+    def send_traj(self, writer, k0, every, frames, tire, end=False):
+        """바퀴 궤적 (docs/map_server.md 4단계). frames: 프레임, 바퀴, 13 (위치 3, 쿼터니언 4, 속도 3, 각속도 3), 물리 스텝 k0부터 every 스텝마다."""
+        frames = np.asarray(frames, float)
+        self._send({"type": "traj", "writer": writer, "k0": int(k0), "every": int(every), "shape": list(frames.shape), "data": enc(frames) if frames.size else "",
+                    "tire": list(tire), "end": bool(end)})
 
     def set_owner(self, r0, r1, c0, c1, writer):
         self.my_owners.append((int(r0), int(r1), int(c0), int(c1), writer))

@@ -140,6 +140,16 @@ class Car:
         return di
 
 
+def log_row(car, t, x, y, z, di):
+    """구간 기록 한 줄 (뒤 차): 시각, 길 기준 옆 위치, y, 차체 높이, 앞뒤 기울기, 옆 기울기, 바퀴 중심 높이 평균, 속도, 스로틀, 브레이크."""
+    v = car.car.GetVehicle()
+    rot = chrono.ChMatrix33d(v.GetRot())
+    # 차체 축: x = 앞. 앞뒤 기울기 = 앞 축의 z 성분, 옆 기울기 = 옆 축의 z 성분
+    fwd, left = rot.GetAxisX(), rot.GetAxisY()
+    wz = [v.GetSpindlePos(a, side).z for a in (0, 1) for side in (veh.LEFT, veh.RIGHT)]
+    return (t, x - path_x(y), y, z, math.degrees(math.asin(fwd.z)), math.degrees(math.asin(left.z)), np.mean(wz), v.GetSpeed(), di.m_throttle, di.m_braking)
+
+
 def heights(terrain):
     return {(n.x, n.y): h for n, h in terrain.GetModifiedNodes(True)}
 
@@ -307,14 +317,7 @@ def run(kphi, front, rear, levels=None, until=None, stiff=None, ghost=None, stri
         if rc is not None:
             x, y, z = rc.pos()
             if WINDOW[0] <= y <= WINDOW[1]:
-                v = rc.car.GetVehicle()
-                q = v.GetRot()
-                rot = chrono.ChMatrix33d(q)
-                # 차체 축: x = 앞. 앞뒤 기울기 = 앞 축의 z 성분, 옆 기울기 = 옆 축의 z 성분
-                fwd, left = rot.GetAxisX(), rot.GetAxisY()
-                wz = [v.GetSpindlePos(a, side).z for a in (0, 1) for side in (veh.LEFT, veh.RIGHT)]
-                log.append((t, x - path_x(y), y, z, math.degrees(math.asin(fwd.z)), math.degrees(math.asin(left.z)), np.mean(wz), v.GetSpeed(),
-                            inputs[-1].m_throttle, inputs[-1].m_braking))
+                log.append(log_row(rc, t, x, y, z, inputs[-1]))
             if y > WINDOW[1] + 3.0:
                 break
         elif fc.pos()[1] > (until if until is not None else Y_END):
