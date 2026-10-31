@@ -192,6 +192,8 @@ class RemoteMap:
         self.applied_log = []                                    # 사본에 넣은 다른 쪽 변경 (바꾼 뒤): 시뮬레이터가 재현 시나리오에 적는다
         self.keep_applied = False                                # 켜는 쪽(시뮬레이터)만 쌓는다: 관찰자·렌더러가 오래 돌면 메모리가 는다
         self.no_log = set()                                      # 쌓지 않는 쓴 쪽 (같이 도는 물리엔진 Chrono: 다시 돌리면 다시 나온다)
+        self.seen_override = None                                # 있으면 seen_n으로 이 번호를 알린다 (Chrono: 사본이 아니라 SCM에 넣은 번호)
+        self.no_rebase_from = None                               # 있으면 이 클라이언트들의 편집에는 서버가 맞추지 않는다
         self.rebased = {"msgs": 0, "cells": 0}                   # 자기 편집에 맞춰 바꾼 다른 쪽 변경
         self.gap = None                                          # 받는 쪽 빈칸 {"n": 빠진 첫 번호, "since", "asked"} (monotonic)
         self.need_resync = False                                 # 서버가 빈칸 구간을 더 들고 있지 않다 (too_old): 다음 poll에서 스냅샷
@@ -305,7 +307,10 @@ class RemoteMap:
         self.sent["write" if m["type"] in ("write", "cells") else m["type"]] += 1
         m["seq"], m["from"], m["wall"] = self.seq, self.name, time.time()   # from = 보낸 클라이언트, writer = 변경의 쓴 쪽
         if hasattr(self, "local"):
-            m["seen_n"] = self.next_n - 1                        # 이 쓰기를 만들 때 사본에 들어 있던 서버 번호 (서버가 rebase에 쓴다)
+            # 이 쓰기를 만들 때 알고 있던 서버 번호 (서버가 rebase에 쓴다)
+            m["seen_n"] = self.next_n - 1 if self.seen_override is None else self.seen_override
+            if self.no_rebase_from:
+                m["no_rebase_from"] = self.no_rebase_from
         if m["type"] in ("write", "cells") and m["op"] in EDIT_OPS:
             self.inflight.append((self.seq, msg_edit(m)))
         data = json.dumps(m)

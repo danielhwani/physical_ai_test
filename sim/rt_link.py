@@ -412,6 +412,8 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
             elif e["action"] == "map_write":               # 실행 때 맵 서버에서 받은 다른 쪽 변경 (재현 시나리오)
                 sim.terrain.time = t_next
                 sim.terrain.apply_map_message(e["msg"])
+                if sim.cosim is not None:                  # 같은 변경을 Chrono의 SCM에도
+                    sim.cosim.inject(e["msg"])
             elif e["action"] == "add_patch":
                 sim.terrain.time = t_next                  # 맵 서버 변경 기록의 시각
                 delta = patch_ready.pop(id(e), None)
@@ -514,6 +516,8 @@ def run(scenario, lockstep=False, cpu=5, priority=80, verbose=True, brain="inpro
             T.time = t_now
             for m in T.poll_server():                                    # 원격 맵 서버의 다른 쪽 변경 (재현 시나리오에 map_write로 적는다)
                 sim._record_map_write(m, verbose, t=t_now)
+                if sim.cosim is not None:                                # 같은 변경을 Chrono의 SCM에도
+                    sim.cosim.inject(m)
             if T.recenter(*base_xy, trigger=sim.window_trigger):          # 지형 창 이동
                 sim.data.mocap_pos[sim.terrain_mocap] = [*T.window_center, 0.0]
                 T.write_all(sim.model, sim.hfield_id)

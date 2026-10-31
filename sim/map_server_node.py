@@ -188,7 +188,8 @@ class MapServerNode:
         서버 순서는 편집 -> 이 쓰기지만 쓴 쪽 사본은 이 쓰기 -> 편집이라, 바꿔야 두 결과가 같다 (버리지 않는다)."""
         if self.edits and self.edits[0][0] > m["seen_n"] + 1 and len(self.edits) == self.edits.maxlen:
             self.rebase_stats["unresolved"] += 1                      # 필요한 편집이 이미 빠졌을 수 있다 (아주 오래 못 받은 쪽)
-        later = [e for n, s, e in self.edits if n > m["seen_n"] and s != sender]
+        skip = m.get("no_rebase_from") or ()
+        later = [e for n, s, e in self.edits if n > m["seen_n"] and s != sender and s not in skip]
         if not later:
             return m
         zr = (self.server.z_min, self.server.z_max)

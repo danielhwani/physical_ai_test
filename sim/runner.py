@@ -268,6 +268,8 @@ class Simulation:
                 self.terrain.add_patch(e["patch"])
             elif e["action"] == "map_write":       # 실행 때 맵 서버에서 받은 다른 쪽 변경 (재현 시나리오)
                 self.terrain.apply_map_message(e["msg"])
+                if self.cosim is not None:         # 같은 변경을 Chrono의 SCM에도 (다음 교환 구간부터)
+                    self.cosim.inject(e["msg"])
             elif e["action"] == "inject_fault":
                 self._set_fault(e["fault"], e.get("duration"), e.get("params") or {})
             elif e["action"] == "clear_fault":
@@ -437,6 +439,8 @@ class Simulation:
             self.terrain.time = d.time
             for m in self.terrain.poll_server():
                 self._record_map_write(m, verbose)
+                if self.cosim is not None:             # 같은 변경을 Chrono의 SCM에도 (다음 교환 구간부터)
+                    self.cosim.inject(m)
         if self.cosim is not None:
             self.cosim.robot_xy = d.qpos[:2]      # 다음 Chrono 요청에 실림 (차량 양보 판단)
             self.cosim.sync(d.time)              # Chrono 결과 반영 (지형 원천 갱신 + 차량 포즈)

@@ -23,6 +23,9 @@ import numpy as np
 
 from cosim import wire
 
+from .map_client import msg_cells, msg_edit
+from .map_server import EDIT_OPS, rebase
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -69,6 +72,8 @@ class ChronoLink:
         owner = [int(rr.min()), int(rr.max()) + 1, int(cc.min()), int(cc.max()) + 1]
         self.map_name = None
         send_cfg = cfg
+        self.owner = owner
+        self.unseen = []                                # SCM이 아직 모르는 받은 편집 [[넣으라고 보낸 요청 번호 또는 None, edit]] (맵 서버 없을 때 rebase)
         if terrain.server is not None and hasattr(terrain.server, "hold"):
             # 별도 프로세스 맵 서버 (3c): Chrono가 TCP 입구로 SCM 영역의 소유자로 직접 쓴다. 러너는 그 변경을 붙잡아 두었다가 교환 시각에 넣는다
             self.map_name = f"chrono_{os.getpid()}"
@@ -77,7 +82,7 @@ class ChronoLink:
             port = terrain.server.info.get("tcp_port")
             assert port, "맵 서버에 TCP 입구가 없다 (sim.map_server_node --tcp-port)"
             send_cfg = dict(cfg, map={"tcp": f"127.0.0.1:{port}", "name": self.map_name, "writer": "chrono", "owner": owner,
-                                      "r0": self.r0, "c0": self.c0})
+                                      "r0": self.r0, "c0": self.c0, "sim": terrain.server.name})
         elif terrain.server is not None:                # 같은 프로세스 맵 서버: SCM 패치 = Chrono 소유 영역 (docs/map_server.md 5.7)
             terrain.server.set_owner(*owner, "chrono")
 
@@ -113,6 +118,10 @@ class ChronoLink:
         msg.update(self._next_cmds)
         if self.robot_xy is not None:
             msg["robot_xy"] = [round(float(v), 6) for v in self.robot_xy]
+        if "inject" in self._next_cmds:
+            for u in self.unseen:
+                if u[0] is None:
+                    u[0] = k                            # 이 요청부터 SCM이 안다
         self._next_cmds = {}
         if self.feet_enabled and self._n_obs:
             # 지난 교환 이후 제어 주기들의 평균 수직 하중과 마지막 발 위치 (다음 구간 동안 Chrono가 사용)
@@ -151,14 +160,44 @@ class ChronoLink:
         self.vehicle = r["vehicle"]
         self.foot_state = r.get("feet", [])
         tr = r["terrain"]
+        idx = getattr(self, "k", 0) + 1                 # 이 응답을 만든 요청 번호
         if tr and "map_seq" in tr:                      # Chrono가 맵 서버에 썼다: 그 seq까지 받아 넣는다 (예전 set_cells 자리)
-            self.terrain.release_partner(self.map_name, tr["map_seq"])
+            # 번호 순서상 그 앞에 있어 함께 들어온 다른 쪽 변경은 곧 보낼 요청에 실어 SCM에 넣는다 (재현과 같은 요청)
+            for m in self.terrain.release_partner(self.map_name, tr["map_seq"]):
+                self.inject(m)
         elif tr:
             i = np.frombuffer(wire.unb64(tr["i"]), "<i4")
             j = np.frombuffer(wire.unb64(tr["j"]), "<i4")
             h = np.frombuffer(wire.unb64(tr["h"]), "<f4").astype(float)
             # SCM 노드 (i, j) = 기준 평면 원점에서 (i*δ, j*δ). 격자 행 = y, 열 = x
-            self.terrain.set_cells(self.r0 + j, self.c0 + i, h)
+            rows, cols = self.r0 + j, self.c0 + i
+            self.unseen = [u for u in self.unseen if u[0] is None or u[0] > idx]
+            if self.unseen:                             # 받은 편집을 모르고 계산한 응답: 서버의 rebase와 같은 규칙으로 맞춘다 (재현 = 실행)
+                h = np.clip(h, self.terrain.z_min, self.terrain.z_max)
+                for _, e in self.unseen:
+                    h, _k = rebase("own", rows.astype(int), cols.astype(int), h, e, (self.terrain.z_min, self.terrain.z_max))
+                keep = ~np.isnan(h)
+                rows, cols, h = rows[keep], cols[keep], h[keep]
+            self.terrain.set_cells(rows, cols, h)
+
+    # ---- 받은 다른 쪽 변경(운용자 편집 등)을 SCM에 (다음 교환 구간부터, 시뮬레이션 시각 기준이라 결정적) ----
+    def inject(self, m):
+        """맵 서버에서 받았거나 재현 시나리오의 map_write. 소유 영역 안의 바뀐 칸을 다음 요청에 싣는다. SCM이 모르면 다음 쓰기가 덮는다."""
+        if m.get("type") not in ("write", "cells"):
+            return
+        if m.get("n") is not None:
+            self._next_cmds["seen_n"] = max(self._next_cmds.get("seen_n", 0), m["n"])
+        rows, cols, vals = msg_cells(m)
+        r0, r1, c0, c1 = self.owner
+        sel = ((vals != 0) if m["op"] == "add" else ~np.isnan(vals)) & (rows >= r0) & (rows < r1) & (cols >= c0) & (cols < c1)
+        if not sel.any():
+            return
+        self._next_cmds.setdefault("inject", []).append({
+            "op": m["op"], "i": wire.b64(np.asarray(cols[sel] - self.c0, "<i4").tobytes()),
+            "j": wire.b64(np.asarray(rows[sel] - self.r0, "<i4").tobytes()),
+            "v": wire.b64(np.asarray(vals[sel], "<f8").tobytes()), "z": [self.terrain.z_min, self.terrain.z_max]})
+        if m["op"] in EDIT_OPS:
+            self.unseen.append([None, msg_edit(m)])
 
     # ---- DIS 콘솔: 개체 투입·제거, 흙 상태 (다음 교환 구간부터 적용, 시뮬레이션 시각 기준이라 결정적) ----
     def spawn_vehicle(self, speed=None):

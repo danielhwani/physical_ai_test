@@ -9,7 +9,8 @@
 
   종류: bump, ramp, rough -> add (변화량, 1 µm보다 작은 곳은 자른 사각형), rut -> dig (지금 높이 기준 절대 높이), set -> set.
   격자(칸 간격, 크기)는 서버가 쓰는 바탕 파일의 매니페스트에서 얻는다 (서버를 --base로 띄운 경우: sim.runner --map-server는 늘 그렇다).
-  소유 영역(Chrono SCM)과 겹치면 알린다: 넣기는 하지만 SCM은 그 편집을 모르므로 다음 소유자 쓰기가 덮는다 (9절 "소유 영역에 넘어온 변경").
+  소유 영역(Chrono SCM)과 겹치면 알린다: 시뮬레이터가 받아 다음 교환 구간부터 SCM에도 넣는다. 넣은 노드는 다짐 이력이 없는 새 흙이다
+  (높이만. 차량·바퀴가 그 높이를 밟고 다시 파인다. 다짐 상태 전달은 9절).
 """
 import argparse
 import json
@@ -106,7 +107,7 @@ def main(argv=None):
           f" (ROS_DOMAIN_ID {domain_id()}, 바탕 {m.info.get('map_name')})"
           f"{'' if ok else ', 감사 실패: ' + str(au)}")
     if owned.any():
-        print(f"주의: 소유 영역(Chrono SCM)과 {int(owned.sum())}칸 겹친다. SCM은 이 편집을 모른다 (다음 소유자 쓰기가 덮음)")
+        print(f"참고: 소유 영역(Chrono SCM)과 {int(owned.sum())}칸 겹친다. 다음 교환 구간부터 SCM에도 들어간다 (높이만: 다짐 이력 없는 새 흙)")
     m.close()
     return 0 if ok else 1
 

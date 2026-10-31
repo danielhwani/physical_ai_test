@@ -17,6 +17,9 @@ SCM 영역의 소유자로 쓴다. 지형 변경분을 응답에 싣지 않고 �
       robot_xy: 로봇 몸통 위치 (vehicle.yield_to_robot이면 차 앞 진로에 로봇이 있는 동안 제동하고 기다린다)
       vehicle_cmd: {"action": "start", "speed": m/s|null} 출발 (vehicle.t_start가 null이면 이 명령까지 제동하고 기다린다),
                    {"action": "stop"} 제동. soil: SCM 흙 값 (이번 구간부터)
+      inject: 다른 쪽 변경(운용자 편집 등)을 이번 구간 시작에 SCM에 넣는다 [{"op", "i", "j", "v", "z"}]. 넣는 시각은 러너가 정한다 (재현).
+              add는 지금 SCM 높이 + v, set과 dig는 v (SetModifiedNodes: 넣은 노드는 다짐 이력이 없는 새 흙이다).
+      seen_n: 맵 서버 소유자일 때, SCM에 넣은 다른 쪽 변경의 마지막 서버 번호. 그보다 뒤의 편집은 모르고 쓴 것이라 서버가 맞춘다 (rebase)
                                               -> {"t": T, "poses": [...], "vehicle": {...}|null, "feet": [...], "terrain": {...}|null}
       terrain: 맵 서버가 없으면 바뀐 노드 {"n", "i", "j", "h"}, 있으면 {"n", "map_seq"} (노드는 맵 서버에 썼다)
   {"cmd": "close"}
@@ -92,6 +95,8 @@ class ChronoServer:
         from sim.map_client import RemoteMap            # numpy만 (ROS2 없이 TCP)
         self.map_cfg = mc
         self.map = RemoteMap(None, name=mc["name"], tcp=mc["tcp"])
+        self.map.seen_override = self.map.next_n - 1    # seen_n은 사본이 받은 번호가 아니라 SCM에 넣은 번호 (러너가 inject와 함께 알린다)
+        self.map.no_rebase_from = [mc["sim"]]           # 러너 자신의 편집은 지금처럼 맞추지 않는다 (SCM에 넣지 않는다)
         self.map.set_owner(*mc["owner"], mc["writer"])  # SCM 영역 = 이 클라이언트의 소유 영역 (O <- 지금 물리 높이)
         return self.map.seq
 
@@ -243,7 +248,26 @@ class ChronoServer:
             return di, False
         return self.driver.GetInputs(), True
 
-    def advance(self, t_target, want_terrain, feet=None, vehicle_cmd=None, soil=None, robot_xy=None):
+    def inject(self, items):
+        """다른 쪽 변경을 SCM 노드에 넣는다. 노드 (i, j)는 기준 평면 원점 기준, 높이는 평면 기준 (SCM 영역의 바탕은 0)."""
+        cur = {(n.x, n.y): h for n, h in self.terrain.GetModifiedNodes(True)}
+        levels = {}
+        for it in items:
+            i = np.frombuffer(wire.unb64(it["i"]), "<i4")
+            j = np.frombuffer(wire.unb64(it["j"]), "<i4")
+            v = np.frombuffer(wire.unb64(it["v"]), "<f8")
+            for a, b, x in zip(i.tolist(), j.tolist(), v.tolist()):
+                if it["op"] == "add":
+                    base = levels.get((a, b), cur.get((a, b), 0.0))
+                    x = min(max(base + x, it["z"][0]), it["z"][1])
+                levels[(a, b)] = x
+        lst = veh.ChSCMTerrainNodeLevelList()
+        for (a, b), h in levels.items():
+            lst.append((chrono.ChVector2i(a, b), h))
+        self.terrain.SetModifiedNodes(lst)
+        return len(levels)
+
+    def advance(self, t_target, want_terrain, feet=None, vehicle_cmd=None, soil=None, robot_xy=None, inject=None, seen_n=None):
         """feet: 이번 구간 동안 쓸 로봇 발 목표 [{"pos": [x,y,z], "fn": N}, ...] (robot_feet 설정 시).
         vehicle_cmd, soil: DIS 콘솔 명령 (이번 구간 시작부터)."""
         if robot_xy is not None:
@@ -255,7 +279,11 @@ class ChronoServer:
         if feet:
             for f, tgt in zip(self.feet, feet):
                 f["target"] = tgt
+        if inject:
+            self.inject(inject)
         if self.map is not None:
+            if seen_n is not None:                       # 여기까지는 SCM이 안다 (사본이 아니라 SCM 기준으로 알린다)
+                self.map.seen_override = max(self.map.seen_override, seen_n)
             self.map.poll()                              # 사본을 따라가고, 메아리 없는 것은 다시 보낸다 (기다리지 않음)
         while self.sys.GetChTime() < t_target - 1e-9:
             t = self.sys.GetChTime()
@@ -338,7 +366,7 @@ def main():
             reply = server.init(msg["config"])
         elif msg["cmd"] == "advance":
             reply = server.advance(msg["t"], msg.get("terrain", False), msg.get("feet"), msg.get("vehicle_cmd"), msg.get("soil"),
-                                   msg.get("robot_xy"))
+                                   msg.get("robot_xy"), msg.get("inject"), msg.get("seen_n"))
         elif msg["cmd"] == "close":
             wire.send(sock, {"busy_s": busy})
             if server_map(server) is not None:

@@ -126,7 +126,8 @@ class TerrainMapService:
 
     def release_partner(self, name, seq, bump=True):
         """같이 도는 물리엔진(Chrono, 맵 서버 소유자로 직접 씀: 3c)의 변경을 seq까지 넣는다. 예전에 그 결과를 set_cells로 넣던 바로 그
-        자리에서 부른다 (같은 시각, 같은 값). 서버 번호 순서상 그 앞에 있던 다른 쪽 변경도 함께 들어가고, 재현 시나리오에 적으려고 남긴다."""
+        자리에서 부른다 (같은 시각, 같은 값). 서버 번호 순서상 그 앞에 있던 다른 쪽 변경도 함께 들어가고, 재현 시나리오에 적으려고 남긴다.
+        반환: 그 다른 쪽 변경."""
         self.partner_wait.append(self.server.release(name, seq))
         got, self.server.applied_log = self.server.applied_log, []
         for m in got:
@@ -135,6 +136,7 @@ class TerrainMapService:
         self.target = self.server.compose(0, self.nrow, 0, self.ncol)
         self.version += int(bump) + len(got)       # set_cells 한 번 + 받은 변경마다 하나 (예전과 재현 시나리오와 같게)
         self._cand = None
+        return got
 
     def take_unrecorded(self):
         got, self.unrecorded = self.unrecorded, []
