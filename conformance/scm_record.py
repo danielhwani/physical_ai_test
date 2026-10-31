@@ -3,7 +3,7 @@
 
   kind      시험 종류: "press" (probe_scm_injection), "compaction" (probe_scm_compaction),
             "virtual_compaction" (probe_scm_virtual_compaction), "rolling" (probe_scm_rolling), "offset_compare" (probe_scm_offset_compare),
-            "wheel" (probe_scm_wheel)
+            "wheel" (probe_scm_wheel), "two_hmmwv" (probe_scm_two_hmmwv: 분석 데이터만)
   format    이 규약의 판 (FORMAT)
   config    시험 설정 (JSON): 흙, 구 반지름, 격자, 하중 등
   analysis  분석 데이터 (JSON): 표의 숫자와 그래프용 곡선
