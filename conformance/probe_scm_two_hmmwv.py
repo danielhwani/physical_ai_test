@@ -17,6 +17,7 @@
     F 실시간 가상 다짐   뒤 차가 달리는 동안 유령 바퀴가 앞 차 궤적을 지연을 두고 함께 따라간다 (실제 상황). 지연:빈도 (s:Hz). 보낸 궤적은 빈도만큼만 있고 받는 쪽이
                          사이를 메운다 (위치 선형, 회전 nlerp, 속도 선형). 매 스텝 누르므로 줄어드는 것은 전송량이다.
   길 (--routes): straight 직선 3 m/s, curve S자 (진폭 CURVE_A, 파장 CURVE_L, 옆 가속도 약 1.4 m/s²), speed 직선에서 3 -> 1 -> 4 m/s. 두 차가 같은 길, 같은 속도 계획.
+  speed는 뒤 차를 REAR_HOLD s 세워 두었다 출발시킨다: 안 그러면 느려진 앞 차를 따라잡아 두 차가 부딪힌다 (중심 거리 3.8 ~ 2.1 m, 차 길이 약 4.6 m: 확인함). 두 차 최소 거리를 함께 낸다.
   재는 구간 (뒤 차 중심 y WINDOW, 뒤 차가 자국 안에서 좌우로 흔들려 넓게 평균한다): 추가 침하 (앞 차 자국 바닥 - 뒤 차가 지난 뒤 바닥), 끝 자국 깊이, 바퀴 중심 높이, 차체 높이, 차체 기울기 흔들림,
   옆으로 벗어남, 스로틀. 차 두 대는 충돌하지 않게 떨어져 있고, 서로 지형으로만 영향을 준다.
 """
@@ -51,6 +52,7 @@ TIRE_R, TIRE_W = 0.467, 0.254                      # HMMWV 단단한 타이어 (
 RUT_MIN = 0.005                                    # 이보다 판 칸만 단단하게 (m)
 CURVE_A, CURVE_L = 1.0, 16.0                       # S자 길 (m)
 ROUTE = "straight"
+REAR_HOLD = 0.0                                    # 뒤 차를 세워 두는 시간 (s)
 SOIL = dict(kc=0.0, n=1.1, cohesion=0.0, friction_deg=30.0, janosi=0.01, elastic_k=4e7, damping_r=3e4)
 
 
@@ -273,6 +275,7 @@ def run(kphi, front, rear, levels=None, until=None, stiff=None, ghost=None, stri
     traj = []
     wall = time.perf_counter()
     step_k, ghost_on = 0, live is not None
+    min_gap = float("inf")
     while True:
         if ghost_on:                                            # F: 앞 차 궤적을 지연을 두고 함께 따라간다
             fr = live_frame(ghost, step_k - int(round(live[0] / STEP)), max(1, int(round(1.0 / (live[1] * STEP)))))
@@ -286,7 +289,9 @@ def run(kphi, front, rear, levels=None, until=None, stiff=None, ghost=None, stri
                 place_ghosts(bodies, fr)
         step_k += 1
         terrain.Synchronize(t)
-        inputs = [c.step_in(t, terrain) for c in cars]
+        inputs = [c.brake(t, terrain) if (c is rc and t < REAR_HOLD) else c.step_in(t, terrain) for c in cars]
+        if fc is not None and rc is not None:
+            min_gap = min(min_gap, fc.pos()[1] - rc.pos()[1])
         terrain.Advance(STEP)
         s.DoStepDynamics(STEP)
         t = s.GetChTime()
@@ -317,7 +322,7 @@ def run(kphi, front, rear, levels=None, until=None, stiff=None, ghost=None, stri
         if t > 60:
             raise RuntimeError(f"차가 {t:.0f} s 동안 끝에 닿지 못했다: 앞 {fc.pos() if fc else None}, 뒤 {rc.pos() if rc else None}")
     return {"log": np.array(log) if log else None, "final": heights(terrain), "cy": cy, "wall": time.perf_counter() - wall, "t": t,
-            "traj": np.array(traj) if traj else None, "ghost_s": ghost_s, "after_ghost": after_ghost}
+            "traj": np.array(traj) if traj else None, "ghost_s": ghost_s, "after_ghost": after_ghost, "min_gap": min_gap}
 
 
 def window_stats(res, front_levels):
@@ -348,16 +353,19 @@ ROWS = [("추가 침하 (cm)", "added_sink_cm", 2), ("끝 자국 깊이 (cm)", "
 
 def routes_main(a):
     """길과 속도별로 A, B, F (지연 0.2 s, 빈도 a.hz). 25 Hz가 직선 밖에서도 되는지."""
-    global ROUTE
+    global ROUTE, REAR_HOLD, Y_END, SCM_Y
     out = {}
     for route in a.routes:
         ROUTE = route
+        REAR_HOLD = 8.0 if route == "speed" else 0.0
+        Y_END, SCM_Y = (26.0, (-30.0, 36.0)) if route == "speed" else (18.0, (-30.0, 22.0))   # speed: 앞 차가 멀리 선다 (뒤 차와 부딪히지 않게)
         for kphi in a.kphi:
             t0 = time.perf_counter()
             ca = run(kphi, True, True)
             fa = run(kphi, True, False)
             cb = run(kphi, False, True, levels=fa["final"])
             sa, sb = window_stats(ca, fa["final"]), window_stats(cb, fa["final"])
+            sa["min_gap_m"] = ca["min_gap"]
             rows = [("A 정답", sa), ("B 높이만", sb)]
             for hz in a.hz:
                 cf = run(kphi, False, True, ghost=fa["traj"], live=(0.2, hz))
@@ -365,7 +373,7 @@ def routes_main(a):
                 sf["rtf"] = cf["t"] / cf["wall"]
                 rows.append((f"F {hz:g}Hz", sf))
             out[f"{route} {kphi:g}"] = dict(rows)
-            print(f"\n== {route}, kphi {kphi:g} ({time.perf_counter() - t0:.0f} s). A 칸별 추가 침하 {sa['added_sink_bin_min_cm']:.2f} ~ {sa['added_sink_bin_max_cm']:.2f} cm, A 속도 {sa['speed_mps']:.2f} m/s", flush=True)
+            print(f"\n== {route}, kphi {kphi:g} ({time.perf_counter() - t0:.0f} s). A 칸별 추가 침하 {sa['added_sink_bin_min_cm']:.2f} ~ {sa['added_sink_bin_max_cm']:.2f} cm, A 속도 {sa['speed_mps']:.2f} m/s, 두 차 최소 거리 {ca['min_gap']:.1f} m", flush=True)
             print(f"{'':10s}{'추가 침하':>9s}{'차이':>8s}{'끝 깊이':>8s}{'차이':>8s}{'바퀴 높이':>9s}{'차이':>8s}{'스로틀':>7s}{'차이':>8s}{'벗어남cm':>9s}{'옆흔들림':>9s}")
             for name, st in rows:
                 print(f"{name:10s}{st['added_sink_cm']:9.2f}{st['added_sink_cm'] - sa['added_sink_cm']:+8.2f}{st['final_depth_cm']:8.2f}{st['final_depth_cm'] - sa['final_depth_cm']:+8.2f}"
