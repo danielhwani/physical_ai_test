@@ -1,6 +1,7 @@
 """HMMWV 두 대가 같은 길을 달릴 때 뒤 차가 앞 차 자국에서 받는 효과의 기준 측정 (docs/map_server.md 5.5). 시뮬레이터, 맵 서버 없이 Chrono만.
 
     python conformance/probe_scm_two_hmmwv.py [--kphi 5e6 1e6] [--mults 8] [--stride 1 5] [--live 0.2:500 0.2:50] [--record build/scm_two_hmmwv.npz]
+    python conformance/probe_scm_two_hmmwv.py --routes straight curve speed [--hz 500 100 50 25 10]    길과 속도별로 A, B, F만 비교
     (어느 환경이든: pychrono가 없으면 chrono 환경으로 다시 실행)
 
   세 경우 (모두 같은 차, 같은 흙, 뒤 차는 같은 출발):
@@ -15,6 +16,7 @@
                          하중이 아니라 위치로 누른다 (차체 동역학이 필요 없다). 그 뒤 유령을 치우고 뒤 차만 달린다. stride: 궤적을 몇 스텝마다 쓸지 (클수록 빠르다).
     F 실시간 가상 다짐   뒤 차가 달리는 동안 유령 바퀴가 앞 차 궤적을 지연을 두고 함께 따라간다 (실제 상황). 지연:빈도 (s:Hz). 보낸 궤적은 빈도만큼만 있고 받는 쪽이
                          사이를 메운다 (위치 선형, 회전 nlerp, 속도 선형). 매 스텝 누르므로 줄어드는 것은 전송량이다.
+  길 (--routes): straight 직선 3 m/s, curve S자 (진폭 CURVE_A, 파장 CURVE_L, 옆 가속도 약 1.4 m/s²), speed 직선에서 3 -> 1 -> 4 m/s. 두 차가 같은 길, 같은 속도 계획.
   재는 구간 (뒤 차 중심 y WINDOW, 뒤 차가 자국 안에서 좌우로 흔들려 넓게 평균한다): 추가 침하 (앞 차 자국 바닥 - 뒤 차가 지난 뒤 바닥), 끝 자국 깊이, 바퀴 중심 높이, 차체 높이, 차체 기울기 흔들림,
   옆으로 벗어남, 스로틀. 차 두 대는 충돌하지 않게 떨어져 있고, 서로 지형으로만 영향을 준다.
 """
@@ -47,7 +49,25 @@ WINDOW = (-8.0, 12.0)                              # 재는 구간 (뒤 차 중�
 BIN = 4.0                                          # 구간 안에서 값이 얼마나 흔들리는지 볼 칸 (m)
 TIRE_R, TIRE_W = 0.467, 0.254                      # HMMWV 단단한 타이어 (접촉 원통)
 RUT_MIN = 0.005                                    # 이보다 판 칸만 단단하게 (m)
+CURVE_A, CURVE_L = 1.0, 16.0                       # S자 길 (m)
+ROUTE = "straight"
 SOIL = dict(kc=0.0, n=1.1, cohesion=0.0, friction_deg=30.0, janosi=0.01, elastic_k=4e7, damping_r=3e4)
+
+
+def path_x(y):
+    """길의 x (y의 함수). 직선과 speed는 0, curve는 y = -14 이후 S자 (앞 차 출발 전까지는 직선, 진폭은 부드럽게 커진다)."""
+    if ROUTE != "curve":
+        return 0.0
+    u = min(max((y + 14.0) / 6.0, 0.0), 1.0)
+    return CURVE_A * (u * u * (3 - 2 * u)) * math.sin(2 * math.pi * (y + 14.0) / CURVE_L)
+
+
+def speed_at(y):
+    """속도 계획 (m/s, y의 함수)."""
+    if ROUTE != "speed":
+        return SPEED
+    pts = [(-30.0, 3.0), (-6.0, 3.0), (-3.0, 1.0), (2.0, 1.0), (5.0, 4.0), (30.0, 4.0)]
+    return float(np.interp(y, [a for a, _ in pts], [b for _, b in pts]))
 
 
 def make_system():
@@ -63,7 +83,7 @@ def make_terrain(s, kphi):
     t.SetSoilParameters(kphi, SOIL["kc"], SOIL["n"], SOIL["cohesion"], SOIL["friction_deg"], SOIL["janosi"], SOIL["elastic_k"], SOIL["damping_r"])
     cy = (SCM_Y[0] + SCM_Y[1]) / 2
     t.SetReferenceFrame(chrono.ChCoordsysd(chrono.ChVector3d(0, cy, 0), chrono.QUNIT))
-    t.Initialize(SCM_W, SCM_Y[1] - SCM_Y[0], DELTA)
+    t.Initialize(8.0 if ROUTE == "curve" else SCM_W, SCM_Y[1] - SCM_Y[0], DELTA)
     return t, cy
 
 
@@ -80,7 +100,13 @@ class Car:
         car.SetTireStepSize(STEP)
         car.Initialize()
         self.car = car
-        self.path = veh.StraightLinePath(chrono.ChVector3d(0, y0, 0.5), chrono.ChVector3d(0, Y_END, 0.5), 1)
+        if ROUTE == "curve":
+            pts = chrono.vector_ChVector3d()
+            for y in np.arange(y0, Y_END + 8.0, 0.5):
+                pts.push_back(chrono.ChVector3d(path_x(float(y)), float(y), 0.5))
+            self.path = chrono.ChBezierCurve(pts)
+        else:
+            self.path = veh.StraightLinePath(chrono.ChVector3d(0, y0, 0.5), chrono.ChVector3d(0, Y_END + 8.0, 0.5), 1)
         self.driver = veh.ChPathFollowerDriver(car.GetVehicle(), self.path, "d", SPEED)
         self.driver.GetSteeringController().SetLookAheadDistance(5.0)
         self.driver.GetSteeringController().SetGains(0.8, 0, 0)
@@ -103,6 +129,7 @@ class Car:
         v = self.car.GetVehicle()
         if v.GetPos().y > Y_END:
             return self.brake(t, terrain)
+        self.driver.SetDesiredSpeed(speed_at(v.GetPos().y))
         di = self.driver.GetInputs()
         self.driver.Synchronize(t)
         self.car.Synchronize(t, di, terrain)
@@ -116,10 +143,10 @@ def heights(terrain):
 
 
 def track_profile(levels, cy):
-    """바퀴 자리 단면: y마다 왼쪽(x<0), 오른쪽(x>0) 가장 낮은 높이. 반환 {y칸: (왼쪽, 오른쪽)}."""
+    """바퀴 자리 단면: y마다 길의 왼쪽(x < 길), 오른쪽 가장 낮은 높이. 반환 {y칸: (왼쪽, 오른쪽)}."""
     out = {}
     for (i, j), h in levels.items():
-        side = 0 if i < 0 else 1
+        side = 0 if i * DELTA < path_x(cy + j * DELTA) else 1
         cur = out.setdefault(j, [0.0, 0.0])
         cur[side] = min(cur[side], h)
     return out
@@ -281,7 +308,7 @@ def run(kphi, front, rear, levels=None, until=None, stiff=None, ghost=None, stri
                 # 차체 축: x = 앞. 앞뒤 기울기 = 앞 축의 z 성분, 옆 기울기 = 옆 축의 z 성분
                 fwd, left = rot.GetAxisX(), rot.GetAxisY()
                 wz = [v.GetSpindlePos(a, side).z for a in (0, 1) for side in (veh.LEFT, veh.RIGHT)]
-                log.append((t, x, y, z, math.degrees(math.asin(fwd.z)), math.degrees(math.asin(left.z)), np.mean(wz), v.GetSpeed(),
+                log.append((t, x - path_x(y), y, z, math.degrees(math.asin(fwd.z)), math.degrees(math.asin(left.z)), np.mean(wz), v.GetSpeed(),
                             inputs[-1].m_throttle, inputs[-1].m_braking))
             if y > WINDOW[1] + 3.0:
                 break
@@ -319,14 +346,47 @@ ROWS = [("추가 침하 (cm)", "added_sink_cm", 2), ("끝 자국 깊이 (cm)", "
         ("앞뒤 기울기 흔들림 (deg)", "pitch_rms_deg", 3), ("옆 기울기 흔들림 (deg)", "roll_rms_deg", 3), ("옆 벗어남 (m)", "lateral_m", 3), ("속도 (m/s)", "speed_mps", 3), ("스로틀 (0~1)", "throttle", 3)]
 
 
+def routes_main(a):
+    """길과 속도별로 A, B, F (지연 0.2 s, 빈도 a.hz). 25 Hz가 직선 밖에서도 되는지."""
+    global ROUTE
+    out = {}
+    for route in a.routes:
+        ROUTE = route
+        for kphi in a.kphi:
+            t0 = time.perf_counter()
+            ca = run(kphi, True, True)
+            fa = run(kphi, True, False)
+            cb = run(kphi, False, True, levels=fa["final"])
+            sa, sb = window_stats(ca, fa["final"]), window_stats(cb, fa["final"])
+            rows = [("A 정답", sa), ("B 높이만", sb)]
+            for hz in a.hz:
+                cf = run(kphi, False, True, ghost=fa["traj"], live=(0.2, hz))
+                sf = window_stats(cf, fa["final"])
+                sf["rtf"] = cf["t"] / cf["wall"]
+                rows.append((f"F {hz:g}Hz", sf))
+            out[f"{route} {kphi:g}"] = dict(rows)
+            print(f"\n== {route}, kphi {kphi:g} ({time.perf_counter() - t0:.0f} s). A 칸별 추가 침하 {sa['added_sink_bin_min_cm']:.2f} ~ {sa['added_sink_bin_max_cm']:.2f} cm, A 속도 {sa['speed_mps']:.2f} m/s", flush=True)
+            print(f"{'':10s}{'추가 침하':>9s}{'차이':>8s}{'끝 깊이':>8s}{'차이':>8s}{'바퀴 높이':>9s}{'차이':>8s}{'스로틀':>7s}{'차이':>8s}{'벗어남cm':>9s}{'옆흔들림':>9s}")
+            for name, st in rows:
+                print(f"{name:10s}{st['added_sink_cm']:9.2f}{st['added_sink_cm'] - sa['added_sink_cm']:+8.2f}{st['final_depth_cm']:8.2f}{st['final_depth_cm'] - sa['final_depth_cm']:+8.2f}"
+                      f"{st['spindle_z_m'] * 100:9.2f}{(st['spindle_z_m'] - sa['spindle_z_m']) * 100:+8.2f}{st['throttle']:7.3f}{st['throttle'] - sa['throttle']:+8.3f}{st['lateral_m'] * 100:9.1f}{st['roll_rms_deg']:9.3f}", flush=True)
+    if a.record:
+        scm_record.save(a.record, "two_hmmwv", {"gap": GAP, "routes": a.routes, "kphi": a.kphi, "hz": a.hz, "delta": DELTA, "soil": SOIL}, out)
+        print("기록:", a.record)
+
+
 def main():
     ap = argparse.ArgumentParser(description="HMMWV 두 대 기준 측정")
     ap.add_argument("--kphi", type=float, nargs="+", default=[5e6, 1e6])
     ap.add_argument("--mults", type=float, nargs="*", default=[8], help="D 배수")
     ap.add_argument("--stride", type=int, nargs="*", default=[1, 5], help="E 유령 궤적을 몇 스텝마다 쓸지")
     ap.add_argument("--live", nargs="*", default=["0:500", "0.2:500", "1:500", "0.2:100", "0.2:50", "0.2:25"], help="F 지연:빈도 (s:Hz)")
+    ap.add_argument("--routes", nargs="*", help="길과 속도별 비교 (straight curve speed)")
+    ap.add_argument("--hz", type=float, nargs="*", default=[500, 100, 50, 25, 10], help="--routes의 F 빈도")
     ap.add_argument("--record")
     a = ap.parse_args()
+    if a.routes:
+        return routes_main(a)
     analysis = {}
     for kphi in a.kphi:
         t0 = time.perf_counter()
