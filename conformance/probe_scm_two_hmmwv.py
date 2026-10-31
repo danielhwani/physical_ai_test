@@ -1,6 +1,6 @@
 """HMMWV 두 대가 같은 길을 달릴 때 뒤 차가 앞 차 자국에서 받는 효과의 기준 측정 (docs/map_server.md 5.5). 시뮬레이터, 맵 서버 없이 Chrono만.
 
-    python conformance/probe_scm_two_hmmwv.py [--kphi 5e6 1e6] [--mults 8] [--stride 1 5] [--record build/scm_two_hmmwv.npz]
+    python conformance/probe_scm_two_hmmwv.py [--kphi 5e6 1e6] [--mults 8] [--stride 1 5] [--live 0.2:500 0.2:50] [--record build/scm_two_hmmwv.npz]
     (어느 환경이든: pychrono가 없으면 chrono 환경으로 다시 실행)
 
   세 경우 (모두 같은 차, 같은 흙, 뒤 차는 같은 출발):
@@ -13,6 +13,8 @@
        D 배수:   자국 칸의 kphi를 모두 m배. 정답에 맞는 값이 있는지 (맞춘 값을 쓰면 정답을 본 것이다).
     E 가상 다짐          앞 차 네 바퀴의 궤적(위치, 회전, 속도, 각속도)을 받아, 그 위치로 움직이는 유령 바퀴(타이어 크기 원통, 고정 몸체)로 새 SCM을 눌러 자국과 다짐을 다시 만든다.
                          하중이 아니라 위치로 누른다 (차체 동역학이 필요 없다). 그 뒤 유령을 치우고 뒤 차만 달린다. stride: 궤적을 몇 스텝마다 쓸지 (클수록 빠르다).
+    F 실시간 가상 다짐   뒤 차가 달리는 동안 유령 바퀴가 앞 차 궤적을 지연을 두고 함께 따라간다 (실제 상황). 지연:빈도 (s:Hz). 보낸 궤적은 빈도만큼만 있고 받는 쪽이
+                         사이를 메운다 (위치 선형, 회전 nlerp, 속도 선형). 매 스텝 누르므로 줄어드는 것은 전송량이다.
   재는 구간 (뒤 차 중심 y WINDOW, 뒤 차가 자국 안에서 좌우로 흔들려 넓게 평균한다): 추가 침하 (앞 차 자국 바닥 - 뒤 차가 지난 뒤 바닥), 끝 자국 깊이, 바퀴 중심 높이, 차체 높이, 차체 기울기 흔들림,
   옆으로 벗어남, 스로틀. 차 두 대는 충돌하지 않게 떨어져 있고, 서로 지형으로만 영향을 준다.
 """
@@ -165,6 +167,31 @@ def ghost_bodies(s, terrain, count):
     return bodies
 
 
+def live_frame(traj, k, every):
+    """스텝 k의 유령 자세: every 스텝마다 보낸 궤적을 사이를 메워서. 궤적 끝을 지나면 None."""
+    if k < 0:
+        return traj[0]
+    last = (len(traj) - 1) // every * every
+    if k > last:
+        return None
+    a = k // every * every
+    if a == k:
+        return traj[a]
+    f = (k - a) / every
+    fr = (1 - f) * traj[a] + f * traj[a + every]
+    q = fr[:, 3:7]
+    fr[:, 3:7] = q / np.linalg.norm(q, axis=1, keepdims=True)
+    return fr
+
+
+def place_ghosts(bodies, frame):
+    for b, r in zip(bodies, frame):
+        b.SetPos(chrono.ChVector3d(*map(float, r[:3])))
+        b.SetRot(chrono.ChQuaterniond(*map(float, r[3:7])))
+        b.SetPosDt(chrono.ChVector3d(*map(float, r[7:10])))
+        b.SetAngVelParent(chrono.ChVector3d(*map(float, r[10:13])))
+
+
 def ghost_press(s, terrain, bodies, traj, stride, hold, with_vel=True):
     """E: 기록된 네 바퀴 궤적대로 유령 바퀴를 움직여 SCM을 누른다. 위치로 누르므로 차체 동역학이 필요 없다. 끝나면 유령을 위로 치운다.
     hold: 그동안 제동으로 세워 둘 차."""
@@ -190,7 +217,7 @@ def ghost_press(s, terrain, bodies, traj, stride, hold, with_vel=True):
     step(t)
 
 
-def run(kphi, front, rear, levels=None, until=None, stiff=None, ghost=None, stride=1, with_vel=True):
+def run(kphi, front, rear, levels=None, until=None, stiff=None, ghost=None, stride=1, with_vel=True, live=None):
     """front / rear: 그 차를 달릴지. levels: 시작 때 넣을 자국 {(i, j): h}. stiff: 칸별 kphi (콜백). ghost: E 유령 바퀴 궤적 (스텝, 바퀴, 7).
     반환: 뒤 차 기록, 끝 높이, 앞 차 궤적 (앞 차만 달릴 때), 시간."""
     s = make_system()
@@ -209,7 +236,7 @@ def run(kphi, front, rear, levels=None, until=None, stiff=None, ghost=None, stri
     cars = []
     fc = Car(s, terrain, Y_FRONT) if front else None
     rc = Car(s, terrain, Y_FRONT - GAP) if rear else None
-    if ghost is not None:                                       # 유령이 다 누를 때까지 뒤 차는 출발점에 세워 둔다
+    if ghost is not None and live is None:                      # 유령이 다 누를 때까지 뒤 차는 출발점에 세워 둔다
         w0 = time.perf_counter()
         ghost_press(s, terrain, bodies, ghost, stride, rc, with_vel)
         ghost_s = time.perf_counter() - w0
@@ -218,7 +245,19 @@ def run(kphi, front, rear, levels=None, until=None, stiff=None, ghost=None, stri
     t, log = s.GetChTime(), []
     traj = []
     wall = time.perf_counter()
+    step_k, ghost_on = 0, live is not None
     while True:
+        if ghost_on:                                            # F: 앞 차 궤적을 지연을 두고 함께 따라간다
+            fr = live_frame(ghost, step_k - int(round(live[0] / STEP)), max(1, int(round(1.0 / (live[1] * STEP)))))
+            if fr is None:
+                for b in bodies:
+                    b.SetPos(chrono.ChVector3d(0, 0, 50))
+                    b.SetPosDt(chrono.ChVector3d(0, 0, 0))
+                    b.SetAngVelParent(chrono.ChVector3d(0, 0, 0))
+                ghost_on = False
+            else:
+                place_ghosts(bodies, fr)
+        step_k += 1
         terrain.Synchronize(t)
         inputs = [c.step_in(t, terrain) for c in cars]
         terrain.Advance(STEP)
@@ -285,6 +324,7 @@ def main():
     ap.add_argument("--kphi", type=float, nargs="+", default=[5e6, 1e6])
     ap.add_argument("--mults", type=float, nargs="*", default=[8], help="D 배수")
     ap.add_argument("--stride", type=int, nargs="*", default=[1, 5], help="E 유령 궤적을 몇 스텝마다 쓸지")
+    ap.add_argument("--live", nargs="*", default=["0:500", "0.2:500", "1:500", "0.2:100", "0.2:50", "0.2:25"], help="F 지연:빈도 (s:Hz)")
     ap.add_argument("--record")
     a = ap.parse_args()
     analysis = {}
@@ -315,13 +355,21 @@ def main():
             se.update(ghost_s=ce["ghost_s"], ghost_rut_diff_mean_cm=float(np.abs(dh).mean()), ghost_rut_diff_max_cm=float(np.abs(dh).max()), ghost_rut_bias_cm=float(dh.mean()))
             rows_e.append((f"E 1/{st_}" + ("" if vel else " 위치만"), se))
         analysis[f"{kphi:g}"]["E"] = {name: st for name, st in rows_e}
+        rows_f = []
+        for spec in a.live:
+            dl, hz = (float(v) for v in spec.split(":"))
+            cf = run(kphi, False, True, ghost=fa["traj"], live=(dl, hz))
+            sf = window_stats(cf, fa["final"])
+            sf.update(wall_s=cf["wall"], sim_s=cf["t"], rtf=cf["t"] / cf["wall"], bytes_per_s=4 * 13 * 8 * hz)
+            rows_f.append((f"F {dl:g}s {hz:g}Hz", sf))
+        analysis[f"{kphi:g}"]["F"] = {name: st for name, st in rows_f}
         print(f"\n== kphi {kphi:g}: 뒤 차가 구간 y {WINDOW[0]:g} ~ {WINDOW[1]:g} m를 지날 때 ({time.perf_counter() - t0:.0f} s)", flush=True)
         print(f"{'':28s}{'A 이어 (정답)':>14s}{'B 높이만':>12s}{'C 평지':>12s}{'B - A':>10s}")
         for name, k, dg in ROWS:
             print(f"{name:28s}{sa[k]:14.{dg}f}{sb[k]:12.{dg}f}{sc[k]:12.{dg}f}{sb[k] - sa[k]:10.{dg}f}")
         print(f"\nD 단단한 흙 (자국 칸 {len(comp)}개, 계산값 kphi 중앙값 {np.median(list(comp.values())):.3g} = 기본의 {np.median(list(comp.values())) / kphi:.1f}배)")
         print(f"{'':12s}{'추가 침하':>10s}{'A와 차이':>10s}{'끝 깊이':>9s}{'A와 차이':>10s}{'바퀴 높이':>10s}{'A와 차이':>10s}{'스로틀':>8s}{'A와 차이':>10s}")
-        for name, st in [("A 정답", sa), ("B 높이만", sb), ("C 평지", sc)] + rows_d + rows_e:
+        for name, st in [("A 정답", sa), ("B 높이만", sb), ("C 평지", sc)] + rows_d + rows_e + rows_f:
             print(f"{name:12s}{st['added_sink_cm']:10.2f}{st['added_sink_cm'] - sa['added_sink_cm']:+10.2f}{st['final_depth_cm']:9.2f}{st['final_depth_cm'] - sa['final_depth_cm']:+10.2f}"
                   f"{st['spindle_z_m'] * 100:10.2f}{(st['spindle_z_m'] - sa['spindle_z_m']) * 100:+10.2f}{st['throttle']:8.3f}{st['throttle'] - sa['throttle']:+10.3f}")
         print(f"A의 추가 침하, {BIN:g} m 칸별 범위: {sa['added_sink_bin_min_cm']:.2f} ~ {sa['added_sink_bin_max_cm']:.2f} cm (이보다 작은 차이는 구별 못 한다)")
@@ -329,7 +377,9 @@ def main():
         for name, st in rows_e:
             print(f"{name}: 유령이 만든 자국과 실제 자국 차이 평균 {st['ghost_rut_diff_mean_cm']:.3f}, 최대 {st['ghost_rut_diff_max_cm']:.2f}, 치우침 {st['ghost_rut_bias_cm']:+.3f} cm, "
                   f"다시 누른 시간 {st['ghost_s']:.1f} s, 옆 벗어남 {st['lateral_m'] * 100:.1f} cm, 옆 흔들림 {st['roll_rms_deg']:.3f}")
-        print(f"(A 옆 벗어남 {sa['lateral_m'] * 100:.1f} cm, 옆 흔들림 {sa['roll_rms_deg']:.3f})")
+        print(f"(A 옆 벗어남 {sa['lateral_m'] * 100:.1f} cm, 옆 흔들림 {sa['roll_rms_deg']:.3f}. 빠르기: A {ca['t'] / ca['wall']:.2f}배, 뒤 차만 {cc['t'] / cc['wall']:.2f}배)")
+        for name, st in rows_f:
+            print(f"{name}: 옆 벗어남 {st['lateral_m'] * 100:.1f} cm, 옆 흔들림 {st['roll_rms_deg']:.3f}, 실시간의 {st['rtf']:.2f}배, 전송 {st['bytes_per_s'] / 1000:.0f} KB/s")
         if sa["added_sink_cm"] > 1e-3:
             print(f"추가 침하 비 B / A = {sb['added_sink_cm'] / sa['added_sink_cm']:.1f}배, 평지 첫 지나감(앞 차 자국 깊이 대신 C) = {sc['added_sink_cm']:.2f} cm")
     if a.record:
