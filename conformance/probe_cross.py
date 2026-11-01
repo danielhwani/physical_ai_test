@@ -1,9 +1,9 @@
-"""교차 시험: 앞 차 자국을 다른 차가 90도로 건넌다 (맵 서버 4단계, 고스트 방식의 약점 찾기).
+"""교차 시험: 앞 차 자국을 다른 차가 건넌다 (맵 서버 4단계, 고스트 방식의 약점 찾기).
 
-    python conformance/probe_cross.py [--kphi 5e6 1e6] [--starts -24.1 -24 -23.9]      (mj_ros. Chrono 프로세스는 chrono 환경으로 띄운다)
+    python conformance/probe_cross.py [--angle 90 45 20] [--kphi 5e6 1e6] [--starts -24.1 -24 -23.9]      (mj_ros. Chrono 프로세스는 chrono 환경으로 띄운다)
 
-  앞 차: x = 0을 y 방향으로. 교차 차량: y = 0을 x 방향으로, 앞 차가 지나간 뒤 건넌다.
-  넷을 비교한다 (건너는 구간 x -6 ~ 6 m):
+  앞 차: x = 0을 y 방향으로. 교차 차량: 앞 차 길과 --angle 도로 만나는 직선을 달려 (0, 0)을 지난다. 앞 차가 지나간 뒤 건넌다.
+  s = 그 직선을 따라 (0, 0)까지의 거리 (출발이 음수). 넷을 비교한다 (90도는 s -6 ~ 6 m, 그 밖은 s -9 ~ 9 m. 얕을수록 바퀴가 자국을 만나는 구간이 길다):
     정답         한 SCM에서 두 대
     두 프로세스   앞 차와 교차 차량이 별도 프로세스. 앞 차 궤적을 고스트로 재생, 맵 서버로 주고받음
     높이만       앞 차의 끝 높이를 교차 차량 SCM에 넣음 (다짐 없음)
@@ -27,19 +27,34 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "conformance"))
 import probe_two_chrono as T  # noqa: E402
 
-X_END = 8.0                                        # 교차 차량이 멈추기 시작하는 x (m)
-WIN = (-6.0, 6.0)                                  # 재는 구간 (교차 차량 중심 x)
-CELLS = (6.0, 4.0)                                 # 지도 비교 영역 반폭 (x, y m)
-CROSS = 1.5                                        # 두 자국이 만나는 칸 반폭 (m)
+S_END = 11.0                                       # 교차 차량이 멈추기 시작하는 s (m)
+CROSS = 1.5                                        # 두 자국이 만나는 칸: 앞 차 길과 교차 차량 길에서 이만큼 안 (m)
 
 
-def setup(P):
-    P.Y_END, P.SCM_Y, P.SCM_W = 18.0, (-20.0, 22.0), 56.0
+def win(angle):
+    """재는 구간 (s)."""
+    return (-6.0, 6.0) if angle == 90.0 else (-9.0, 9.0)
+
+
+def heading(angle):
+    """앞 차 방향(+y)과 angle 도로 만나는 방향 (x축 기준 라디안). 90 -> +x."""
+    return math.radians(90.0 - angle)
+
+
+def setup(P, a):
+    P.Y_END, P.SCM_Y, P.SCM_W = 18.0, ((-20.0, 22.0) if a.angle == 90.0 else (-30.0, 22.0)), 56.0
     return P
 
 
 def cross_car(P, s, ter, a):
-    return P.Car(s, ter, 0.0, a.start, heading=0.0, length=X_END - a.start)
+    th = heading(a.angle)
+    return P.Car(s, ter, a.start * math.sin(th), a.start * math.cos(th), heading=th, length=S_END - a.start)
+
+
+def along(car, a):
+    th = heading(a.angle)
+    x, y, _ = car.pos()
+    return x * math.cos(th) + y * math.sin(th)
 
 
 def row(P, car, t, di):
@@ -59,7 +74,7 @@ def final_heights(ter):
 
 def role_front(a):
     import probe_scm_two_hmmwv as P
-    setup(P)
+    setup(P, a)
     m, to_cells, _, _ = T.client(P, "front", a)
     s = P.make_system()
     ter, _ = P.make_terrain(s, a.kphi)
@@ -104,7 +119,7 @@ def role_front(a):
 def role_rear(a):
     from sim.map_client import dec
     import probe_scm_two_hmmwv as P
-    setup(P)
+    setup(P, a)
     m, to_cells, i0, j0 = T.client(P, "rear", a)
     s = P.make_system()
     ter, _ = P.make_terrain(s, a.kphi)
@@ -168,7 +183,7 @@ def role_rear(a):
         if (k + 1) % T.WRITE_EVERY == 0:
             write()
         k += 1
-        if car.pos()[0] > WIN[1] + 1.0:
+        if along(car, a) > win(a.angle)[1] + 1.0:
             break
     write()
     wall = time.perf_counter() - wall
@@ -181,7 +196,7 @@ def role_rear(a):
 def role_solo(a):
     """한 SCM: truth (두 대), flat (교차 차량만), heights (앞 차 끝 높이를 넣고 교차 차량만)."""
     import probe_scm_two_hmmwv as P
-    setup(P)
+    setup(P, a)
     s = P.make_system()
     ter, _ = P.make_terrain(s, a.kphi)
     if a.mode == "heights":
@@ -209,34 +224,42 @@ def role_solo(a):
             gap = min(gap, math.hypot(fx - cx, fy - cy_))
             if t_pass is None and fy > 0:
                 t_pass = t
-        if car.pos()[0] > WIN[1] + 1.0:
+        if along(car, a) > win(a.angle)[1] + 1.0:
             break
     T.save(a.out, heights=final_heights(ter), log=np.array(log), wall=time.perf_counter() - wall, sim=t, min_gap=gap, t_pass=t_pass or -1.0)
 
 
-def stats(log):
+def stats(log, angle):
     """건너는 구간의 값. 각도 deg, 가속도 m/s^2, 속도 m/s, 옆 위치 cm."""
-    sel = (log[:, 1] >= WIN[0]) & (log[:, 1] <= WIN[1])
-    lg = log[sel]
+    th = heading(angle)
+    sv = log[:, 1] * math.cos(th) + log[:, 2] * math.sin(th)
+    lat = -log[:, 1] * math.sin(th) + log[:, 2] * math.cos(th)
+    w = win(angle)
+    sel = (sv >= w[0]) & (sv <= w[1])
+    lg, sv, lat = log[sel], sv[sel], lat[sel]
     vz = np.convolve(lg[:, 10], np.ones(25) / 25, mode="valid")              # 50 ms 평균 뒤 미분 (접촉 잡음 빼기)
     az = np.diff(vz) / np.diff(lg[:len(vz), 0])
-    entry = lg[lg[:, 1] < WIN[0] + 1.0]
-    exit_ = lg[lg[:, 1] > WIN[1] - 1.0]
-    return {"앞뒤 기울기 폭": float(lg[:, 4].max() - lg[:, 4].min()), "옆 기울기 최대": float(np.abs(lg[:, 5]).max()), "수직 가속도 최대": float(np.abs(az).max()),
-            "속도 손실": float(entry[:, 7].mean() - lg[:, 7].min()), "방향 변화 최대": float(np.abs(lg[:, 6]).max()), "나갈 때 옆 위치": 100 * float(exit_[:, 2].mean()),
-            "구간 스로틀": float(lg[:, 8].mean())}
+    yaw = (lg[:, 6] - math.degrees(th) + 180.0) % 360.0 - 180.0
+    return {"앞뒤 기울기 폭": float(lg[:, 4].max() - lg[:, 4].min()), "옆 기울기 폭": float(lg[:, 5].max() - lg[:, 5].min()), "수직 가속도 최대": float(np.abs(az).max()),
+            "속도 손실": float(lg[sv < w[0] + 1.0, 7].mean() - lg[:, 7].min()), "방향 변화 최대": float(np.abs(yaw).max()), "옆 벗어남 최대": 100 * float(np.abs(lat).max()),
+            "나갈 때 옆 위치": 100 * float(lat[sv > w[1] - 1.0].mean()), "조향 RMS": float(np.sqrt(np.mean(lg[:, 9] ** 2))), "구간 스로틀": float(lg[:, 8].mean())}
 
 
-def cell_diff(a_h, b_h, x, y, res=0.05):
-    ix, iy = int(round(x / res)), int(round(y / res))
-    cy = 1.0
-    jc = int(round(-cy / res))
+def cell_diff(a_h, b_h, a, cross, res=0.05):
+    """칸별 차이 (cm). cross: 두 자국이 만나는 칸만, 아니면 주변 (x +-6 m, y +-10 m). 자국 칸(2 mm 넘게 파임)만."""
+    th = heading(a.angle)
+    cy = -4.0 if a.angle != 90.0 else 1.0
     out = []
-    for i in range(-ix, ix + 1):
-        for j in range(jc - iy, jc + iy + 1):
-            u, v = a_h.get((i, j), 0.0), b_h.get((i, j), 0.0)
-            if abs(u) > 0.002 or abs(v) > 0.002:
-                out.append(100 * (v - u))
+    for key in set(a_h) | set(b_h):
+        x, y = key[0] * res, key[1] * res + cy
+        if cross:
+            if abs(x) > CROSS or abs(-x * math.sin(th) + y * math.cos(th)) > CROSS:
+                continue
+        elif abs(x) > 6.0 or abs(y) > 10.0:
+            continue
+        u, v = a_h.get(key, 0.0), b_h.get(key, 0.0)
+        if abs(u) > 0.002 or abs(v) > 0.002:
+            out.append(100 * (v - u))
     return np.array(out)
 
 
@@ -244,25 +267,27 @@ def rng(vals, f=".2f"):
     return f"{min(vals):{f}} ~ {max(vals):{f}}"
 
 
-def report(res, starts, kphi):
-    print(f"\n== kphi {kphi:g}: 교차 차량 값, x {WIN[0]:g} ~ {WIN[1]:g} m (출발 {starts})")
+def report(res, starts, kphi, a):
+    w = win(a.angle)
+    print(f"\n== 교차 각도 {a.angle:g}도, kphi {kphi:g}: 교차 차량 값, s {w[0]:g} ~ {w[1]:g} m (출발 {starts})")
     names = ["truth", "rear", "heights", "flat"]
     labels = {"truth": "정답 (한 SCM)", "rear": "두 프로세스", "heights": "높이만", "flat": "자국 없음"}
-    keys = list(stats(res[starts[0]]["truth"][0]).keys())
+    keys = list(stats(res[starts[0]]["truth"][0], a.angle).keys())
     for k in keys:
-        print(f"  {k:12s}" + "  ".join(f"{labels[n]} {rng([stats(res[g][n][0])[k] for g in starts])}" for n in names))
+        print(f"  {k:12s}" + "  ".join(f"{labels[n]} {rng([stats(res[g][n][0], a.angle)[k] for g in starts])}" for n in names))
     gs = list(starts)
-    for lab, (x, y) in (("주변 영역", CELLS), ("만나는 칸", (CROSS, CROSS))):
-        tp = [cell_diff(res[p]["truth"][1], res[q]["truth"][1], x, y) for ia, p in enumerate(gs) for q in gs[ia + 1:]]
-        mp = [cell_diff(res[g]["truth"][1], res[g]["map"], x, y) for g in gs]
+    for lab, cr in (("주변 영역", False), ("만나는 칸", True)):
+        tp = [cell_diff(res[p]["truth"][1], res[q]["truth"][1], a, cr) for ia, p in enumerate(gs) for q in gs[ia + 1:]]
+        mp = [cell_diff(res[g]["truth"][1], res[g]["map"], a, cr) for g in gs]
         fmt = lambda ds: f"|평균| {rng([float(np.abs(d).mean()) for d in ds], '.3f')}, 평균 {rng([float(d.mean()) for d in ds], '+.3f')}, 최대 {max(float(np.abs(d).max()) for d in ds):.2f}" if ds else "없음"  # noqa: E731
         print(f"  {lab} 칸별 (cm): 정답끼리 {fmt(tp)}")
         print(f"  {lab} 칸별 (cm): 지도-정답 {fmt(mp)}")
     tr = res[gs[0]]["truth"]
-    x_t = tr[0][:, 1]
-    print(f"  앞 차가 y = 0을 지난 때 t = {tr[2]:.1f} s, 교차 차량이 x = -3 m를 지난 때 t = {tr[0][np.searchsorted(x_t, -3.0), 0]:.1f} s, 두 차 최소 거리 {tr[3]:.1f} m")
+    th = heading(a.angle)
+    sv = tr[0][:, 1] * math.cos(th) + tr[0][:, 2] * math.sin(th)
+    print(f"  앞 차가 y = 0을 지난 때 t = {tr[2]:.1f} s, 교차 차량이 s = -3 m를 지난 때 t = {tr[0][np.searchsorted(sv, -3.0), 0]:.1f} s, 두 차 최소 거리 {tr[3]:.1f} m")
     au = [res[g]["audit"] for g in gs]
-    print(f"  해시 불일치: {[x.get('hash_mismatch', x) for x in au]}, 교차 차량 빠르기 {rng([res[g]['speed'] for g in gs])}배")
+    print(f"  해시 불일치: {[x.get('hash_mismatch', x) for x in au]}, 교차 차량 빠르기 {rng([res[g]['speed'] for g in gs])}배", flush=True)
 
 
 def orchestrate(a):
@@ -273,7 +298,8 @@ def orchestrate(a):
     chrono_py = str(Path.home() / "miniconda3/envs/chrono/bin/python")
     me = [chrono_py, str(Path(__file__).resolve())]
     env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "AMENT_PREFIX_PATH", "LD_LIBRARY_PATH")}
-    for kphi in a.kphi:
+    for angle, kphi in [(x, k) for x in a.angle for k in a.kphi]:
+        a1 = argparse.Namespace(angle=angle)
         res = {}
         with tempfile.TemporaryDirectory(prefix="cross_") as tmp:
             dirn = Path(tmp)
@@ -283,7 +309,7 @@ def orchestrate(a):
                 port = so.getsockname()[1]
                 so.close()
                 server = subprocess.Popen([sys.executable, "-m", "sim.map_server_node", "--tcp-port", str(port)], cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-                common = ["--kphi", str(kphi), "--start", str(g), "--hz", str(a.hz), "--delay", str(a.delay)]
+                common = ["--angle", str(angle), "--kphi", str(kphi), "--start", str(g), "--hz", str(a.hz), "--delay", str(a.delay)]
                 tcp = ["--tcp", f"127.0.0.1:{port}"]
                 try:
                     front = subprocess.Popen(me + ["--role", "front", "--out", str(dirn / f"front_{g}.npz")] + common + tcp, env=env, cwd=ROOT)
@@ -304,12 +330,13 @@ def orchestrate(a):
                 for mode in ("truth", "flat", "heights"):
                     d, h = T.load(dirn / f"{mode}_{g}.npz")
                     res[g][mode] = (d["log"], h, float(d["t_pass"]), float(d["min_gap"]))
-                print(f"[kphi {kphi:g} 출발 {g} 끝]", flush=True)
-        report(res, a.starts, kphi)
+                print(f"[각도 {angle:g} kphi {kphi:g} 출발 {g} 끝]", flush=True)
+        report(res, a.starts, kphi, a1)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="앞 차 자국을 90도로 건너기")
+    ap = argparse.ArgumentParser(description="앞 차 자국을 건너기")
+    ap.add_argument("--angle", type=float, nargs="+", default=[90.0], help="앞 차 길과 만나는 각도 (도). 90이 직각")
     ap.add_argument("--kphi", type=float, nargs="+", default=[5e6, 1e6])
     ap.add_argument("--starts", type=float, nargs="+", default=[-24.1, -24.0, -23.9], help="교차 차량 출발 x (m)")
     ap.add_argument("--start", type=float)
@@ -323,7 +350,7 @@ def main():
     a = ap.parse_args()
     if a.role is None:
         return orchestrate(a)
-    a.kphi, a.lane = a.kphi[0], None
+    a.kphi, a.lane, a.angle = a.kphi[0], None, a.angle[0]
     {"front": role_front, "rear": role_rear, "solo": role_solo}[a.role](a)
 
 
