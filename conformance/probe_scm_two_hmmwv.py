@@ -111,8 +111,11 @@ class Car:
                 pts.push_back(chrono.ChVector3d(path_x(float(y)), float(y), 0.5))
             self.path = chrono.ChBezierCurve(pts)
         else:
-            far = (Y_END + 8.0 - y0) if length is None else length + 8.0
-            self.path = veh.StraightLinePath(chrono.ChVector3d(x0, y0, 0.5), chrono.ChVector3d(x0 + far * self.dir[0], y0 + far * self.dir[1], 0.5), 1)
+            if length is None:                                  # 끝점을 삼각함수로 계산하면 x가 2.4e-15 m 어긋나 결과가 달라진다 (두 차 따라가기가 그만큼 민감하다)
+                self.path = veh.StraightLinePath(chrono.ChVector3d(x0, y0, 0.5), chrono.ChVector3d(x0, Y_END + 8.0, 0.5), 1)
+            else:
+                far = length + 8.0
+                self.path = veh.StraightLinePath(chrono.ChVector3d(x0, y0, 0.5), chrono.ChVector3d(x0 + far * self.dir[0], y0 + far * self.dir[1], 0.5), 1)
         self.driver = veh.ChPathFollowerDriver(car.GetVehicle(), self.path, "d", SPEED)
         self.driver.GetSteeringController().SetLookAheadDistance(5.0)
         self.driver.GetSteeringController().SetGains(0.8, 0, 0)

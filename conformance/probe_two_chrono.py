@@ -4,6 +4,7 @@
     python conformance/probe_two_chrono.py [--kphi 5e6 1e6] [--hz 25] [--delay 0.2]       (mj_ros 환경. Chrono 프로세스는 chrono 환경으로 띄운다)
     python conformance/probe_two_chrono.py --spread 11.8 11.9 12.0 12.1 12.2              뒤 차 출발 위치별로 정답끼리의 칸별 범위와 두 프로세스를 비교
     python conformance/probe_two_chrono.py --spread 11.8 11.9 12.0 12.1 12.2 --rear-x 0.1 0.2 0.3   자국 벽 시험: 뒤 차를 앞 차 길에서 옆으로 옮겨서
+    python conformance/probe_two_chrono.py --spread 11.8 11.9 12.0 12.1 12.2 --delays 1 2 3 4 5     궤적이 얼마나 늦어도 되는가 (정답은 한 번만 돌린다)
     python conformance/probe_two_chrono.py --robot scenarios/two_cars_crossing.yaml [--godot]   두 차가 낸 자국을 시뮬레이터의 로봇이 넘는다 (차는 지도 x = --lane m를 지난다)
 
   앞 차 프로세스: 자기 SCM에서 달리며 바뀐 노드를 dig로, 네 바퀴 궤적을 traj로 맵 서버(TCP)에 보낸다.
@@ -15,6 +16,7 @@
 import argparse
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -29,6 +31,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "conformance"))
 THRESH = 0.001                                     # 뒤 차: 지도보다 이만큼 더 낮아진 칸만 보낸다 (m)
 Z_RANGE = (-0.5, 0.5)
+GUARD = 1.0                                        # 고스트를 숨기는 거리: 자기 차 앞바퀴 앞 (m)
 WRITE_EVERY = 100                                  # 지도에 쓰는 주기 (물리 스텝, 0.2 s)
 
 
@@ -132,6 +135,23 @@ def role_front(a):
     m.close()
 
 
+def hide_late_ghosts(P, car, bodies, frame):
+    """자기 차 앞바퀴에 GUARD m 안까지 왔거나 지나간 고스트 바퀴를 숨긴다 (이 궤적은 늦었다. 고스트는 충돌 몸체라 겹치면 차에 부딪힌다). 반환: 숨긴 바퀴 수."""
+    v = car.car.GetVehicle()
+    pl, pr = v.GetSpindlePos(0, P.veh.LEFT), v.GetSpindlePos(0, P.veh.RIGHT)
+    cx, cy = (pl.x + pr.x) / 2, (pl.y + pr.y) / 2
+    fwd = P.chrono.ChMatrix33d(v.GetRot()).GetAxisX()
+    n = 0
+    for b, r in zip(bodies, frame):
+        dx, dy = r[0] - cx, r[1] - cy
+        if dx * fwd.x + dy * fwd.y < GUARD and abs(-dx * fwd.y + dy * fwd.x) < 2.0:
+            b.SetPos(P.chrono.ChVector3d(0, 0, 50))
+            b.SetPosDt(P.chrono.ChVector3d(0, 0, 0))
+            b.SetAngVelParent(P.chrono.ChVector3d(0, 0, 0))
+            n += 1
+    return n
+
+
 def role_rear(a):
     import probe_scm_two_hmmwv as P
     setup(P)
@@ -144,7 +164,7 @@ def role_rear(a):
     delay = int(round(a.delay / P.STEP))
     frames, ended, every = [], False, None
     sent, log, t, k = {}, [], 0.0, 0
-    ghost_on, waited = True, 0.0
+    ghost_on, waited, hid = True, 0.0, 0
     m.send_traj("rear", 0, 1, np.zeros((0, 4, 13)), (P.TIRE_R, P.TIRE_W))   # 준비 끝: 앞 차가 이것을 보고 출발한다
 
     def receive():
@@ -191,6 +211,7 @@ def role_rear(a):
                 fr = (1 - f) * frames[a0] + f * frames[a0 + 1]
                 fr[:, 3:7] = fr[:, 3:7] / np.linalg.norm(fr[:, 3:7], axis=1, keepdims=True)
                 P.place_ghosts(bodies, fr)
+                hid += hide_late_ghosts(P, car, bodies, fr)
         ter.Synchronize(t)
         di = car.step_in(t, ter)
         ter.Advance(P.STEP)
@@ -209,7 +230,7 @@ def role_rear(a):
     au = m.audit(wait_s=120.0)
     final = m.local.compose(0, m.local.nrow, 0, m.local.ncol)
     save(a.out, heights={(n.x, n.y): v for n, v in ter.GetModifiedNodes(True)}, wall=wall, sim=t, audit=json.dumps(au), log=np.array(log), final_map=final,
-         waited=waited, i0=i0, j0=j0, frames=np.array(frames))
+         waited=waited, i0=i0, j0=j0, frames=np.array(frames), hid=hid)
     m.close()
 
 
@@ -298,10 +319,11 @@ def spread_compare(a, dirn, kphi):
         final = rd["final_map"]
         mp = {(int(i - i0), int(j - j0)): float(final[j, i]) for j in range(nrow) for i in range(ncol) if final[j, i] != 0.0}
         R[g] = (rd["log"], rh, P.window_stats({"log": rd["log"], "final": rh, "cy": cy}, fh), mp)
+        print(f"  [간격 {g}] 숨긴 고스트 바퀴 {int(rd['hid'])} 스텝 x 바퀴 ({100 * int(rd['hid']) / max(1, 4 * len(rd['frames']) * 20):.0f} %)")
         au = json.loads(str(rd["audit"]))
         if au.get("hash_mismatch") != 0:
             print(f"간격 {g}: 뒤 차 해시 불일치 {au}")
-    print(f"\n== kphi {kphi:g}, 뒤 차 옆으로 {100 * a.rear_x[0]:g} cm. 각 쌍: 칸별 |평균| (cm), 평균 (cm), 뒤 차 옆 궤적 차이 RMS (cm)")
+    print(f"\n== kphi {kphi:g}, 뒤 차 옆으로 {100 * a.rear_x[0]:g} cm, 지연 {a.delay:g} s. 각 쌍: 칸별 |평균| (cm), 평균 (cm), 뒤 차 옆 궤적 차이 RMS (cm)")
     gs = list(a.spread)
     pairs = []
     for ia, ga in enumerate(gs):
@@ -331,7 +353,8 @@ def spread_compare(a, dirn, kphi):
 
 
 def spread(a, me, env):
-    for kphi, off in [(k, x) for k in a.kphi for x in a.rear_x]:
+    cache = tempfile.TemporaryDirectory(prefix="two_chrono_truth_")      # 정답은 지연과 상관없다
+    for kphi, off, delay in [(k, x, d) for k in a.kphi for x in a.rear_x for d in (a.delays or [a.delay])]:
         with tempfile.TemporaryDirectory(prefix="two_chrono_") as tmp:
             dirn = Path(tmp)
             for g in a.spread:
@@ -341,7 +364,7 @@ def spread(a, me, env):
                 s.close()
                 server = subprocess.Popen([sys.executable, "-m", "sim.map_server_node", "--tcp-port", str(port)], cwd=ROOT,
                                           stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-                common = ["--kphi", str(kphi), "--hz", str(a.hz), "--delay", str(a.delay), "--tcp", f"127.0.0.1:{port}", "--gap", str(g), "--rear-x", str(off)]
+                common = ["--kphi", str(kphi), "--hz", str(a.hz), "--delay", str(delay), "--tcp", f"127.0.0.1:{port}", "--gap", str(g), "--rear-x", str(off)]
                 try:
                     front = subprocess.Popen(me + ["--role", "front", "--out", str(dirn / f"front_{g}.npz")] + common, env=env, cwd=ROOT)
                     time.sleep(1.0)
@@ -351,9 +374,12 @@ def spread(a, me, env):
                 finally:
                     server.terminate()
                     server.wait(timeout=10)
-                subprocess.run(me + ["--role", "truth", "--out", str(dirn / f"truth_{g}.npz"), *common], env=env, cwd=ROOT, check=True, timeout=1800)
-                print(f"[kphi {kphi:g} 옆 {off:g} 간격 {g} 끝]", flush=True)
-            subprocess.run(me + ["--role", "spread_compare", "--dir", str(dirn), "--kphi", str(kphi), "--rear-x", str(off), "--spread", *map(str, a.spread)], env=env, cwd=ROOT, check=True, timeout=900)
+                cached = Path(cache.name) / f"truth_{kphi:g}_{off:g}_{g}.npz"
+                if not cached.exists():
+                    subprocess.run(me + ["--role", "truth", "--out", str(cached), *common], env=env, cwd=ROOT, check=True, timeout=1800)
+                shutil.copy(cached, dirn / f"truth_{g}.npz")
+                print(f"[kphi {kphi:g} 옆 {off:g} 지연 {delay:g} 간격 {g} 끝]", flush=True)
+            subprocess.run(me + ["--role", "spread_compare", "--dir", str(dirn), "--kphi", str(kphi), "--rear-x", str(off), "--delay", str(delay), "--spread", *map(str, a.spread)], env=env, cwd=ROOT, check=True, timeout=900)
 
 
 def robot_series(run):
@@ -531,6 +557,7 @@ def main():
     ap.add_argument("--kphi", type=float, nargs="+", default=[5e6, 1e6])
     ap.add_argument("--hz", type=float, default=25.0)
     ap.add_argument("--delay", type=float, default=0.2)
+    ap.add_argument("--delays", type=float, nargs="+", help="--spread: 궤적 지연 여러 값 (s)")
     ap.add_argument("--role", choices=("front", "rear", "truth", "compare", "spread_compare"))
     ap.add_argument("--spread", type=float, nargs="*", help="뒤 차 출발 간격들 (m)")
     ap.add_argument("--gap", type=float, default=12.0)
