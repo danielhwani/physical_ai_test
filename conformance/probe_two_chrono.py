@@ -231,11 +231,11 @@ def compare(a, dirn, kphi):
                 dm.append(100 * (m_ - t_))
                 dr.append(100 * (rh.get((i, j), 0.0) - t_))
     dm, dr = np.array(dm), np.array(dr)
-    print(f"\n== kphi {kphi:g}: 뒤 차, y {P.WINDOW[0]:g} ~ {P.WINDOW[1]:g} m (궤적 {a.hz:g} Hz, 지연 {a.delay:g} s)")
-    print(f"{'':10s}{'추가 침하':>9s}{'끝 깊이':>8s}{'바퀴 높이':>9s}{'스로틀':>7s}{'벗어남cm':>9s}{'옆흔들림':>9s}")
-    for name, st in (("정답 A", st_t), ("두 프로세스", st_r)):
-        print(f"{name:10s}{st['added_sink_cm']:9.2f}{st['final_depth_cm']:8.2f}{st['spindle_z_m'] * 100:9.2f}{st['throttle']:7.3f}{st['lateral_m'] * 100:9.1f}{st['roll_rms_deg']:9.3f}")
-    print(f"차이      {st_r['added_sink_cm'] - st_t['added_sink_cm']:+9.2f}{st_r['final_depth_cm'] - st_t['final_depth_cm']:+8.2f}{(st_r['spindle_z_m'] - st_t['spindle_z_m']) * 100:+9.2f}{st_r['throttle'] - st_t['throttle']:+7.3f}")
+    print(f"\n== kphi {kphi:g}: 뒤 차 값, y {P.WINDOW[0]:g} ~ {P.WINDOW[1]:g} m (궤적 {a.hz:g} Hz, 지연 {a.delay:g} s)")
+    print(f"{'':20s}{'추가 침하':>9s}{'끝 깊이':>8s}{'바퀴 높이':>9s}{'스로틀':>7s}{'벗어남cm':>9s}{'옆흔들림':>9s}")
+    for name, st in (("뒤 차 (정답 A)", st_t), ("뒤 차 (두 프로세스)", st_r)):
+        print(f"{name:20s}{st['added_sink_cm']:9.2f}{st['final_depth_cm']:8.2f}{st['spindle_z_m'] * 100:9.2f}{st['throttle']:7.3f}{st['lateral_m'] * 100:9.1f}{st['roll_rms_deg']:9.3f}")
+    print(f"{'뒤 차 차이':20s}{st_r['added_sink_cm'] - st_t['added_sink_cm']:+9.2f}{st_r['final_depth_cm'] - st_t['final_depth_cm']:+8.2f}{(st_r['spindle_z_m'] - st_t['spindle_z_m']) * 100:+9.2f}{st_r['throttle'] - st_t['throttle']:+7.3f}")
     print(f"A 칸별 추가 침하 {st_t['added_sink_bin_min_cm']:.2f} ~ {st_t['added_sink_bin_max_cm']:.2f} cm, 두 차 최소 거리 {float(td['min_gap']):.1f} m")
     _, tb = load(dirn / "truth_b.npz")
     d0 = np.array([100 * (tb.get((i, j), 0.0) - th.get((i, j), 0.0)) for i in range(-i0, i0 + 1) for j in range(j_lo, j_hi + 1)
@@ -302,8 +302,8 @@ def spread_compare(a, dirn, kphi):
     allp = np.vstack([pa, oa])
     print(f"  칸별 |평균|과 궤적 차이의 상관 (15쌍): {np.corrcoef(allp[:, 0], allp[:, 2])[0, 1]:+.2f}")
     keys = ("added_sink_cm", "final_depth_cm", "spindle_z_m", "throttle", "lateral_m", "speed_mps")
-    for name, rows in (("정답", [T[g][2] for g in gs]), ("두 프로세스", [R[g][2] for g in gs])):
-        print(f"  {name:8s}" + "  ".join(f"{k.split('_')[0]} {min(r[k] for r in rows) * (100 if k in ('spindle_z_m', 'lateral_m') else 1):.3f} ~ {max(r[k] for r in rows) * (100 if k in ('spindle_z_m', 'lateral_m') else 1):.3f}" for k in keys))
+    for name, rows in (("뒤 차 (정답 A)", [T[g][2] for g in gs]), ("뒤 차 (두 프로세스)", [R[g][2] for g in gs])):
+        print(f"  {name:20s}" + "  ".join(f"{k.split('_')[0]} {min(r[k] for r in rows) * (100 if k in ('spindle_z_m', 'lateral_m') else 1):.3f} ~ {max(r[k] for r in rows) * (100 if k in ('spindle_z_m', 'lateral_m') else 1):.3f}" for k in keys))
 
 
 def spread(a, me, env):
