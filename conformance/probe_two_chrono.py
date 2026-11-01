@@ -5,6 +5,8 @@
     python conformance/probe_two_chrono.py --spread 11.8 11.9 12.0 12.1 12.2              뒤 차 출발 위치별로 정답끼리의 칸별 범위와 두 프로세스를 비교
     python conformance/probe_two_chrono.py --spread 11.8 11.9 12.0 12.1 12.2 --rear-x 0.1 0.2 0.3   자국 벽 시험: 뒤 차를 앞 차 길에서 옆으로 옮겨서
     python conformance/probe_two_chrono.py --spread 11.8 11.9 12.0 12.1 12.2 --delays 1 2 3 4 5     궤적이 얼마나 늦어도 되는가 (정답은 한 번만 돌린다)
+    python conformance/probe_two_chrono.py --spread 11.8 11.9 12.0 12.1 12.2 --delay 1 --cases base drop0.5 out0.5 out2 late4   뒤 차가 기다리지 않는다 (같은 배속 --pace)
+        base 그대로, dropP 궤적 프레임을 확률 P로 뺀다, outD 앞 차 t = 6 s (--outage-at)부터 D초 끊긴다 (구멍 앞, 안, 뒤로 나눠 출력), lateW 궤적이 실제 시간 W초 늦게 도착한다
     python conformance/probe_two_chrono.py --robot scenarios/two_cars_crossing.yaml [--godot]   두 차가 낸 자국을 시뮬레이터의 로봇이 넘는다 (차는 지도 x = --lane m를 지난다)
 
   앞 차 프로세스: 자기 SCM에서 달리며 바뀐 노드를 dig로, 네 바퀴 궤적을 traj로 맵 서버(TCP)에 보낸다.
@@ -31,6 +33,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "conformance"))
 THRESH = 0.001                                     # 뒤 차: 지도보다 이만큼 더 낮아진 칸만 보낸다 (m)
 Z_RANGE = (-0.5, 0.5)
+MAX_FILL = 1.0                                     # 받은 궤적 프레임 사이를 메우는 최대 시간 (s, 시뮬레이션)
 GUARD = 1.0                                        # 고스트를 숨기는 거리: 자기 차 앞바퀴 앞 (m)
 WRITE_EVERY = 100                                  # 지도에 쓰는 주기 (물리 스텝, 0.2 s)
 
@@ -111,13 +114,17 @@ def role_front(a):
             raise RuntimeError("뒤 차가 붙지 않는다")
     wall = time.perf_counter()
     tire = (P.TIRE_R, P.TIRE_W)
+    rng = np.random.default_rng(1)
+    ys = []
     while car.pos()[1] <= P.Y_END:
         ter.Synchronize(t)
         car.step_in(t, ter)
         ter.Advance(P.STEP)
         s.DoStepDynamics(P.STEP)
         t = s.GetChTime()
-        if k % every == 0:
+        ys.append((t, car.pos()[1]))
+        out = a.outage is not None and a.outage[0] <= t < a.outage[0] + a.outage[1]
+        if k % every == 0 and not out and (k < 2 * every or rng.random() >= a.drop_traj):   # 처음 두 프레임은 시작 맞추기에 쓴다
             m.send_traj("front", k, every, [wheel_frame(P, car)], tire)
         if (k + 1) % WRITE_EVERY == 0:
             r, c, h = to_cells(*changed_nodes(ter, sent))
@@ -125,13 +132,139 @@ def role_front(a):
                 m.write_cells("dig", "front", r, c, h, t=t)
             m.poll()
         k += 1
+        if a.pace:
+            pace_wait(wall, t, a.pace)
     r, c, h = to_cells(*changed_nodes(ter, sent))
     if r.size:
         m.write_cells("dig", "front", r, c, h, t=t)
     m.send_traj("front", k, every, np.zeros((0, 4, 13)), tire, end=True)
     wall = time.perf_counter() - wall
     au = m.audit(wait_s=120.0)
-    save(a.out, heights={(n.x, n.y): v for n, v in ter.GetModifiedNodes(True)}, wall=wall, sim=t, audit=json.dumps(au), steps=k)
+    save(a.out, heights={(n.x, n.y): v for n, v in ter.GetModifiedNodes(True)}, wall=wall, sim=t, audit=json.dumps(au), steps=k, ys=np.array(ys))
+    m.close()
+
+
+def pace_wait(wall0, t, pace):
+    """시뮬레이션 시각 t가 실제 시간의 pace배를 앞서면 기다린다. 반환: 늦은 시간 (s, 0 이상)."""
+    now = time.perf_counter() - wall0
+    target = t / pace
+    if now < target:
+        time.sleep(target - now)
+        return 0.0
+    return now - target
+
+
+def hide_ghosts(P, bodies):
+    for b in bodies:
+        b.SetPos(P.chrono.ChVector3d(0, 0, 50))
+        b.SetPosDt(P.chrono.ChVector3d(0, 0, 0))
+        b.SetAngVelParent(P.chrono.ChVector3d(0, 0, 0))
+
+
+def role_rear_free(a):
+    """기다리지 않는 뒤 차: 항상 delay 전 자세를 재생한다 (지터 버퍼). 그때 자세가 없으면 고스트를 쉬게 한다 (받은 프레임 사이가 MAX_FILL 이하면 메운다)."""
+    import bisect
+    import probe_scm_two_hmmwv as P
+    from sim.map_client import dec
+    setup(P)
+    P.GAP = a.gap
+    m, to_cells, i0, j0 = client(P, "rear", a)
+    s = P.make_system()
+    ter, cy = P.make_terrain(s, a.kphi)
+    bodies = P.ghost_bodies(s, ter, 4)
+    car = P.Car(s, ter, P.Y_FRONT - P.GAP, a.rear_x[0])
+    delay = int(round(a.delay / P.STEP))
+    frames, keys, queue, every, end_k = {}, [], [], None, None
+    sent, log, t, k = {}, [], 0.0, 0
+    hid, missed, late_frames, lag = 0, 0, 0, 0.0
+    max_fill = None
+    m.send_traj("rear", 0, 1, np.zeros((0, 4, 13)), (P.TIRE_R, P.TIRE_W))
+
+    def receive(idx):
+        nonlocal every, end_k, late_frames, max_fill
+        m.poll()
+        queue.extend(m.traj_in)
+        m.traj_in.clear()
+        now = time.time()
+        rest = []
+        for tm in queue:
+            start = tm["k0"] < 2 * tm["every"] or tm["end"]               # 처음 두 프레임과 끝 표시는 늦추지 않는다 (시작 맞추기와 끝내기)
+            if not start and now - tm["wall"] < a.net_delay:
+                rest.append(tm)
+                continue
+            every = tm["every"]
+            max_fill = int(round(MAX_FILL / (every * P.STEP)))
+            if tm["end"]:
+                end_k = tm["k0"]
+            elif tm["data"]:
+                f = tm["k0"] // every
+                frames[f] = dec(tm["data"], tuple(tm["shape"]))[0]
+                bisect.insort(keys, f)
+                if tm["k0"] < idx:
+                    late_frames += 1
+        queue[:] = rest
+
+    def pose(idx):
+        """이 스텝의 자세. 없으면 None."""
+        a0 = idx // every
+        i = bisect.bisect_right(keys, a0)
+        if i == 0 or i >= len(keys):
+            return None
+        lo, hi = keys[i - 1], keys[i]
+        if hi - lo > max_fill:
+            return None
+        f = (idx - lo * every) / ((hi - lo) * every)
+        fr = (1 - f) * frames[lo] + f * frames[hi]
+        fr[:, 3:7] = fr[:, 3:7] / np.linalg.norm(fr[:, 3:7], axis=1, keepdims=True)
+        return fr
+
+    def write():
+        r, c, h = to_cells(*changed_nodes(ter, sent))
+        if r.size:
+            low = h < m.local.compose(0, m.local.nrow, 0, m.local.ncol)[r, c] - THRESH
+            if low.any():
+                m.write_cells("dig", "rear", r[low], c[low], h[low], t=t)
+
+    t0 = time.monotonic()
+    while len(keys) < 2:                                       # 시작 맞추기만 기다린다 (첫 두 프레임)
+        receive(0)
+        time.sleep(0.001)
+        if time.monotonic() - t0 > 120:
+            raise RuntimeError("앞 차 궤적이 오지 않는다")
+    wall = time.perf_counter()
+    while True:
+        idx = max(0, k - delay)
+        receive(idx)
+        if end_k is None or idx < end_k - every:
+            fr = pose(idx)
+            if fr is None:
+                hide_ghosts(P, bodies)
+                missed += 1
+            else:
+                P.place_ghosts(bodies, fr)
+                hid += hide_late_ghosts(P, car, bodies, fr)
+        else:
+            hide_ghosts(P, bodies)
+        ter.Synchronize(t)
+        di = car.step_in(t, ter)
+        ter.Advance(P.STEP)
+        s.DoStepDynamics(P.STEP)
+        t = s.GetChTime()
+        x, y, z = car.pos()
+        if P.WINDOW[0] <= y <= P.WINDOW[1]:
+            log.append(P.log_row(car, t, x, y, z, di))
+        if (k + 1) % WRITE_EVERY == 0:
+            write()
+        k += 1
+        lag = max(lag, pace_wait(wall, t, a.pace))
+        if y > P.WINDOW[1] + 3.0:
+            break
+    write()
+    wall = time.perf_counter() - wall
+    au = m.audit(wait_s=120.0)
+    final = m.local.compose(0, m.local.nrow, 0, m.local.ncol)
+    save(a.out, heights={(n.x, n.y): v for n, v in ter.GetModifiedNodes(True)}, wall=wall, sim=t, audit=json.dumps(au), log=np.array(log), final_map=final,
+         waited=0.0, i0=i0, j0=j0, frames=np.array([frames[f] for f in keys]), hid=hid, missed=missed, late_frames=late_frames, lag=lag, steps=k)
     m.close()
 
 
@@ -302,6 +435,58 @@ def trace_diff(la, lb):
     return 100 * float(np.sqrt(np.mean((xa - xb) ** 2)))
 
 
+def hole_profile(P, T, R, F, gs, y0, y1, i0, cy, j_lo, j_hi):
+    """끊긴 궤적의 영향을 y로 나눠 본다. 바퀴는 차 중심 앞뒤로 있어 구멍 양쪽 2 m까지 영향권으로 둔다."""
+    def cells(h_a, h_b, j_a, j_b):
+        return cell_diff(h_a, h_b, i0, j_a, j_b)
+    def j_of(y):
+        return int(round((y - cy) / P.DELTA))
+    def depth(h, j_a, j_b):
+        pr = P.track_profile(h, cy)
+        v = [-100 * x for j in range(j_a, j_b) for x in pr.get(j, [0.0, 0.0])]
+        return float(np.mean(v)) if v else 0.0
+    def wheel(lg, y_a, y_b, col):
+        m = (lg[:, 2] >= y_a) & (lg[:, 2] < y_b)
+        return 100 * float(lg[m, col].mean()) if m.any() else float("nan")
+    def rng(v, f="+.2f"):
+        return f"{min(v):{f}} ~ {max(v):{f}}"
+
+    print(f"  y 칸별 (m). 차이는 지도 - 정답 (cm, + = 지도가 얕음). 깊이는 왼쪽, 오른쪽 자국의 가장 깊은 곳 평균, 출발 위치 {len(gs)}개 평균")
+    print(f"  {'y':>6s} {'정답끼리|평균|최대':>16s} {'지도-정답 평균':>18s} {'뒤SCM-정답 평균':>18s} {'앞차':>6s} {'정답':>6s} {'지도':>6s} {'뒤SCM':>6s} {'바퀴높이 차':>16s} {'옆 위치 차':>16s}")
+    TH = {g: T[g][1] for g in gs}
+    MP = {g: R[g][3] for g in gs}
+    RH = {g: R[g][1] for g in gs}
+    for e in np.arange(P.WINDOW[0], P.WINDOW[1], 1.0):
+        ja, jb = j_of(e), j_of(e + 1.0)
+        base = [float(np.abs(cells(TH[ga], TH[gb], ja, jb)).mean()) for i, ga in enumerate(gs) for gb in gs[i + 1:]]
+        dm = [float(cells(TH[g], MP[g], ja, jb).mean()) for g in gs]
+        dr = [float(cells(TH[g], RH[g], ja, jb).mean()) for g in gs]
+        dep = [np.mean([depth(src[g], ja, jb) for g in gs]) for src in (F, TH, MP, RH)]
+        dz = [wheel(R[g][0], e, e + 1.0, 6) - wheel(T[g][0], e, e + 1.0, 6) for g in gs]
+        dx = [wheel(R[g][0], e, e + 1.0, 1) - wheel(T[g][0], e, e + 1.0, 1) for g in gs]
+        mark = "*" if y0 <= e + 1.0 and e <= y1 else " "
+        print(f" {mark}{e:6.1f} {max(base):16.3f} {rng(dm):>18s} {rng(dr):>18s} {dep[0]:6.1f} {dep[1]:6.1f} {dep[2]:6.1f} {dep[3]:6.1f} {rng(dz):>16s} {rng(dx, '+.1f'):>16s}", flush=True)
+
+    print(f"  세 구역 (구멍 y {y0:.1f} ~ {y1:.1f} m, 양쪽 2 m까지 영향권). 몫 = 그 구역이 전체 지도 평균에 보탠 값 (cm)")
+    zones = (("구멍 앞", P.WINDOW[0], y0 - 2.0), ("구멍과 영향권", y0 - 2.0, y1 + 2.0), ("구멍 뒤", y1 + 2.0, P.WINDOW[1]))
+    for name, za, zb in zones:
+        ja, jb = j_of(za), j_of(zb)
+        base = [float(np.abs(cells(TH[ga], TH[gb], ja, jb)).mean()) for i, ga in enumerate(gs) for gb in gs[i + 1:]]
+        bm = [float(cells(TH[ga], TH[gb], ja, jb).mean()) for i, ga in enumerate(gs) for gb in gs[i + 1:]]
+        dm, da, sh, dz, dx = [], [], [], [], []
+        for g in gs:
+            d = cells(TH[g], MP[g], ja, jb)
+            n = cell_diff(TH[g], MP[g], i0, j_lo, j_hi).size
+            dm.append(float(d.mean()))
+            da.append(float(np.abs(d).mean()))
+            sh.append(float(d.sum()) / n)
+            dz.append(wheel(R[g][0], za, zb, 6) - wheel(T[g][0], za, zb, 6))
+            lr, lt = R[g][0], T[g][0]
+            yy = np.arange(za, zb, 0.25)
+            dx.append(100 * float(np.sqrt(np.mean((np.interp(yy, lr[:, 2], lr[:, 1]) - np.interp(yy, lt[:, 2], lt[:, 1])) ** 2))))
+        print(f"    {name} y {za:.1f} ~ {zb:.1f}: 지도-정답 평균 {rng(dm)}, |평균| {rng(da, '.2f')}, 몫 {rng(sh)} | 정답끼리 평균 {rng(bm)}, |평균| {rng(base, '.2f')} | 바퀴높이 차 {rng(dz)} | 옆 궤적 차이 RMS {rng(dx, '.1f')}", flush=True)
+
+
 def spread_compare(a, dirn, kphi):
     """chrono 환경에서: 정답끼리의 범위와 두 프로세스 - 정답."""
     import probe_scm_two_hmmwv as P
@@ -309,21 +494,24 @@ def spread_compare(a, dirn, kphi):
     nrow, ncol, i0, j0 = grid_shape(P)
     cy = (P.SCM_Y[0] + P.SCM_Y[1]) / 2
     j_lo, j_hi = int(round((P.WINDOW[0] - cy) / P.DELTA)), int(round((P.WINDOW[1] - cy) / P.DELTA))
-    T, R = {}, {}
+    T, R, F = {}, {}, {}
     fh = None
     for g in a.spread:
         td, th = load(dirn / f"truth_{g}.npz")
         rd, rh = load(dirn / f"rear_{g}.npz")
         fd, fh = load(dirn / f"front_{g}.npz")
+        F[g] = fh
         T[g] = (td["log"], th, P.window_stats({"log": td["log"], "final": th, "cy": cy}, fh))
         final = rd["final_map"]
         mp = {(int(i - i0), int(j - j0)): float(final[j, i]) for j in range(nrow) for i in range(ncol) if final[j, i] != 0.0}
         R[g] = (rd["log"], rh, P.window_stats({"log": rd["log"], "final": rh, "cy": cy}, fh), mp)
-        print(f"  [간격 {g}] 숨긴 고스트 바퀴 {int(rd['hid'])} 스텝 x 바퀴 ({100 * int(rd['hid']) / max(1, 4 * len(rd['frames']) * 20):.0f} %)")
+        sha = __import__("hashlib").sha1(rd["log"].tobytes()).hexdigest()[:10]
+        print(f"  [간격 {g}] 뒤 차 기록 {sha}, 숨긴 고스트 바퀴 {int(rd['hid'])} 스텝 x 바퀴 ({100 * int(rd['hid']) / max(1, 4 * len(rd['frames']) * 20):.0f} %)"
+              + (f", 고스트 쉼 {int(rd['missed'])}/{int(rd['steps'])} 스텝, 재생 뒤 도착한 프레임 {int(rd['late_frames'])}, 배속 늦음 최대 {1000 * float(rd['lag']):.0f} ms" if "missed" in rd else ""))
         au = json.loads(str(rd["audit"]))
         if au.get("hash_mismatch") != 0:
             print(f"간격 {g}: 뒤 차 해시 불일치 {au}")
-    print(f"\n== kphi {kphi:g}, 뒤 차 옆으로 {100 * a.rear_x[0]:g} cm, 지연 {a.delay:g} s. 각 쌍: 칸별 |평균| (cm), 평균 (cm), 뒤 차 옆 궤적 차이 RMS (cm)")
+    print(f"\n== kphi {kphi:g}, 뒤 차 옆으로 {100 * a.rear_x[0]:g} cm, 지연 {a.delay:g} s{', 경우 ' + a.case if a.case else ''}. 각 쌍: 칸별 |평균| (cm), 평균 (cm), 뒤 차 옆 궤적 차이 RMS (cm)")
     gs = list(a.spread)
     pairs = []
     for ia, ga in enumerate(gs):
@@ -336,6 +524,13 @@ def spread_compare(a, dirn, kphi):
         d = cell_diff(T[g][1], R[g][3], i0, j_lo, j_hi)
         own.append((float(np.abs(d).mean()), float(d.mean()), trace_diff(T[g][0], R[g][0])))
         print(f"  지도 {g} - 정답 {g}: |평균| {own[-1][0]:.3f}, 평균 {own[-1][1]:+.3f}, 궤적 {own[-1][2]:.1f}", flush=True)
+    if a.outage:                                               # 끊긴 궤적이 누르지 못한 구간만
+        ys = np.load(dirn / f"front_{gs[0]}.npz")["ys"]
+        y0, y1 = np.interp(a.outage[0], ys[:, 0], ys[:, 1]), np.interp(a.outage[0] + a.outage[1], ys[:, 0], ys[:, 1])
+        for name, src in (("정답 A", T), ("두 프로세스", R)):
+            v = [100 * float(src[g][0][(src[g][0][:, 2] >= y0) & (src[g][0][:, 2] <= y1), 6].mean()) for g in gs]
+            print(f"  구멍 구간 y {y0:.1f} ~ {y1:.1f} m 바퀴 높이 {name}: {min(v):.2f} ~ {max(v):.2f} cm")
+        hole_profile(P, T, R, F, gs, float(y0), float(y1), i0, cy, j_lo, j_hi)
     pa, oa = np.array([p[:3] for p in pairs]), np.array(own)
     print(f"  정답끼리 {len(pairs)}쌍: |평균| {pa[:, 0].min():.3f} ~ {pa[:, 0].max():.3f}, 평균 {pa[:, 1].min():+.3f} ~ {pa[:, 1].max():+.3f}, 궤적 {pa[:, 2].min():.1f} ~ {pa[:, 2].max():.1f}")
     print(f"  지도 - 정답 {len(own)}쌍: |평균| {oa[:, 0].min():.3f} ~ {oa[:, 0].max():.3f}, 평균 {oa[:, 1].min():+.3f} ~ {oa[:, 1].max():+.3f}, 궤적 {oa[:, 2].min():.1f} ~ {oa[:, 2].max():.1f}")
@@ -354,7 +549,21 @@ def spread_compare(a, dirn, kphi):
 
 def spread(a, me, env):
     cache = tempfile.TemporaryDirectory(prefix="two_chrono_truth_")      # 정답은 지연과 상관없다
-    for kphi, off, delay in [(k, x, d) for k in a.kphi for x in a.rear_x for d in (a.delays or [a.delay])]:
+    def case_flags(c):
+        if c == "wait":
+            return []
+        out = ["--pace", str(a.pace or 0.4)]
+        if c.startswith("drop"):
+            out += ["--drop-traj", c[4:]]
+        elif c.startswith("out"):
+            out += ["--outage", str(a.outage_at), c[3:]]
+        elif c.startswith("late"):
+            out += ["--net-delay", c[4:]]
+        else:
+            assert c == "base", c
+        return out
+
+    for kphi, off, delay, case in [(k, x, d, c) for k in a.kphi for x in a.rear_x for d in (a.delays or [a.delay]) for c in (a.cases or ["wait"])]:
         with tempfile.TemporaryDirectory(prefix="two_chrono_") as tmp:
             dirn = Path(tmp)
             for g in a.spread:
@@ -364,7 +573,7 @@ def spread(a, me, env):
                 s.close()
                 server = subprocess.Popen([sys.executable, "-m", "sim.map_server_node", "--tcp-port", str(port)], cwd=ROOT,
                                           stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-                common = ["--kphi", str(kphi), "--hz", str(a.hz), "--delay", str(delay), "--tcp", f"127.0.0.1:{port}", "--gap", str(g), "--rear-x", str(off)]
+                common = ["--kphi", str(kphi), "--hz", str(a.hz), "--delay", str(delay), "--tcp", f"127.0.0.1:{port}", "--gap", str(g), "--rear-x", str(off)] + case_flags(case)
                 try:
                     front = subprocess.Popen(me + ["--role", "front", "--out", str(dirn / f"front_{g}.npz")] + common, env=env, cwd=ROOT)
                     time.sleep(1.0)
@@ -379,7 +588,7 @@ def spread(a, me, env):
                     subprocess.run(me + ["--role", "truth", "--out", str(cached), *common], env=env, cwd=ROOT, check=True, timeout=1800)
                 shutil.copy(cached, dirn / f"truth_{g}.npz")
                 print(f"[kphi {kphi:g} 옆 {off:g} 지연 {delay:g} 간격 {g} 끝]", flush=True)
-            subprocess.run(me + ["--role", "spread_compare", "--dir", str(dirn), "--kphi", str(kphi), "--rear-x", str(off), "--delay", str(delay), "--spread", *map(str, a.spread)], env=env, cwd=ROOT, check=True, timeout=900)
+            subprocess.run(me + ["--role", "spread_compare", "--dir", str(dirn), "--kphi", str(kphi), "--rear-x", str(off), "--delay", str(delay), "--spread", *map(str, a.spread), "--case", case if case != "wait" else ""] + (["--outage", str(a.outage_at), case[3:]] if case.startswith("out") else []), env=env, cwd=ROOT, check=True, timeout=900)
 
 
 def robot_series(run):
@@ -558,6 +767,13 @@ def main():
     ap.add_argument("--hz", type=float, default=25.0)
     ap.add_argument("--delay", type=float, default=0.2)
     ap.add_argument("--delays", type=float, nargs="+", help="--spread: 궤적 지연 여러 값 (s)")
+    ap.add_argument("--cases", nargs="+", help="--spread: 기다리지 않는 뒤 차의 경우들 (위 설명). wait은 기다리는 방식")
+    ap.add_argument("--case", default="")
+    ap.add_argument("--pace", type=float, help="두 프로세스의 배속 (실제 시간 대비). 있으면 뒤 차가 기다리지 않는다")
+    ap.add_argument("--drop-traj", type=float, default=0.0)
+    ap.add_argument("--outage", type=float, nargs=2)
+    ap.add_argument("--outage-at", type=float, default=6.0, help="--cases outN에서 끊김이 시작되는 시뮬레이션 시각 (s)")
+    ap.add_argument("--net-delay", type=float, default=0.0)
     ap.add_argument("--role", choices=("front", "rear", "truth", "compare", "spread_compare"))
     ap.add_argument("--spread", type=float, nargs="*", help="뒤 차 출발 간격들 (m)")
     ap.add_argument("--gap", type=float, default=12.0)
@@ -576,7 +792,7 @@ def main():
         return spread_compare(a, Path(a.dir), a.kphi)
     if a.role == "compare":
         return compare(a, Path(a.dir), a.kphi)
-    {"front": role_front, "rear": role_rear, "truth": role_truth}[a.role](a)
+    {"front": role_front, "rear": role_rear_free if a.pace else role_rear, "truth": role_truth}[a.role](a)
 
 
 if __name__ == "__main__":
