@@ -195,6 +195,7 @@ class RemoteMap:
         self.applied_log = []                                    # 사본에 넣은 다른 쪽 변경 (바꾼 뒤): 시뮬레이터가 재현 시나리오에 적는다
         self.keep_applied = False                                # 켜는 쪽(시뮬레이터)만 쌓는다: 관찰자·렌더러가 오래 돌면 메모리가 는다
         self.no_log = set()                                      # 쌓지 않는 쓴 쪽 (같이 도는 물리엔진 Chrono: 다시 돌리면 다시 나온다)
+        self.keep_traj = False                                   # 받은 바퀴 궤적을 traj_in에 쌓는다 (재생하는 물리 엔진만. 로봇과 렌더러는 높이만 쓴다)
         self.traj_in = []                                        # 받은 다른 쪽 바퀴 궤적 메시지 (서버 번호 순서). 쓰는 쪽이 꺼내 간다
         self.seen_override = None                                # 있으면 seen_n으로 이 번호를 알린다 (Chrono: 사본이 아니라 SCM에 넣은 번호)
         self.no_rebase_from = None                               # 있으면 이 클라이언트들의 편집에는 서버가 맞추지 않는다
@@ -402,7 +403,8 @@ class RemoteMap:
             if m.get("from") == self.name:
                 self.inflight = [x for x in self.inflight if x[0] != m["seq"]]   # 서버 순서가 확인된 자기 편집
             elif m["type"] == "traj":
-                self.traj_in.append(m)
+                if self.keep_traj:
+                    self.traj_in.append(m)
                 self.applied_seq[m["from"]] = m["seq"]
             else:
                 # 서버는 이것을 아직 확인 안 된 자기 편집보다 앞에 놓았지만 사본에는 그 편집이 먼저 들어 있다: 편집에 맞춰 바꾼다

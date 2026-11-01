@@ -3,6 +3,8 @@
 
     python conformance/probe_two_chrono.py [--kphi 5e6 1e6] [--hz 25] [--delay 0.2]       (mj_ros 환경. Chrono 프로세스는 chrono 환경으로 띄운다)
     python conformance/probe_two_chrono.py --spread 11.8 11.9 12.0 12.1 12.2              뒤 차 출발 위치별로 정답끼리의 칸별 범위와 두 프로세스를 비교
+    python conformance/probe_two_chrono.py --spread 11.8 11.9 12.0 12.1 12.2 --rear-x 0.1 0.2 0.3   자국 벽 시험: 뒤 차를 앞 차 길에서 옆으로 옮겨서
+    python conformance/probe_two_chrono.py --robot scenarios/two_cars_crossing.yaml [--godot]   두 차가 낸 자국을 시뮬레이터의 로봇이 넘는다 (차는 지도 x = --lane m를 지난다)
 
   앞 차 프로세스: 자기 SCM에서 달리며 바뀐 노드를 dig로, 네 바퀴 궤적을 traj로 맵 서버(TCP)에 보낸다.
   뒤 차 프로세스: 받은 궤적을 고스트 바퀴로 재생해 자기 SCM을 누르고 (높이는 넣지 않는다), 뒤 차를 달리며 지도보다 THRESH 넘게 낮아진 칸만 dig로 보낸다.
@@ -51,10 +53,26 @@ def changed_nodes(terrain, sent):
     return np.array(i, int), np.array(j, int), np.array(h, float)
 
 
-def client(P, name, tcp):
+def client(P, name, a):
+    """지도에 붙는다. 반환: 클라이언트, to_cells(i, j, h) -> 지도 칸 (행, 열, 높이), 범위 밖 칸은 뺀다.
+    --robot: 지도는 시뮬레이터 것 (관찰자로 받는다). SCM 노드 (i, j)의 월드 좌표 = (lane + i 칸, SCM 가운데 y + j 칸)."""
     from sim.map_client import RemoteMap
-    nrow, ncol, i0, j0 = grid_shape(P)
-    return RemoteMap(np.zeros((nrow, ncol)), Z_RANGE, name=name, tcp=tcp), i0, j0
+    if a.lane is None:
+        nrow, ncol, i0, j0 = grid_shape(P)
+        m = RemoteMap(np.zeros((nrow, ncol)), Z_RANGE, name=name, tcp=a.tcp)
+    else:
+        m = RemoteMap(None, name=name, tcp=a.tcp, wait_s=60.0)
+        nrow, ncol = m.local.nrow, m.local.ncol
+        cy = (P.SCM_Y[0] + P.SCM_Y[1]) / 2
+        i0 = int(round((a.lane + (ncol - 1) * P.DELTA / 2) / P.DELTA))
+        j0 = int(round((cy + (nrow - 1) * P.DELTA / 2) / P.DELTA))
+    m.keep_traj = True
+
+    def to_cells(i, j, h):
+        r, c = j + j0, i + i0
+        ok = (r >= 0) & (r < nrow) & (c >= 0) & (c < ncol)
+        return r[ok], c[ok], np.clip(h[ok], m.local.z_min, m.local.z_max)
+    return m, to_cells, i0, j0
 
 
 def wheel_frame(P, car):
@@ -76,14 +94,14 @@ def save(path, **kw):
 def role_front(a):
     import probe_scm_two_hmmwv as P
     setup(P)
-    m, i0, j0 = client(P, "front", a.tcp)
+    m, to_cells, i0, j0 = client(P, "front", a)
     s = P.make_system()
     ter, cy = P.make_terrain(s, a.kphi)
     car = P.Car(s, ter, P.Y_FRONT)
     every = max(1, int(round(1.0 / (a.hz * P.STEP))))
     sent, t, k = {}, 0.0, 0
     t_wait = time.monotonic()
-    while "rear" not in (m.info or {}).get("joined", []):       # 뒤 차가 붙을 때까지 출발하지 않는다 (붙기 전 궤적은 받지 못한다: 늦게 붙기는 아직 없다)
+    while not any(tm["writer"] == "rear" for tm in m.traj_in):  # 뒤 차가 지도를 다 받고 알릴 때까지 출발하지 않는다 (붙기 전 궤적은 받지 못한다: 늦게 붙기는 아직 없다)
         m.poll()
         time.sleep(0.01)
         if time.monotonic() - t_wait > 120:
@@ -99,14 +117,14 @@ def role_front(a):
         if k % every == 0:
             m.send_traj("front", k, every, [wheel_frame(P, car)], tire)
         if (k + 1) % WRITE_EVERY == 0:
-            i, j, h = changed_nodes(ter, sent)
-            if i.size:
-                m.write_cells("dig", "front", j + j0, i + i0, h, t=t)
+            r, c, h = to_cells(*changed_nodes(ter, sent))
+            if r.size:
+                m.write_cells("dig", "front", r, c, h, t=t)
             m.poll()
         k += 1
-    i, j, h = changed_nodes(ter, sent)
-    if i.size:
-        m.write_cells("dig", "front", j + j0, i + i0, h, t=t)
+    r, c, h = to_cells(*changed_nodes(ter, sent))
+    if r.size:
+        m.write_cells("dig", "front", r, c, h, t=t)
     m.send_traj("front", k, every, np.zeros((0, 4, 13)), tire, end=True)
     wall = time.perf_counter() - wall
     au = m.audit(wait_s=120.0)
@@ -118,15 +136,16 @@ def role_rear(a):
     import probe_scm_two_hmmwv as P
     setup(P)
     P.GAP = a.gap
-    m, i0, j0 = client(P, "rear", a.tcp)
+    m, to_cells, i0, j0 = client(P, "rear", a)
     s = P.make_system()
     ter, cy = P.make_terrain(s, a.kphi)
     bodies = P.ghost_bodies(s, ter, 4)
-    car = P.Car(s, ter, P.Y_FRONT - P.GAP)
+    car = P.Car(s, ter, P.Y_FRONT - P.GAP, a.rear_x[0])
     delay = int(round(a.delay / P.STEP))
     frames, ended, every = [], False, None
     sent, log, t, k = {}, [], 0.0, 0
     ghost_on, waited = True, 0.0
+    m.send_traj("rear", 0, 1, np.zeros((0, 4, 13)), (P.TIRE_R, P.TIRE_W))   # 준비 끝: 앞 차가 이것을 보고 출발한다
 
     def receive():
         nonlocal ended, every
@@ -143,13 +162,11 @@ def role_rear(a):
         m.traj_in.clear()
 
     def write():
-        i, j, h = changed_nodes(ter, sent)
-        if i.size:
-            r, c = j + j0, i + i0
-            h2 = np.clip(h, *Z_RANGE)
-            low = h2 < m.local.compose(0, m.local.nrow, 0, m.local.ncol)[r, c] - THRESH   # 고스트가 만든 칸은 지도에 이미 있다
+        r, c, h = to_cells(*changed_nodes(ter, sent))
+        if r.size:
+            low = h < m.local.compose(0, m.local.nrow, 0, m.local.ncol)[r, c] - THRESH   # 고스트가 만든 칸은 지도에 이미 있다
             if low.any():
-                m.write_cells("dig", "rear", r[low], c[low], h2[low], t=t)
+                m.write_cells("dig", "rear", r[low], c[low], h[low], t=t)
 
     wall = time.perf_counter()
     while True:
@@ -200,6 +217,7 @@ def role_truth(a):
     import probe_scm_two_hmmwv as P
     setup(P)
     P.GAP = a.gap
+    P.REAR_X = a.rear_x[0]
     ca = P.run(a.kphi, True, True)
     save(a.out, heights=ca["final"], log=ca["log"], cy=ca["cy"], wall=ca["wall"], sim=ca["t"], min_gap=ca["min_gap"])
 
@@ -283,7 +301,7 @@ def spread_compare(a, dirn, kphi):
         au = json.loads(str(rd["audit"]))
         if au.get("hash_mismatch") != 0:
             print(f"간격 {g}: 뒤 차 해시 불일치 {au}")
-    print(f"\n== kphi {kphi:g}. 각 쌍: 칸별 |평균| (cm), 평균 (cm), 뒤 차 옆 궤적 차이 RMS (cm)")
+    print(f"\n== kphi {kphi:g}, 뒤 차 옆으로 {100 * a.rear_x[0]:g} cm. 각 쌍: 칸별 |평균| (cm), 평균 (cm), 뒤 차 옆 궤적 차이 RMS (cm)")
     gs = list(a.spread)
     pairs = []
     for ia, ga in enumerate(gs):
@@ -300,14 +318,20 @@ def spread_compare(a, dirn, kphi):
     print(f"  정답끼리 {len(pairs)}쌍: |평균| {pa[:, 0].min():.3f} ~ {pa[:, 0].max():.3f}, 평균 {pa[:, 1].min():+.3f} ~ {pa[:, 1].max():+.3f}, 궤적 {pa[:, 2].min():.1f} ~ {pa[:, 2].max():.1f}")
     print(f"  지도 - 정답 {len(own)}쌍: |평균| {oa[:, 0].min():.3f} ~ {oa[:, 0].max():.3f}, 평균 {oa[:, 1].min():+.3f} ~ {oa[:, 1].max():+.3f}, 궤적 {oa[:, 2].min():.1f} ~ {oa[:, 2].max():.1f}")
     allp = np.vstack([pa, oa])
-    print(f"  칸별 |평균|과 궤적 차이의 상관 (15쌍): {np.corrcoef(allp[:, 0], allp[:, 2])[0, 1]:+.2f}")
+    print(f"  칸별 |평균|과 궤적 차이의 상관 ({len(allp)}쌍): {np.corrcoef(allp[:, 0], allp[:, 2])[0, 1]:+.2f}")
     keys = ("added_sink_cm", "final_depth_cm", "spindle_z_m", "throttle", "lateral_m", "speed_mps")
     for name, rows in (("뒤 차 (정답 A)", [T[g][2] for g in gs]), ("뒤 차 (두 프로세스)", [R[g][2] for g in gs])):
         print(f"  {name:20s}" + "  ".join(f"{k.split('_')[0]} {min(r[k] for r in rows) * (100 if k in ('spindle_z_m', 'lateral_m') else 1):.3f} ~ {max(r[k] for r in rows) * (100 if k in ('spindle_z_m', 'lateral_m') else 1):.3f}" for k in keys))
+    for name, logs in (("뒤 차 (정답 A)", [T[g][0] for g in gs]), ("뒤 차 (두 프로세스)", [R[g][0] for g in gs])):
+        xm = [100 * float(lg[:, 1].mean()) for lg in logs]                        # 평균 옆 위치 (앞 차 길 기준, cm)
+        xe = [100 * float(lg[lg[:, 2] > P.WINDOW[1] - 2.0, 1].mean()) for lg in logs]   # 구간 끝 2 m의 옆 위치
+        st = [float(np.sqrt(np.mean(lg[:, 10] ** 2))) for lg in logs]             # 조향 입력 RMS
+        rl = [float(np.std(lg[:, 5])) for lg in logs]
+        print(f"  {name:20s}옆 위치 평균 {min(xm):.1f} ~ {max(xm):.1f} cm  구간 끝 {min(xe):.1f} ~ {max(xe):.1f} cm  조향 RMS {min(st):.4f} ~ {max(st):.4f}  옆기울기 {min(rl):.3f} ~ {max(rl):.3f} deg")
 
 
 def spread(a, me, env):
-    for kphi in a.kphi:
+    for kphi, off in [(k, x) for k in a.kphi for x in a.rear_x]:
         with tempfile.TemporaryDirectory(prefix="two_chrono_") as tmp:
             dirn = Path(tmp)
             for g in a.spread:
@@ -317,7 +341,7 @@ def spread(a, me, env):
                 s.close()
                 server = subprocess.Popen([sys.executable, "-m", "sim.map_server_node", "--tcp-port", str(port)], cwd=ROOT,
                                           stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-                common = ["--kphi", str(kphi), "--hz", str(a.hz), "--delay", str(a.delay), "--tcp", f"127.0.0.1:{port}", "--gap", str(g)]
+                common = ["--kphi", str(kphi), "--hz", str(a.hz), "--delay", str(a.delay), "--tcp", f"127.0.0.1:{port}", "--gap", str(g), "--rear-x", str(off)]
                 try:
                     front = subprocess.Popen(me + ["--role", "front", "--out", str(dirn / f"front_{g}.npz")] + common, env=env, cwd=ROOT)
                     time.sleep(1.0)
@@ -328,8 +352,139 @@ def spread(a, me, env):
                     server.terminate()
                     server.wait(timeout=10)
                 subprocess.run(me + ["--role", "truth", "--out", str(dirn / f"truth_{g}.npz"), *common], env=env, cwd=ROOT, check=True, timeout=1800)
-                print(f"[kphi {kphi:g} 간격 {g} 끝]", flush=True)
-            subprocess.run(me + ["--role", "spread_compare", "--dir", str(dirn), "--kphi", str(kphi), "--spread", *map(str, a.spread)], env=env, cwd=ROOT, check=True, timeout=900)
+                print(f"[kphi {kphi:g} 옆 {off:g} 간격 {g} 끝]", flush=True)
+            subprocess.run(me + ["--role", "spread_compare", "--dir", str(dirn), "--kphi", str(kphi), "--rear-x", str(off), "--spread", *map(str, a.spread)], env=env, cwd=ROOT, check=True, timeout=900)
+
+
+def robot_series(run):
+    import pandas as pd
+    ts = pd.read_parquet(run / "timeseries.parquet")
+    pos = np.column_stack([ts[f"base_pos_{i}"] for i in range(3)]) if "base_pos_0" in ts else np.stack(ts["base_pos"].to_numpy())
+    quat = np.column_stack([ts[f"base_quat_wxyz_{i}"] for i in range(4)]) if "base_quat_wxyz_0" in ts else np.stack(ts["base_quat_wxyz"].to_numpy())
+    return ts["t"].to_numpy(), pos, quat
+
+
+def robot_row(name, run, t_cmd):
+    t, pos, q = robot_series(run)
+    sel = t > t_cmd
+    w, x, y, z = q[sel].T
+    roll, pitch = np.degrees(np.arctan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))), np.degrees(np.arcsin(np.clip(2 * (w * y - z * x), -1, 1)))
+    su = json.loads((run / "summary.json").read_text())["mop"]
+    print(f"{name:22s}{pos[-1, 0]:8.2f}{pos[-1, 1]:8.2f}{pos[sel, 2].min():8.3f}{np.abs(roll).max():8.1f}{np.abs(pitch).max():8.1f}{su.get('map_received_changes', 0):7d}")
+
+
+def runner_once(path):
+    """맵 서버 없이 시뮬레이터 한 번 (lockstep). 반환: 실행 폴더."""
+    runs = ROOT / "runs"
+    before = set(os.listdir(runs))
+    subprocess.run([sys.executable, "-m", "sim.runner", str(path)], cwd=ROOT, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600)
+    new = sorted(set(os.listdir(runs)) - before)
+    assert len(new) == 1, new
+    return runs / new[0]
+
+
+def robot_report(a, run, dirn, t_cmd, me, env):
+    """받은 자국과 로봇 위치, 다시 돌리기(비트 비교), 정답 지도(한 SCM)와 평평한 땅 위의 로봇."""
+    import shutil
+    import yaml
+    from sim.map_client import enc, msg_cells
+    replay = yaml.safe_load((run / "scenario_replay.yaml").read_text())
+    wr = [e for e in replay["events"] if e["action"] == "map_write"]
+    print(f"받은 변경 {len(wr)}개: " + ", ".join(f"{w} {sum(e['msg']['writer'] == w for e in wr)}개" for w in sorted({e['msg']['writer'] for e in wr})))
+    final = np.load(dirn / "rear.npz")["final_map"]
+    nrow, ncol = final.shape
+    res = replay["terrain"]["resolution"]
+    half = (nrow - 1) * res / 2                                     # terrain.size는 반폭이다
+    last, low = 0.0, 0.0
+    for e in wr:
+        rows, _, vals = msg_cells(e["msg"])
+        s = np.abs(rows * res - half) < 0.6
+        if s.any():
+            last, low = max(last, e["t"]), min(low, float(np.nanmin(vals[s])))
+    t, pos, _ = robot_series(run)
+    print(f"로봇 길(|y| < 0.6 m)의 마지막 변경 t = {last:.1f} s, 그때 로봇 x = {pos[np.searchsorted(t, last), 0]:.2f} m (출발 t = {t_cmd:g} s), 가장 깊은 값 {100 * low:.1f} cm")
+
+    aux = []
+    rep = runner_once(run / "scenario_replay.yaml")
+    aux.append(rep)
+    t2, pos2, _ = robot_series(rep)
+    same = len(t) == len(t2) and np.array_equal(pos, pos2)
+    print(f"다시 돌리기 (차 없이): 로봇 위치 비트 단위로 {'같다' if same else '다르다'}" + ("" if same else f" (최대 차이 {np.abs(pos[:min(len(t), len(t2))] - pos2[:min(len(t), len(t2))]).max():.4f} m)"))
+
+    subprocess.run(me + ["--role", "truth", "--out", str(dirn / "truth.npz"), "--kphi", str(a.kphi[0])], env=env, cwd=ROOT, check=True, timeout=600)
+    _, th = load(dirn / "truth.npz")
+    cy = float(np.load(dirn / "truth.npz")["cy"])
+    i0, j0 = int(round((a.lane_or3 + (ncol - 1) * res / 2) / res)), int(round((cy + (nrow - 1) * res / 2) / res))
+    cells = [(j + j0, i + i0, h) for (i, j), h in th.items() if 0 <= j + j0 < nrow and 0 <= i + i0 < ncol and abs(h) > 1e-9]
+    rows, cols, vals = (np.array(v) for v in zip(*cells))
+    vals = np.clip(vals, *replay["terrain"]["z_range"])
+    truth_map = np.zeros((nrow, ncol))
+    truth_map[rows, cols] = vals
+    mask = (np.abs(final) > 0.002) | (np.abs(truth_map) > 0.002)
+    mask[:, int(round((5.0 + half) / res)):] = False                # 요철 (바탕) 영역은 뺀다
+    diff = 100 * (final - truth_map)[mask]
+    print(f"끝난 지도 - 정답 (지도 안 자국 칸 {diff.size}개): 평균 {diff.mean():+.3f}, |평균| {np.abs(diff).mean():.3f}, 최대 {np.abs(diff).max():.2f} cm")
+    msg = {"type": "cells", "op": "dig", "writer": "truth", "t": t_cmd / 2, "n_cells": int(rows.size),
+           "rows": __import__("base64").b64encode(rows.astype("<i4").tobytes()).decode(),
+           "cols": __import__("base64").b64encode(cols.astype("<i4").tobytes()).decode(), "values": enc(vals)}
+    tr = dict(replay)
+    tr["name"] = replay["name"] + "_truth"
+    tr["events"] = [e for e in replay["events"] if e["action"] != "map_write"] + [{"t": t_cmd / 2, "action": "map_write", "source": "map", "msg": msg}]
+    tr["events"].sort(key=lambda e: e["t"])
+    fl = dict(replay)
+    fl["name"] = replay["name"] + "_flat"
+    fl["events"] = [e for e in replay["events"] if e["action"] != "map_write"]
+    (dirn / "truth.yaml").write_text(yaml.safe_dump(tr))
+    (dirn / "flat.yaml").write_text(yaml.safe_dump(fl))
+    run_t, run_f = runner_once(dirn / "truth.yaml"), runner_once(dirn / "flat.yaml")
+    aux += [run_t, run_f]
+    print(f"\n로봇 (출발 뒤)        {'끝 x':>6s}{'끝 y':>6s}{'몸통최저':>6s}{'옆기움':>6s}{'앞뒤기움':>5s}{'변경':>5s}")
+    robot_row("두 프로세스 지도", run, t_cmd)
+    robot_row("정답 지도 (한 SCM)", run_t, t_cmd)
+    robot_row("자국 없음", run_f, t_cmd)
+    for d in aux:
+        shutil.rmtree(d)
+
+
+def run_robot(a, env, me):
+    """시뮬레이터(맵 서버 포함)를 띄우고, 지도가 생기면 차 두 프로세스를 붙인다."""
+    from sim.map_client import RemoteMap
+    import yaml
+    t_cmd = next(e["t"] for e in yaml.safe_load(Path(a.robot).read_text())["events"] if e["action"] == "set_command")
+    runs = ROOT / "runs"
+    before = set(os.listdir(runs))
+    with tempfile.TemporaryDirectory(prefix="two_chrono_") as tmp:
+        dirn = Path(tmp)
+        runner = subprocess.Popen([sys.executable, "-m", "sim.runner", a.robot, "--map-server", "--realtime"] + (["--godot"] if a.godot else []),
+                                  cwd=ROOT, stdout=open(dirn / "runner.log", "w"), stderr=subprocess.STDOUT)
+        try:
+            ob = RemoteMap(None, name="probe_robot", wait_s=120.0)
+            port = ob.info["tcp_port"]
+            ob.close()
+            common = ["--kphi", str(a.kphi[0]), "--hz", str(a.hz), "--delay", str(a.delay), "--tcp", f"127.0.0.1:{port}", "--lane", str(a.lane or 3.0)]
+            front = subprocess.Popen(me + ["--role", "front", "--out", str(dirn / "front.npz")] + common, env=env, cwd=ROOT)
+            time.sleep(1.0)
+            rear = subprocess.Popen(me + ["--role", "rear", "--out", str(dirn / "rear.npz")] + common, env=env, cwd=ROOT)
+            for name, p in (("앞 차", front), ("뒤 차", rear)):
+                if p.wait(timeout=600) != 0:
+                    raise SystemExit(f"{name} 프로세스가 실패했다")
+            for name in ("front", "rear"):
+                d = np.load(dirn / f"{name}.npz")
+                au = json.loads(str(d["audit"]))
+                print(f"{name}: 불일치 {au.get('hash_mismatch', au)}, 보냄 {au.get('sent')}, 빠르기 {float(d['sim']) / float(d['wall']):.2f}배, 걸린 시간 {float(d['wall']):.1f} s", flush=True)
+            if runner.wait(timeout=300) != 0:
+                print((dirn / "runner.log").read_text()[-2000:])
+                raise SystemExit("시뮬레이터가 실패했다")
+        finally:
+            if runner.poll() is None:
+                runner.terminate()
+                runner.wait(timeout=30)
+        new = sorted(set(os.listdir(runs)) - before)
+        assert len(new) == 1, new
+        run = runs / new[0]
+        a.lane_or3 = a.lane or 3.0
+        robot_report(a, run, dirn, t_cmd, me, env)
+    print(f"실행 폴더: {run.relative_to(ROOT)}")
 
 
 def orchestrate(a):
@@ -342,6 +497,8 @@ def orchestrate(a):
     env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "AMENT_PREFIX_PATH", "LD_LIBRARY_PATH")}
     if a.spread:
         return spread(a, me, env)
+    if a.robot:
+        return run_robot(a, env, me)
     for kphi in a.kphi:
         with tempfile.TemporaryDirectory(prefix="two_chrono_") as tmp:
             dirn = Path(tmp)
@@ -377,6 +534,10 @@ def main():
     ap.add_argument("--role", choices=("front", "rear", "truth", "compare", "spread_compare"))
     ap.add_argument("--spread", type=float, nargs="*", help="뒤 차 출발 간격들 (m)")
     ap.add_argument("--gap", type=float, default=12.0)
+    ap.add_argument("--rear-x", type=float, nargs="+", default=[0.0], help="뒤 차 길을 앞 차 길에서 옆으로 옮기는 거리 (m). --spread는 여러 값")
+    ap.add_argument("--robot", help="이 시나리오의 시뮬레이터(로봇)에 지도를 붙인다")
+    ap.add_argument("--godot", action="store_true", help="--robot: 화면으로 보기")
+    ap.add_argument("--lane", type=float, help="차가 지나는 지도 x (m). --robot이면 기본 3")
     ap.add_argument("--tcp")
     ap.add_argument("--out")
     ap.add_argument("--dir")

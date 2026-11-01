@@ -53,6 +53,7 @@ RUT_MIN = 0.005                                    # 이보다 판 칸만 단단
 CURVE_A, CURVE_L = 1.0, 16.0                       # S자 길 (m)
 ROUTE = "straight"
 REAR_HOLD = 0.0                                    # 뒤 차를 세워 두는 시간 (s)
+REAR_X = 0.0                                       # 뒤 차의 길을 앞 차 길에서 옆으로 옮기는 거리 (m, 자국 벽 시험)
 SOIL = dict(kc=0.0, n=1.1, cohesion=0.0, friction_deg=30.0, janosi=0.01, elastic_k=4e7, damping_r=3e4)
 
 
@@ -90,11 +91,13 @@ def make_terrain(s, kphi):
 
 
 class Car:
-    def __init__(self, s, terrain, y0):
+    def __init__(self, s, terrain, y0, x0=0.0, heading=math.pi / 2, length=None):
+        """기본: x0에서 y 방향으로 Y_END까지. heading과 length를 주면 그 방향의 직선 length m (교차 시험)."""
+        self.start, self.dir, self.length = (x0, y0), (math.cos(heading), math.sin(heading)), length
         car = veh.HMMWV_Full(s)
         car.SetContactMethod(chrono.ChContactMethod_SMC)
         car.SetChassisFixed(False)
-        car.SetInitPosition(chrono.ChCoordsysd(chrono.ChVector3d(0, y0, 0.6), chrono.QuatFromAngleZ(math.pi / 2)))
+        car.SetInitPosition(chrono.ChCoordsysd(chrono.ChVector3d(x0, y0, 0.6), chrono.QuatFromAngleZ(heading)))
         car.SetEngineType(veh.EngineModelType_SIMPLE_MAP)
         car.SetTransmissionType(veh.TransmissionModelType_AUTOMATIC_SIMPLE_MAP)
         car.SetDriveType(veh.DrivelineTypeWV_AWD)
@@ -108,7 +111,8 @@ class Car:
                 pts.push_back(chrono.ChVector3d(path_x(float(y)), float(y), 0.5))
             self.path = chrono.ChBezierCurve(pts)
         else:
-            self.path = veh.StraightLinePath(chrono.ChVector3d(0, y0, 0.5), chrono.ChVector3d(0, Y_END + 8.0, 0.5), 1)
+            far = (Y_END + 8.0 - y0) if length is None else length + 8.0
+            self.path = veh.StraightLinePath(chrono.ChVector3d(x0, y0, 0.5), chrono.ChVector3d(x0 + far * self.dir[0], y0 + far * self.dir[1], 0.5), 1)
         self.driver = veh.ChPathFollowerDriver(car.GetVehicle(), self.path, "d", SPEED)
         self.driver.GetSteeringController().SetLookAheadDistance(5.0)
         self.driver.GetSteeringController().SetGains(0.8, 0, 0)
@@ -129,7 +133,8 @@ class Car:
 
     def step_in(self, t, terrain):
         v = self.car.GetVehicle()
-        if v.GetPos().y > Y_END:
+        p = v.GetPos()
+        if (p.y > Y_END) if self.length is None else ((p.x - self.start[0]) * self.dir[0] + (p.y - self.start[1]) * self.dir[1] > self.length):
             return self.brake(t, terrain)
         self.driver.SetDesiredSpeed(speed_at(v.GetPos().y))
         di = self.driver.GetInputs()
@@ -141,13 +146,13 @@ class Car:
 
 
 def log_row(car, t, x, y, z, di):
-    """구간 기록 한 줄 (뒤 차): 시각, 길 기준 옆 위치, y, 차체 높이, 앞뒤 기울기, 옆 기울기, 바퀴 중심 높이 평균, 속도, 스로틀, 브레이크."""
+    """구간 기록 한 줄 (뒤 차): 시각, 길 기준 옆 위치, y, 차체 높이, 앞뒤 기울기, 옆 기울기, 바퀴 중심 높이 평균, 속도, 스로틀, 브레이크, 조향."""
     v = car.car.GetVehicle()
     rot = chrono.ChMatrix33d(v.GetRot())
     # 차체 축: x = 앞. 앞뒤 기울기 = 앞 축의 z 성분, 옆 기울기 = 옆 축의 z 성분
     fwd, left = rot.GetAxisX(), rot.GetAxisY()
     wz = [v.GetSpindlePos(a, side).z for a in (0, 1) for side in (veh.LEFT, veh.RIGHT)]
-    return (t, x - path_x(y), y, z, math.degrees(math.asin(fwd.z)), math.degrees(math.asin(left.z)), np.mean(wz), v.GetSpeed(), di.m_throttle, di.m_braking)
+    return (t, x - path_x(y), y, z, math.degrees(math.asin(fwd.z)), math.degrees(math.asin(left.z)), np.mean(wz), v.GetSpeed(), di.m_throttle, di.m_braking, di.m_steering)
 
 
 def heights(terrain):
@@ -274,7 +279,7 @@ def run(kphi, front, rear, levels=None, until=None, stiff=None, ghost=None, stri
     bodies = ghost_bodies(s, terrain, ghost.shape[1]) if ghost is not None else None
     cars = []
     fc = Car(s, terrain, Y_FRONT) if front else None
-    rc = Car(s, terrain, Y_FRONT - GAP) if rear else None
+    rc = Car(s, terrain, Y_FRONT - GAP, REAR_X) if rear else None
     if ghost is not None and live is None:                      # 유령이 다 누를 때까지 뒤 차는 출발점에 세워 둔다
         w0 = time.perf_counter()
         ghost_press(s, terrain, bodies, ghost, stride, rc, with_vel)
