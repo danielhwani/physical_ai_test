@@ -6,7 +6,7 @@
     python conformance/probe_two_chrono.py --spread 11.8 11.9 12.0 12.1 12.2 --rear-x 0.1 0.2 0.3   자국 벽 시험: 뒤 차를 앞 차 길에서 옆으로 옮겨서
     python conformance/probe_two_chrono.py --spread 11.8 11.9 12.0 12.1 12.2 --delays 1 2 3 4 5     궤적이 얼마나 늦어도 되는가 (정답은 한 번만 돌린다)
     python conformance/probe_two_chrono.py --spread 11.8 11.9 12.0 12.1 12.2 --delay 1 --cases base drop0.5 out0.5 out2 late4   뒤 차가 기다리지 않는다 (같은 배속 --pace)
-        base 그대로, dropP 궤적 프레임을 확률 P로 뺀다, outD 앞 차 t = 6 s (--outage-at)부터 D초 끊긴다 (구멍 앞, 안, 뒤로 나눠 출력), lateW 궤적이 실제 시간 W초 늦게 도착한다
+        base 그대로, dropP 궤적 프레임을 확률 P로 뺀다, outD 앞 차 t = 6 s (--outage-at)부터 D초 끊긴다 (구멍 앞, 안, 뒤로 나눠 출력), lateW 궤적이 실제 시간 W초 늦게 도착한다, stallD 궤적이 D초 끊겼다가 몰려서 온다 (밀린 궤적은 --catchup 배로 재생)
     python conformance/probe_two_chrono.py --robot scenarios/two_cars_crossing.yaml [--godot]   두 차가 낸 자국을 시뮬레이터의 로봇이 넘는다 (차는 지도 x = --lane m를 지난다)
 
   앞 차 프로세스: 자기 SCM에서 달리며 바뀐 노드를 dig로, 네 바퀴 궤적을 traj로 맵 서버(TCP)에 보낸다.
@@ -115,7 +115,7 @@ def role_front(a):
     wall = time.perf_counter()
     tire = (P.TIRE_R, P.TIRE_W)
     rng = np.random.default_rng(1)
-    ys = []
+    ys, held = [], []
     while car.pos()[1] <= P.Y_END:
         ter.Synchronize(t)
         car.step_in(t, ter)
@@ -125,7 +125,13 @@ def role_front(a):
         ys.append((t, car.pos()[1]))
         out = a.outage is not None and a.outage[0] <= t < a.outage[0] + a.outage[1]
         if k % every == 0 and not out and (k < 2 * every or rng.random() >= a.drop_traj):   # 처음 두 프레임은 시작 맞추기에 쓴다
-            m.send_traj("front", k, every, [wheel_frame(P, car)], tire)
+            if a.stall is not None and a.stall[0] <= t < a.stall[0] + a.stall[1]:    # 사라지지 않고 늦는다 (끊김이 풀리면 몰아서 보낸다)
+                held.append((k, wheel_frame(P, car)))
+            else:
+                for hk, hf in held:
+                    m.send_traj("front", hk, every, [hf], tire)
+                held.clear()
+                m.send_traj("front", k, every, [wheel_frame(P, car)], tire)
         if (k + 1) % WRITE_EVERY == 0:
             r, c, h = to_cells(*changed_nodes(ter, sent))
             if r.size:
@@ -162,7 +168,9 @@ def hide_ghosts(P, bodies):
 
 
 def role_rear_free(a):
-    """기다리지 않는 뒤 차: 항상 delay 전 자세를 재생한다 (지터 버퍼). 그때 자세가 없으면 고스트를 쉬게 한다 (받은 프레임 사이가 MAX_FILL 이하면 메운다)."""
+    """기다리지 않는 뒤 차: delay 전 자세를 재생한다 (지터 버퍼). 그때 자세가 없으면 고스트를 쉬게 한다 (받은 프레임 사이가 MAX_FILL 이하면 메운다).
+    늦게 온 궤적은 버리지 않는다: 재생 위치 cur가 목표 (k - delay)보다 밀렸으면 R배로 따라잡고, 받은 궤적 끝에 가까우면 (2프레임 미만) 1배로 간다. 프레임이 실제로 빠진 구멍은 건너뛴다.
+    늦지 않으면 cur는 항상 목표와 같다."""
     import bisect
     import probe_scm_two_hmmwv as P
     from sim.map_client import dec
@@ -178,6 +186,8 @@ def role_rear_free(a):
     sent, log, t, k = {}, [], 0.0, 0
     hid, missed, late_frames, lag = 0, 0, 0, 0.0
     max_fill = None
+    R = int(a.catchup)
+    cur, behind, fast = 0, 0, 0
     m.send_traj("rear", 0, 1, np.zeros((0, 4, 13)), (P.TIRE_R, P.TIRE_W))
 
     def receive(idx):
@@ -225,6 +235,22 @@ def role_rear_free(a):
             if low.any():
                 m.write_cells("dig", "rear", r[low], c[low], h[low], t=t)
 
+    def advance(c, target):
+        """다음 재생 위치. 반환: (위치, 몇 배로 갔나)."""
+        if c >= target:
+            return target, 1
+        last = keys[-1] * every
+        if c >= last:                                          # 앞에 받은 궤적이 없다
+            return c, 0
+        i = bisect.bisect_right(keys, c // every)
+        if i == 0:
+            return min(target, keys[0] * every), 0
+        lo, hi = keys[i - 1], keys[i]
+        if hi - lo > max_fill:                                 # 뒤 프레임이 이미 왔으니 (순서대로 온다) 이 구멍은 안 온다
+            return min(target, hi * every), 0
+        rate = R if last - c >= 2 * every else 1
+        return min(target, last, c + rate), rate
+
     t0 = time.monotonic()
     while len(keys) < 2:                                       # 시작 맞추기만 기다린다 (첫 두 프레임)
         receive(0)
@@ -233,8 +259,12 @@ def role_rear_free(a):
             raise RuntimeError("앞 차 궤적이 오지 않는다")
     wall = time.perf_counter()
     while True:
-        idx = max(0, k - delay)
-        receive(idx)
+        target = max(0, k - delay)
+        receive(cur)
+        cur, rate = advance(cur, target)
+        behind = max(behind, target - cur)
+        fast += rate > 1 and target - cur > 0
+        idx = cur
         if end_k is None or idx < end_k - every:
             fr = pose(idx)
             if fr is None:
@@ -264,7 +294,7 @@ def role_rear_free(a):
     au = m.audit(wait_s=120.0)
     final = m.local.compose(0, m.local.nrow, 0, m.local.ncol)
     save(a.out, heights={(n.x, n.y): v for n, v in ter.GetModifiedNodes(True)}, wall=wall, sim=t, audit=json.dumps(au), log=np.array(log), final_map=final,
-         waited=0.0, i0=i0, j0=j0, frames=np.array([frames[f] for f in keys]), hid=hid, missed=missed, late_frames=late_frames, lag=lag, steps=k)
+         waited=0.0, i0=i0, j0=j0, frames=np.array([frames[f] for f in keys]), hid=hid, missed=missed, late_frames=late_frames, lag=lag, steps=k, behind=behind * P.STEP, fast=fast)
     m.close()
 
 
@@ -507,7 +537,7 @@ def spread_compare(a, dirn, kphi):
         R[g] = (rd["log"], rh, P.window_stats({"log": rd["log"], "final": rh, "cy": cy}, fh), mp)
         sha = __import__("hashlib").sha1(rd["log"].tobytes()).hexdigest()[:10]
         print(f"  [간격 {g}] 뒤 차 기록 {sha}, 숨긴 고스트 바퀴 {int(rd['hid'])} 스텝 x 바퀴 ({100 * int(rd['hid']) / max(1, 4 * len(rd['frames']) * 20):.0f} %)"
-              + (f", 고스트 쉼 {int(rd['missed'])}/{int(rd['steps'])} 스텝, 재생 뒤 도착한 프레임 {int(rd['late_frames'])}, 배속 늦음 최대 {1000 * float(rd['lag']):.0f} ms" if "missed" in rd else ""))
+              + (f", 고스트 쉼 {int(rd['missed'])}/{int(rd['steps'])} 스텝, 재생 뒤 도착한 프레임 {int(rd['late_frames'])}, 배속 늦음 최대 {1000 * float(rd['lag']):.0f} ms, 재생 밀림 최대 {float(rd['behind']):.2f} s, 빨리 재생 {int(rd['fast'])} 스텝" if "missed" in rd else ""))
         au = json.loads(str(rd["audit"]))
         if au.get("hash_mismatch") != 0:
             print(f"간격 {g}: 뒤 차 해시 불일치 {au}")
@@ -552,11 +582,13 @@ def spread(a, me, env):
     def case_flags(c):
         if c == "wait":
             return []
-        out = ["--pace", str(a.pace or 0.4)]
+        out = ["--pace", str(a.pace or 0.4), "--catchup", str(a.catchup)]
         if c.startswith("drop"):
             out += ["--drop-traj", c[4:]]
         elif c.startswith("out"):
             out += ["--outage", str(a.outage_at), c[3:]]
+        elif c.startswith("stall"):
+            out += ["--stall", str(a.outage_at), c[5:]]
         elif c.startswith("late"):
             out += ["--net-delay", c[4:]]
         else:
@@ -588,7 +620,7 @@ def spread(a, me, env):
                     subprocess.run(me + ["--role", "truth", "--out", str(cached), *common], env=env, cwd=ROOT, check=True, timeout=1800)
                 shutil.copy(cached, dirn / f"truth_{g}.npz")
                 print(f"[kphi {kphi:g} 옆 {off:g} 지연 {delay:g} 간격 {g} 끝]", flush=True)
-            subprocess.run(me + ["--role", "spread_compare", "--dir", str(dirn), "--kphi", str(kphi), "--rear-x", str(off), "--delay", str(delay), "--spread", *map(str, a.spread), "--case", case if case != "wait" else ""] + (["--outage", str(a.outage_at), case[3:]] if case.startswith("out") else []), env=env, cwd=ROOT, check=True, timeout=900)
+            subprocess.run(me + ["--role", "spread_compare", "--dir", str(dirn), "--kphi", str(kphi), "--rear-x", str(off), "--delay", str(delay), "--spread", *map(str, a.spread), "--case", case if case != "wait" else ""] + (["--outage", str(a.outage_at), case[3:]] if case.startswith("out") else ["--outage", str(a.outage_at), case[5:]] if case.startswith("stall") else []), env=env, cwd=ROOT, check=True, timeout=900)
 
 
 def robot_series(run):
@@ -772,6 +804,8 @@ def main():
     ap.add_argument("--pace", type=float, help="두 프로세스의 배속 (실제 시간 대비). 있으면 뒤 차가 기다리지 않는다")
     ap.add_argument("--drop-traj", type=float, default=0.0)
     ap.add_argument("--outage", type=float, nargs=2)
+    ap.add_argument("--stall", type=float, nargs=2, help="이 구간의 궤적을 보내지 않고 모았다가 끝나면 몰아서 보낸다 (시작, 길이 s)")
+    ap.add_argument("--catchup", type=int, default=4, help="밀린 궤적을 몇 배로 재생하나")
     ap.add_argument("--outage-at", type=float, default=6.0, help="--cases outN에서 끊김이 시작되는 시뮬레이션 시각 (s)")
     ap.add_argument("--net-delay", type=float, default=0.0)
     ap.add_argument("--role", choices=("front", "rear", "truth", "compare", "spread_compare"))
