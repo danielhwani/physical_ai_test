@@ -7,6 +7,7 @@
     python conformance/probe_two_chrono.py --spread 11.8 11.9 12.0 12.1 12.2 --delays 1 2 3 4 5     궤적이 얼마나 늦어도 되는가 (정답은 한 번만 돌린다)
     python conformance/probe_two_chrono.py --spread 11.8 11.9 12.0 12.1 12.2 --delay 1 --cases base drop0.5 out0.5 out2 late4   뒤 차가 기다리지 않는다 (같은 배속 --pace)
         base 그대로, dropP 궤적 프레임을 확률 P로 뺀다, outD 앞 차 t = 6 s (--outage-at)부터 D초 끊긴다 (구멍 앞, 안, 뒤로 나눠 출력), lateW 궤적이 실제 시간 W초 늦게 도착한다, stallD 궤적이 D초 끊겼다가 몰려서 온다 (밀린 궤적은 --catchup 배로 재생)
+    python conformance/probe_two_chrono.py --spread 11.8 11.9 12.0 12.1 12.2 --delay 1 --cases base --fast --pace 1   실시간: 앞 차와 뒤 차의 SCM 활성 영역을 줄이고 1배속으로 (--truth-fast면 정답도 그 영역으로)
     python conformance/probe_two_chrono.py --robot scenarios/two_cars_crossing.yaml [--godot]   두 차가 낸 자국을 시뮬레이터의 로봇이 넘는다 (차는 지도 x = --lane m를 지난다)
 
   앞 차 프로세스: 자기 SCM에서 달리며 바뀐 노드를 dig로, 네 바퀴 궤적을 traj로 맵 서버(TCP)에 보낸다.
@@ -42,6 +43,12 @@ def setup(P):
     """앞 차가 멀리 선다 (뒤 차가 구간을 다 지나도 부딪히지 않게: 기본 길이면 끝에서 중심 거리 4.1 m)."""
     P.Y_END, P.SCM_Y = 26.0, (-30.0, 36.0)
     return P
+
+
+def apply_fast(P, a, threads=1):
+    """--fast: 차는 바퀴마다, 고스트도 작은 SCM 활성 영역 (레이 수를 줄인다). 접촉을 다 덮으면 영역 크기는 결과를 바꾸지 않는다. threads: 이 프로세스의 Chrono 스레드 수."""
+    if a.fast:
+        P.WHEEL_DOMAIN, P.GHOST_DOMAIN, P.THREADS = (1.1, 0.5, 1.1), (1.1, 0.4, 1.1), threads
 
 
 def grid_shape(P):
@@ -100,6 +107,7 @@ def save(path, **kw):
 def role_front(a):
     import probe_scm_two_hmmwv as P
     setup(P)
+    apply_fast(P, a)
     m, to_cells, i0, j0 = client(P, "front", a)
     s = P.make_system()
     ter, cy = P.make_terrain(s, a.kphi)
@@ -175,6 +183,7 @@ def role_rear_free(a):
     import probe_scm_two_hmmwv as P
     from sim.map_client import dec
     setup(P)
+    apply_fast(P, a, a.threads)
     P.GAP = a.gap
     m, to_cells, i0, j0 = client(P, "rear", a)
     s = P.make_system()
@@ -400,6 +409,9 @@ def role_rear(a):
 def role_truth(a):
     import probe_scm_two_hmmwv as P
     setup(P)
+    if a.truth_fast:                                           # 정답도 작은 활성 영역으로 (아주 작은 교란에 정답 범위가 얼마나 넓어지나)
+        a.fast = True
+        apply_fast(P, a)
     P.GAP = a.gap
     P.REAR_X = a.rear_x[0]
     ca = P.run(a.kphi, True, True)
@@ -582,7 +594,7 @@ def spread(a, me, env):
     def case_flags(c):
         if c == "wait":
             return []
-        out = ["--pace", str(a.pace or 0.4), "--catchup", str(a.catchup)]
+        out = ["--pace", str(a.pace or 0.4), "--catchup", str(a.catchup), "--threads", str(a.threads)] + (["--fast"] if a.fast else []) + (["--truth-fast"] if a.truth_fast else [])
         if c.startswith("drop"):
             out += ["--drop-traj", c[4:]]
         elif c.startswith("out"):
@@ -805,6 +817,9 @@ def main():
     ap.add_argument("--drop-traj", type=float, default=0.0)
     ap.add_argument("--outage", type=float, nargs=2)
     ap.add_argument("--stall", type=float, nargs=2, help="이 구간의 궤적을 보내지 않고 모았다가 끝나면 몰아서 보낸다 (시작, 길이 s)")
+    ap.add_argument("--fast", action="store_true", help="앞 차와 뒤 차의 SCM 활성 영역을 줄인다 (정답은 그대로)")
+    ap.add_argument("--truth-fast", action="store_true", help="정답도 --fast의 활성 영역으로 돌린다")
+    ap.add_argument("--threads", type=int, default=2, help="--fast일 때 뒤 차 Chrono 스레드 수")
     ap.add_argument("--catchup", type=int, default=4, help="밀린 궤적을 몇 배로 재생하나")
     ap.add_argument("--outage-at", type=float, default=6.0, help="--cases outN에서 끊김이 시작되는 시뮬레이션 시각 (s)")
     ap.add_argument("--net-delay", type=float, default=0.0)

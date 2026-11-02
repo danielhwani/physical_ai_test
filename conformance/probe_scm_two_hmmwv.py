@@ -54,6 +54,10 @@ CURVE_A, CURVE_L = 1.0, 16.0                       # S자 길 (m)
 ROUTE = "straight"
 REAR_HOLD = 0.0                                    # 뒤 차를 세워 두는 시간 (s)
 REAR_X = 0.0                                       # 뒤 차의 길을 앞 차 길에서 옆으로 옮기는 거리 (m, 자국 벽 시험)
+CAR_DOMAIN = (5.0, 3.0, 1.0)                       # 차의 SCM 활성 영역 (m)
+WHEEL_DOMAIN = None                                # 주면 차 전체 대신 바퀴마다 이 크기로 (m)
+GHOST_DOMAIN = (1.4, 0.8, 1.4)                     # 유령 바퀴의 SCM 활성 영역 (m)
+THREADS = 1                                        # Chrono 스레드 수
 SOIL = dict(kc=0.0, n=1.1, cohesion=0.0, friction_deg=30.0, janosi=0.01, elastic_k=4e7, damping_r=3e4)
 
 
@@ -77,7 +81,7 @@ def make_system():
     s = chrono.ChSystemSMC()
     s.SetCollisionSystemType(chrono.ChCollisionSystem.Type_BULLET)
     s.SetGravitationalAcceleration(chrono.ChVector3d(0, 0, -9.81))
-    s.SetNumThreads(1)
+    s.SetNumThreads(THREADS)
     return s
 
 
@@ -121,7 +125,12 @@ class Car:
         self.driver.GetSteeringController().SetGains(0.8, 0, 0)
         self.driver.GetSpeedController().SetGains(0.4, 0, 0)
         self.driver.Initialize()
-        terrain.AddActiveDomain(car.GetChassisBody(), chrono.ChVector3d(0, 0, 0), chrono.ChVector3d(5, 3, 1))
+        if WHEEL_DOMAIN is None:
+            terrain.AddActiveDomain(car.GetChassisBody(), chrono.ChVector3d(0, 0, 0), chrono.ChVector3d(*CAR_DOMAIN))
+        else:                                               # 바퀴마다 (레이를 크게 줄인다)
+            for axle in (0, 1):
+                for side in (veh.LEFT, veh.RIGHT):
+                    terrain.AddActiveDomain(car.GetVehicle().GetWheel(axle, side).GetSpindle(), chrono.ChVector3d(0, 0, 0), chrono.ChVector3d(*WHEEL_DOMAIN))
 
     def pos(self):
         p = self.car.GetVehicle().GetPos()
@@ -209,7 +218,7 @@ def ghost_bodies(s, terrain, count):
         b.SetFixed(True)
         b.SetPos(chrono.ChVector3d(0, 0, 50))
         s.Add(b)
-        terrain.AddActiveDomain(b, chrono.ChVector3d(0, 0, 0), chrono.ChVector3d(1.4, 0.8, 1.4))
+        terrain.AddActiveDomain(b, chrono.ChVector3d(0, 0, 0), chrono.ChVector3d(*GHOST_DOMAIN))
         bodies.append(b)
     return bodies
 
