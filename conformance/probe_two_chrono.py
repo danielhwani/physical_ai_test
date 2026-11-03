@@ -8,6 +8,7 @@
     python conformance/probe_two_chrono.py --spread 11.8 11.9 12.0 12.1 12.2 --delay 1 --cases base drop0.5 out0.5 out2 late4   뒤 차가 기다리지 않는다 (같은 배속 --pace)
         base 그대로, dropP 궤적 프레임을 확률 P로 뺀다, outD 앞 차 t = 6 s (--outage-at)부터 D초 끊긴다 (구멍 앞, 안, 뒤로 나눠 출력), lateW 궤적이 실제 시간 W초 늦게 도착한다, stallD 궤적이 D초 끊겼다가 몰려서 온다 (밀린 궤적은 --catchup 배로 재생)
     python conformance/probe_two_chrono.py --spread 11.8 11.9 12.0 12.1 12.2 --delay 1 --cases base --fast --pace 1   실시간: 앞 차와 뒤 차의 SCM 활성 영역을 줄이고 1배속으로 (--truth-fast면 정답도 그 영역으로)
+    python conformance/probe_two_chrono.py --route curve --spread 11.8 11.9 12.0 12.1 12.2 --delay 1 --fast --pace 1 --hz 100 --cases base   곡선 (무른 흙은 100 Hz가 필요하다)
     python conformance/probe_two_chrono.py --robot scenarios/two_cars_crossing.yaml [--godot]   두 차가 낸 자국을 시뮬레이터의 로봇이 넘는다 (차는 지도 x = --lane m를 지난다)
 
   앞 차 프로세스: 자기 SCM에서 달리며 바뀐 노드를 dig로, 네 바퀴 궤적을 traj로 맵 서버(TCP)에 보낸다.
@@ -39,9 +40,15 @@ GUARD = 1.0                                        # 고스트를 숨기는 거�
 WRITE_EVERY = 100                                  # 지도에 쓰는 주기 (물리 스텝, 0.2 s)
 
 
+ROUTE = "straight"
+
+
 def setup(P):
-    """앞 차가 멀리 선다 (뒤 차가 구간을 다 지나도 부딪히지 않게: 기본 길이면 끝에서 중심 거리 4.1 m)."""
+    """앞 차가 멀리 선다 (뒤 차가 구간을 다 지나도 부딪히지 않게: 기본 길이면 끝에서 중심 거리 4.1 m). curve: S자 길 (SCM 폭 8 m)."""
     P.Y_END, P.SCM_Y = 26.0, (-30.0, 36.0)
+    P.ROUTE = ROUTE
+    if ROUTE == "curve":
+        P.SCM_W = 8.0                                          # make_terrain이 곡선에 쓰는 폭과 지도 칸을 맞춘다
     return P
 
 
@@ -617,7 +624,7 @@ def spread(a, me, env):
                 s.close()
                 server = subprocess.Popen([sys.executable, "-m", "sim.map_server_node", "--tcp-port", str(port)], cwd=ROOT,
                                           stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-                common = ["--kphi", str(kphi), "--hz", str(a.hz), "--delay", str(delay), "--tcp", f"127.0.0.1:{port}", "--gap", str(g), "--rear-x", str(off)] + case_flags(case)
+                common = ["--kphi", str(kphi), "--hz", str(a.hz), "--delay", str(delay), "--tcp", f"127.0.0.1:{port}", "--gap", str(g), "--rear-x", str(off), "--route", a.route] + case_flags(case)
                 try:
                     front = subprocess.Popen(me + ["--role", "front", "--out", str(dirn / f"front_{g}.npz")] + common, env=env, cwd=ROOT)
                     time.sleep(1.0)
@@ -627,12 +634,12 @@ def spread(a, me, env):
                 finally:
                     server.terminate()
                     server.wait(timeout=10)
-                cached = Path(cache.name) / f"truth_{kphi:g}_{off:g}_{g}.npz"
+                cached = Path(cache.name) / f"truth_{a.route}_{kphi:g}_{off:g}_{g}{'_fast' if a.truth_fast else ''}.npz"
                 if not cached.exists():
                     subprocess.run(me + ["--role", "truth", "--out", str(cached), *common], env=env, cwd=ROOT, check=True, timeout=1800)
                 shutil.copy(cached, dirn / f"truth_{g}.npz")
                 print(f"[kphi {kphi:g} 옆 {off:g} 지연 {delay:g} 간격 {g} 끝]", flush=True)
-            subprocess.run(me + ["--role", "spread_compare", "--dir", str(dirn), "--kphi", str(kphi), "--rear-x", str(off), "--delay", str(delay), "--spread", *map(str, a.spread), "--case", case if case != "wait" else ""] + (["--outage", str(a.outage_at), case[3:]] if case.startswith("out") else ["--outage", str(a.outage_at), case[5:]] if case.startswith("stall") else []), env=env, cwd=ROOT, check=True, timeout=900)
+            subprocess.run(me + ["--role", "spread_compare", "--dir", str(dirn), "--route", a.route, "--kphi", str(kphi), "--rear-x", str(off), "--delay", str(delay), "--spread", *map(str, a.spread), "--case", case if case != "wait" else ""] + (["--outage", str(a.outage_at), case[3:]] if case.startswith("out") else ["--outage", str(a.outage_at), case[5:]] if case.startswith("stall") else []), env=env, cwd=ROOT, check=True, timeout=900)
 
 
 def robot_series(run):
@@ -817,6 +824,7 @@ def main():
     ap.add_argument("--drop-traj", type=float, default=0.0)
     ap.add_argument("--outage", type=float, nargs=2)
     ap.add_argument("--stall", type=float, nargs=2, help="이 구간의 궤적을 보내지 않고 모았다가 끝나면 몰아서 보낸다 (시작, 길이 s)")
+    ap.add_argument("--route", default="straight", choices=["straight", "curve"], help="길 (curve: S자, 진폭 1 m, 파장 16 m)")
     ap.add_argument("--fast", action="store_true", help="앞 차와 뒤 차의 SCM 활성 영역을 줄인다 (정답은 그대로)")
     ap.add_argument("--truth-fast", action="store_true", help="정답도 --fast의 활성 영역으로 돌린다")
     ap.add_argument("--threads", type=int, default=2, help="--fast일 때 뒤 차 Chrono 스레드 수")
@@ -834,6 +842,8 @@ def main():
     ap.add_argument("--out")
     ap.add_argument("--dir")
     a = ap.parse_args()
+    global ROUTE
+    ROUTE = a.route
     if a.role is None:
         return orchestrate(a)
     a.kphi = a.kphi[0]
