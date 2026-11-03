@@ -556,7 +556,8 @@ def spread_compare(a, dirn, kphi):
         R[g] = (rd["log"], rh, P.window_stats({"log": rd["log"], "final": rh, "cy": cy}, fh), mp)
         sha = __import__("hashlib").sha1(rd["log"].tobytes()).hexdigest()[:10]
         print(f"  [간격 {g}] 뒤 차 기록 {sha}, 숨긴 고스트 바퀴 {int(rd['hid'])} 스텝 x 바퀴 ({100 * int(rd['hid']) / max(1, 4 * len(rd['frames']) * 20):.0f} %)"
-              + (f", 고스트 쉼 {int(rd['missed'])}/{int(rd['steps'])} 스텝, 재생 뒤 도착한 프레임 {int(rd['late_frames'])}, 배속 늦음 최대 {1000 * float(rd['lag']):.0f} ms, 재생 밀림 최대 {float(rd['behind']):.2f} s, 빨리 재생 {int(rd['fast'])} 스텝" if "missed" in rd else ""))
+              + (f", 고스트 쉼 {int(rd['missed'])}/{int(rd['steps'])} 스텝, 재생 뒤 도착한 프레임 {int(rd['late_frames'])}, 배속 늦음 최대 {1000 * float(rd['lag']):.0f} ms, 재생 밀림 최대 {float(rd['behind']):.2f} s, 빨리 재생 {int(rd['fast'])} 스텝" if "missed" in rd else "")
+              + f", 빠르기 앞 차 {float(fd['sim']) / float(fd['wall']):.2f}배, 뒤 차 {float(rd['sim']) / float(rd['wall']):.2f}배")
         au = json.loads(str(rd["audit"]))
         if au.get("hash_mismatch") != 0:
             print(f"간격 {g}: 뒤 차 해시 불일치 {au}")
