@@ -8,7 +8,7 @@
     python conformance/probe_two_chrono.py --spread 11.8 11.9 12.0 12.1 12.2 --delay 1 --cases base drop0.5 out0.5 out2 late4   뒤 차가 기다리지 않는다 (같은 배속 --pace)
         base 그대로, dropP 궤적 프레임을 확률 P로 뺀다, outD 앞 차 t = 6 s (--outage-at)부터 D초 끊긴다 (구멍 앞, 안, 뒤로 나눠 출력), lateW 궤적이 실제 시간 W초 늦게 도착한다, stallD 궤적이 D초 끊겼다가 몰려서 온다 (밀린 궤적은 --catchup 배로 재생)
     python conformance/probe_two_chrono.py --spread 11.8 11.9 12.0 12.1 12.2 --delay 1 --cases base --fast --pace 1   실시간: 앞 차와 뒤 차의 SCM 활성 영역을 줄이고 1배속으로 (--truth-fast면 정답도 그 영역으로)
-    python conformance/probe_two_chrono.py --route curve --spread 11.8 11.9 12.0 12.1 12.2 --delay 1 --fast --pace 1 --hz 100 --cases base   곡선 (무른 흙은 100 Hz가 필요하다)
+    python conformance/probe_two_chrono.py --route curve --spread 11.8 11.9 12.0 12.1 12.2 --delay 1 --fast --pace 1 --hz 100 --cases base   곡선 (무른 흙은 100 Hz가 필요하다. 운용 권장 100 Hz, 기본값은 예전 결과 재현용 25 Hz)
     python conformance/probe_two_chrono.py --robot scenarios/two_cars_crossing.yaml [--godot]   두 차가 낸 자국을 시뮬레이터의 로봇이 넘는다 (차는 지도 x = --lane m를 지난다)
 
   앞 차 프로세스: 자기 SCM에서 달리며 바뀐 노드를 dig로, 네 바퀴 궤적을 traj로 맵 서버(TCP)에 보낸다.
@@ -35,6 +35,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "conformance"))
 THRESH = 0.001                                     # 뒤 차: 지도보다 이만큼 더 낮아진 칸만 보낸다 (m)
 Z_RANGE = (-0.5, 0.5)
+PACE_LOG = 250                                                 # 뒤 차 빠르기 기록 간격 (스텝, 0.5 s)
 MAX_FILL = 1.0                                     # 받은 궤적 프레임 사이를 메우는 최대 시간 (s, 시뮬레이션)
 GUARD = 1.0                                        # 고스트를 숨기는 거리: 자기 차 앞바퀴 앞 (m)
 WRITE_EVERY = 100                                  # 지도에 쓰는 주기 (물리 스텝, 0.2 s)
@@ -203,6 +204,7 @@ def role_rear_free(a):
     hid, missed, late_frames, lag = 0, 0, 0, 0.0
     max_fill = None
     R = int(a.catchup)
+    plog = []
     cur, behind, fast = 0, 0, 0
     m.send_traj("rear", 0, 1, np.zeros((0, 4, 13)), (P.TIRE_R, P.TIRE_W))
 
@@ -303,6 +305,8 @@ def role_rear_free(a):
             write()
         k += 1
         lag = max(lag, pace_wait(wall, t, a.pace))
+        if k % PACE_LOG == 0:                                  # 0.5 s마다: 시뮬레이션 시각, 실제 경과 시간, 뒤 차 y
+            plog.append((t, time.perf_counter() - wall, y))
         if y > P.WINDOW[1] + 3.0:
             break
     write()
@@ -310,7 +314,7 @@ def role_rear_free(a):
     au = m.audit(wait_s=120.0)
     final = m.local.compose(0, m.local.nrow, 0, m.local.ncol)
     save(a.out, heights={(n.x, n.y): v for n, v in ter.GetModifiedNodes(True)}, wall=wall, sim=t, audit=json.dumps(au), log=np.array(log), final_map=final,
-         waited=0.0, i0=i0, j0=j0, frames=np.array([frames[f] for f in keys]), hid=hid, missed=missed, late_frames=late_frames, lag=lag, steps=k, behind=behind * P.STEP, fast=fast)
+         waited=0.0, pace=a.pace, i0=i0, j0=j0, frames=np.array([frames[f] for f in keys]), hid=hid, missed=missed, late_frames=late_frames, lag=lag, steps=k, behind=behind * P.STEP, fast=fast, plog=np.array(plog))
     m.close()
 
 
@@ -484,6 +488,22 @@ def trace_diff(la, lb):
     return 100 * float(np.sqrt(np.mean((xa - xb) ** 2)))
 
 
+def pace_summary(rd, window=(-8.0, 12.0)):
+    """0.5 s 구간별 뒤 차 빠르기 (기다린 시간 포함이라 --pace 1이면 1배 근처). 가장 느린 구간과, 실제 시각이 시뮬레이션보다 늦은 정도.
+    비교 구간 (뒤 차 y가 window 안) 따로: 그 뒤에는 앞 차가 끝나며 마무리 작업 (지도 해시 검사 등)을 한다."""
+    if "plog" not in rd or len(rd["plog"]) < 3:
+        return ""
+    pl = rd["plog"]
+    sp = np.diff(pl[:, 0]) / np.maximum(np.diff(pl[:, 1]), 1e-9)
+    late = pl[:, 1] - pl[:, 0] / max(float(rd["pace"]), 1e-9)
+    inw = (pl[:, 2] >= window[0]) & (pl[:, 2] <= window[1])
+    i = int(np.argmin(sp))
+    j = int(np.argmax(late))
+    lw = late[inw].max() if inw.any() else float("nan")
+    return (f" | 0.5 s 구간 빠르기 최소 {sp[i]:.2f}배 (y {pl[i + 1, 2]:.1f} m), 0.9배 미만 {int((sp < 0.9).sum())}/{len(sp)}, "
+            f"가장 늦음 {1000 * late[j]:.0f} ms (y {pl[j, 2]:.1f} m), 비교 구간 안 가장 늦음 {1000 * lw:.0f} ms")
+
+
 def hole_profile(P, T, R, F, gs, y0, y1, i0, cy, j_lo, j_hi):
     """끊긴 궤적의 영향을 y로 나눠 본다. 바퀴는 차 중심 앞뒤로 있어 구멍 양쪽 2 m까지 영향권으로 둔다."""
     def cells(h_a, h_b, j_a, j_b):
@@ -557,7 +577,7 @@ def spread_compare(a, dirn, kphi):
         sha = __import__("hashlib").sha1(rd["log"].tobytes()).hexdigest()[:10]
         print(f"  [간격 {g}] 뒤 차 기록 {sha}, 숨긴 고스트 바퀴 {int(rd['hid'])} 스텝 x 바퀴 ({100 * int(rd['hid']) / max(1, 4 * len(rd['frames']) * 20):.0f} %)"
               + (f", 고스트 쉼 {int(rd['missed'])}/{int(rd['steps'])} 스텝, 재생 뒤 도착한 프레임 {int(rd['late_frames'])}, 배속 늦음 최대 {1000 * float(rd['lag']):.0f} ms, 재생 밀림 최대 {float(rd['behind']):.2f} s, 빨리 재생 {int(rd['fast'])} 스텝" if "missed" in rd else "")
-              + f", 빠르기 앞 차 {float(fd['sim']) / float(fd['wall']):.2f}배, 뒤 차 {float(rd['sim']) / float(rd['wall']):.2f}배")
+              + f", 빠르기 앞 차 {float(fd['sim']) / float(fd['wall']):.2f}배, 뒤 차 {float(rd['sim']) / float(rd['wall']):.2f}배" + pace_summary(rd))
         au = json.loads(str(rd["audit"]))
         if au.get("hash_mismatch") != 0:
             print(f"간격 {g}: 뒤 차 해시 불일치 {au}")
