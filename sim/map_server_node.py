@@ -19,6 +19,9 @@
         set: 순서가 결과를 바꿈)는 버린다. 버린 것 = 잃은 변경 (MOP map_lost_changes).
   감사: /map/request {"type": "audit"} -> /map/reply에 지금 판, 클라이언트별 마지막 seq, 타일 해시.
   스냅샷: /map/request {"type": "snapshot"} -> /map/reply에 상태 전체와 그때의 n, 클라이언트별 seq (늦게 붙기 6.1, 빈칸 복구).
+  지난 궤적 (늦게 붙기, 4단계): 내보낸 traj 메시지를 따로 들고 있다 (모두 합쳐 TRAJ_KEEP_BYTES까지, 넘으면 오래된 것부터 버린다).
+        /map/request {"type": "traj_history", "upto": n} -> /map/reply {"type": "traj_history", "msgs": [n이 upto 이하인 traj JSON],
+        "dropped": 버린 수}. 늦게 붙은 물리 엔진이 스냅샷 (높이)과 함께 받아 고스트로 다시 눌러 다짐까지 만든다 (높이만으로는 다짐이 빠진다).
   저장 (5.8): --save-dir DIR이면 끝날 때(SIGTERM, Ctrl+C), 또는 /map/request {"type": "save"}에 DIR/state.json (상태 전체)과
         DIR/final/ (합친 물리 높이를 바탕 파일 꼴로: 다음 서버의 --base로 쓸 수 있다)을 쓴다.
 """
@@ -44,6 +47,7 @@ RING = 20000          # 다시 보내 줄 수 있게 들고 있는 /map/updates 
 RESEND_S = 0.5        # 빈칸을 다시 달라고 하는 주기 (s)
 EDITS_KEPT = 1000     # rebase용으로 들고 있는 최근 편집 수 (편집은 드물다)
 GIVEUP_S = 5.0        # 이만큼 안 메워지는 빈칸은 건너뛴다 (보낸 쪽이 죽었거나 그 메시지를 더 들고 있지 않다)
+TRAJ_KEEP_BYTES = 200_000_000   # 늦게 붙는 쪽에 줄 지난 궤적 (traj JSON) 합계 상한. 100 Hz에 차 한 대 약 0.1 MB/s (JSON) -> 약 30분
 
 
 class _Msg:
@@ -74,6 +78,7 @@ class MapServerNode:
         self.inits = {}                                             # 클라이언트 -> 마지막 init의 {nonce, result} (클라이언트가 답을 알아봄)
         self.n = 0                                                  # /map/updates로 내보낸 메시지 번호 (붙는 절차, 빈칸 찾기)
         self.ring = collections.deque(maxlen=ring)                  # 최근에 내보낸 메시지 (n, JSON)
+        self.traj_hist, self.traj_bytes, self.traj_dropped = collections.deque(), 0, 0   # 지난 궤적 (n, JSON): 늦게 붙는 쪽용
         self.lat = {}                                               # 클라이언트 -> 보낸 때부터 서버가 받기까지 (s) 목록
         self.held = {}                                              # 클라이언트 -> {seq: 메시지} (빈칸 뒤에 온 것)
         self.gap_since = {}                                         # 클라이언트 -> {빠진 seq: 처음 본 시각} (monotonic)
@@ -261,6 +266,12 @@ class MapServerNode:
             self.edits.append((self.n, sender, msg_edit(m)))
         data = json.dumps(m)
         self.ring.append((self.n, data))
+        if m["type"] == "traj":
+            self.traj_hist.append((self.n, data))
+            self.traj_bytes += len(data)
+            while self.traj_bytes > TRAJ_KEEP_BYTES and self.traj_hist:
+                self.traj_bytes -= len(self.traj_hist.popleft()[1])
+                self.traj_dropped += 1
         self.out("u", data)
         if m["type"] == "owner":
             self.publish_info()
@@ -319,6 +330,11 @@ class MapServerNode:
                 k0 = self.ring[0][0]
                 msgs = [self.ring[k - k0][1] for k in range(lo, min(hi, self.n) + 1)]
                 reply({"type": "replay", "from": lo, "to": hi, "msgs": msgs})
+        elif m["type"] == "traj_history":                           # 늦게 붙은 쪽: 스냅샷까지의 지난 궤적
+            upto = m.get("upto", self.n)
+            msgs = [d for k, d in self.traj_hist if k <= upto]
+            reply({"type": "traj_history", "upto": upto, "msgs": msgs, "dropped": self.traj_dropped})
+            self.node.get_logger().info(f"지난 궤적: {m['client']} ({len(msgs)}개, n {upto}까지)")
         elif m["type"] == "save":
             reply({"type": "saved", "dir": self.save(m.get("dir")), "version": None if self.server is None else self.server.version})
 

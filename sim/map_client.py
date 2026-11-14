@@ -9,10 +9,11 @@
                                        traj: 바퀴 궤적 (지도는 안 바뀐다. 서버 번호만 받아 전달. 받는 물리 엔진이 고스트 바퀴로 재생, 4단계 시제품)
     /map/updates  서버 -> 클라이언트   위 메시지에 서버가 매긴 판 "v"와 내보낸 번호 "n"을 붙여 그대로 (init 제외)
     /map/info     서버 (늦게 붙어도 받음) {"format", "rules", "tile", "grid", "z_range", "version", "n", "owners", "writers", ...}
-    /map/request  클라이언트 -> 서버   {"type": "audit" | "snapshot" | "replay" | "save", "client", "id", ...}
+    /map/request  클라이언트 -> 서버   {"type": "audit" | "snapshot" | "replay" | "traj_history" | "save", "client", "id", ...}
     /map/reply    서버 -> 클라이언트   audit: {"version", "seq": {클라이언트: 마지막 seq}, "hashes": {타일: sha256}}
                                        snapshot: {"n", "seq", "state": 서버 상태 전체 (MapServer.state, 아래 enc_state)}
                                        replay: {"from", "to", "msgs" | "too_old"}, resend: {"from", "to"} (서버가 빈칸을 봄)
+                                       traj_history: {"upto", "msgs": 지난 traj (n <= upto), "dropped"} (늦게 붙은 물리 엔진, fetch_traj_history)
   보낸 클라이언트(from)마다 seq를 1부터 붙인다 (모든 메시지: init, owner, write, cells). 서버는 받은 순서로 판을 매긴다.
   판 = 적용한 지도 변경 메시지 수 (write, cells). init(접속·바탕)과 owner(소유 영역 선언)는 판을 올리지 않는다. 값이 실제로 안 바뀐
   변경(예: min에서 더 낮지 않은 값만)도 판을 하나 올린다. 그래서 seq = 판 + init + owner (이 클라이언트만 쓴 경우).
@@ -180,8 +181,9 @@ class RemoteMap:
     drop: (보내기, 받기) 일부러 버릴 비율 (빈칸 복구 시험용, 0이면 없음). 버린 것은 다시 보내기·다시 받기로 메워져야 한다."""
 
     def __init__(self, base, z_range=None, name="sim", wait_s=30.0, drop=(0.0, 0.0), drop_seed=0, unacked_max=UNACKED_MAX,
-                 tcp=None):
-        """tcp: "127.0.0.1:포트"면 ROS2 대신 맵 서버의 TCP 입구로 (ROS2가 없는 클라이언트, sim/map_transport.py)."""
+                 tcp=None, keep_traj=False):
+        """tcp: "127.0.0.1:포트"면 ROS2 대신 맵 서버의 TCP 입구로 (ROS2가 없는 클라이언트, sim/map_transport.py).
+        keep_traj: 받은 바퀴 궤적을 traj_in에 쌓는다. 붙는 절차 안에서 받는 것도 놓치지 않게 생성할 때 켠다."""
         from .map_transport import RosTransport, TcpTransport
         self.name, self.seq, self.wait_s = name, 0, wait_s
         self.sent = {"init": 0, "owner": 0, "write": 0, "traj": 0}   # 보낸 메시지 종류별 수 (write = write + cells, 지도 변경)
@@ -195,7 +197,7 @@ class RemoteMap:
         self.applied_log = []                                    # 사본에 넣은 다른 쪽 변경 (바꾼 뒤): 시뮬레이터가 재현 시나리오에 적는다
         self.keep_applied = False                                # 켜는 쪽(시뮬레이터)만 쌓는다: 관찰자·렌더러가 오래 돌면 메모리가 는다
         self.no_log = set()                                      # 쌓지 않는 쓴 쪽 (같이 도는 물리엔진 Chrono: 다시 돌리면 다시 나온다)
-        self.keep_traj = False                                   # 받은 바퀴 궤적을 traj_in에 쌓는다 (재생하는 물리 엔진만. 로봇과 렌더러는 높이만 쓴다)
+        self.keep_traj = keep_traj                               # 받은 바퀴 궤적을 traj_in에 쌓는다 (재생하는 물리 엔진만. 로봇과 렌더러는 높이만 쓴다)
         self.traj_in = []                                        # 받은 다른 쪽 바퀴 궤적 메시지 (서버 번호 순서). 쓰는 쪽이 꺼내 간다
         self.seen_override = None                                # 있으면 seen_n으로 이 번호를 알린다 (Chrono: 사본이 아니라 SCM에 넣은 번호)
         self.no_rebase_from = None                               # 있으면 이 클라이언트들의 편집에는 서버가 맞추지 않는다
@@ -286,6 +288,19 @@ class RemoteMap:
         self.next_n = snap["n"] + 1
         self.pending = {k: v for k, v in self.pending.items() if k >= self.next_n}
         return snap, time.monotonic() - t0
+
+    def fetch_traj_history(self, timeout=30.0):
+        """늦게 붙기: 붙을 때 받은 스냅샷 (joined n)까지의 지난 궤적을 서버에서 받아 traj_in 앞에 놓는다 (그 뒤 것은 poll에서 이어 온다).
+        반환: 받은 수 (붙는 절차를 안 썼으면 = 첫 클라이언트, 0)."""
+        if self.joined is None:
+            return 0
+        got = self._request("traj_history", timeout=timeout, upto=self.joined["n"])
+        if got is None:
+            raise RuntimeError("맵 서버가 지난 궤적을 주지 않는다")
+        old = [json.loads(d) for d in got["msgs"] if json.loads(d).get("from") != self.name]
+        self.traj_in[:0] = old
+        self.traj_history = {"msgs": len(old), "upto": got["upto"], "dropped": got["dropped"]}
+        return len(old)
 
     def _join(self):
         """붙는 절차 2, 3: 스냅샷으로 사본을 만들고, 쌓인 변경 중 스냅샷 뒤(n이 더 큰) 것만 poll에서 적용한다."""

@@ -80,9 +80,9 @@ def client(P, name, a):
     from sim.map_client import RemoteMap
     if a.lane is None:
         nrow, ncol, i0, j0 = grid_shape(P)
-        m = RemoteMap(np.zeros((nrow, ncol)), Z_RANGE, name=name, tcp=a.tcp)
+        m = RemoteMap(np.zeros((nrow, ncol)), Z_RANGE, name=name, tcp=a.tcp, keep_traj=True)
     else:
-        m = RemoteMap(None, name=name, tcp=a.tcp, wait_s=60.0)
+        m = RemoteMap(None, name=name, tcp=a.tcp, wait_s=60.0, keep_traj=True)
         nrow, ncol = m.local.nrow, m.local.ncol
         cy = (P.SCM_Y[0] + P.SCM_Y[1]) / 2
         i0 = int(round((a.lane + (ncol - 1) * P.DELTA / 2) / P.DELTA))
@@ -123,7 +123,7 @@ def role_front(a):
     every = max(1, int(round(1.0 / (a.hz * P.STEP))))
     sent, t, k = {}, 0.0, 0
     t_wait = time.monotonic()
-    while not any(tm["writer"] == "rear" for tm in m.traj_in):  # 뒤 차가 지도를 다 받고 알릴 때까지 출발하지 않는다 (붙기 전 궤적은 받지 못한다: 늦게 붙기는 아직 없다)
+    while not a.no_wait and not any(tm["writer"] == "rear" for tm in m.traj_in):  # 뒤 차가 지도를 다 받고 알릴 때까지 출발하지 않는다 (--no-wait: 기다리지 않는다, 뒤 차가 늦게 붙어 지난 궤적을 받는다)
         m.poll()
         time.sleep(0.01)
         if time.monotonic() - t_wait > 120:
@@ -206,6 +206,8 @@ def role_rear_free(a):
     R = int(a.catchup)
     plog = []
     cur, behind, fast = 0, 0, 0
+    n_hist = m.fetch_traj_history() if a.late else 0           # 늦게 붙기: 스냅샷까지의 지난 궤적 (그 뒤 것은 poll에서 이어 온다)
+    pre, k_go, g_go, pre_wall = bool(a.late), None, None, None   # 늦게 붙으면 먼저 차를 세워 두고 지난 궤적을 눌러 둔다 (pre)
     m.send_traj("rear", 0, 1, np.zeros((0, 4, 13)), (P.TIRE_R, P.TIRE_W))
 
     def receive(idx):
@@ -277,10 +279,17 @@ def role_rear_free(a):
             raise RuntimeError("앞 차 궤적이 오지 않는다")
     wall = time.perf_counter()
     while True:
-        target = max(0, k - delay)
         receive(cur)
+        if pre:                                                # 먼저 누르기: 받은 궤적 끝 - delay까지 R배로 (앞 차가 끝났으면 끝까지)
+            goal = end_k - every if end_k is not None else keys[-1] * every - delay
+            if cur >= goal - 2 * every:                        # 따라잡았다: 이제 출발. 앞 차의 스텝 = 뒤 차 스텝 + (g_go - k_go)
+                pre, k_go, g_go, pre_wall = False, k, cur, time.perf_counter() - wall
+            target = goal if pre else cur
+        else:
+            target = max(0, k - delay) if k_go is None else g_go + (k - k_go)
         cur, rate = advance(cur, target)
-        behind = max(behind, target - cur)
+        if not pre:
+            behind = max(behind, target - cur)
         fast += rate > 1 and target - cur > 0
         idx = cur
         if end_k is None or idx < end_k - every:
@@ -294,7 +303,7 @@ def role_rear_free(a):
         else:
             hide_ghosts(P, bodies)
         ter.Synchronize(t)
-        di = car.step_in(t, ter)
+        di = car.brake(t, ter) if pre else car.step_in(t, ter)
         ter.Advance(P.STEP)
         s.DoStepDynamics(P.STEP)
         t = s.GetChTime()
@@ -314,7 +323,9 @@ def role_rear_free(a):
     au = m.audit(wait_s=120.0)
     final = m.local.compose(0, m.local.nrow, 0, m.local.ncol)
     save(a.out, heights={(n.x, n.y): v for n, v in ter.GetModifiedNodes(True)}, wall=wall, sim=t, audit=json.dumps(au), log=np.array(log), final_map=final,
-         waited=0.0, pace=a.pace, i0=i0, j0=j0, frames=np.array([frames[f] for f in keys]), hid=hid, missed=missed, late_frames=late_frames, lag=lag, steps=k, behind=behind * P.STEP, fast=fast, plog=np.array(plog))
+         waited=0.0, pace=a.pace, i0=i0, j0=j0, frames=np.array([frames[f] for f in keys]), hid=hid, missed=missed, late_frames=late_frames, lag=lag, steps=k, behind=behind * P.STEP, fast=fast, plog=np.array(plog),
+         late=bool(a.late), n_hist=n_hist, k_go=-1 if k_go is None else k_go, g_go=-1 if g_go is None else g_go, pre_wall=-1.0 if pre_wall is None else pre_wall,
+         hold=-1.0 if k_go is None else k_go * P.STEP)            # 정답에서 뒤 차를 세워 둘 시간 = 이 프로세스에서 서 있던 시간 (세워 둔 시간만 바꿔도 무른 흙에서 갈래가 바뀐다)
     m.close()
 
 
@@ -425,6 +436,7 @@ def role_truth(a):
         apply_fast(P, a)
     P.GAP = a.gap
     P.REAR_X = a.rear_x[0]
+    P.REAR_HOLD = a.hold                                       # 늦게 붙기: 뒤 차가 두 프로세스에서 출발한 앞 차 시각까지 세워 둔다
     ca = P.run(a.kphi, True, True)
     save(a.out, heights=ca["final"], log=ca["log"], cy=ca["cy"], wall=ca["wall"], sim=ca["t"], min_gap=ca["min_gap"])
 
@@ -577,7 +589,8 @@ def spread_compare(a, dirn, kphi):
         sha = __import__("hashlib").sha1(rd["log"].tobytes()).hexdigest()[:10]
         print(f"  [간격 {g}] 뒤 차 기록 {sha}, 숨긴 고스트 바퀴 {int(rd['hid'])} 스텝 x 바퀴 ({100 * int(rd['hid']) / max(1, 4 * len(rd['frames']) * 20):.0f} %)"
               + (f", 고스트 쉼 {int(rd['missed'])}/{int(rd['steps'])} 스텝, 재생 뒤 도착한 프레임 {int(rd['late_frames'])}, 배속 늦음 최대 {1000 * float(rd['lag']):.0f} ms, 재생 밀림 최대 {float(rd['behind']):.2f} s, 빨리 재생 {int(rd['fast'])} 스텝" if "missed" in rd else "")
-              + f", 빠르기 앞 차 {float(fd['sim']) / float(fd['wall']):.2f}배, 뒤 차 {float(rd['sim']) / float(rd['wall']):.2f}배" + pace_summary(rd))
+              + f", 빠르기 앞 차 {float(fd['sim']) / float(fd['wall']):.2f}배, 뒤 차 {float(rd['sim']) / float(rd['wall']):.2f}배" + pace_summary(rd)
+              + (f" | 늦게 붙기: 지난 궤적 {int(rd['n_hist'])}개, 먼저 누르기 {float(rd['pre_wall']):.1f} s (실제 시간), 서 있던 시간 {float(rd['hold']):.2f} s (정답도 같게), 출발 때 앞 차 시각 약 {int(rd['g_go']) * P.STEP + a.delay:.1f} s" if "late" in rd and bool(rd["late"]) else ""))
         au = json.loads(str(rd["audit"]))
         if au.get("hash_mismatch") != 0:
             print(f"간격 {g}: 뒤 차 해시 불일치 {au}")
@@ -631,6 +644,8 @@ def spread(a, me, env):
             out += ["--stall", str(a.outage_at), c[5:]]
         elif c.startswith("late"):
             out += ["--net-delay", c[4:]]
+        elif c.startswith("join"):                             # 뒤 차가 앞 차 출발 S초 뒤에 붙는다 (앞 차는 기다리지 않는다)
+            out += ["--no-wait", "--late"]
         else:
             assert c == "base", c
         return out
@@ -648,16 +663,19 @@ def spread(a, me, env):
                 common = ["--kphi", str(kphi), "--hz", str(a.hz), "--delay", str(delay), "--tcp", f"127.0.0.1:{port}", "--gap", str(g), "--rear-x", str(off), "--route", a.route] + case_flags(case)
                 try:
                     front = subprocess.Popen(me + ["--role", "front", "--out", str(dirn / f"front_{g}.npz")] + common, env=env, cwd=ROOT)
-                    time.sleep(1.0)
+                    time.sleep(float(case[4:]) if case.startswith("join") else 1.0)
                     rear = subprocess.Popen(me + ["--role", "rear", "--out", str(dirn / f"rear_{g}.npz")] + common, env=env, cwd=ROOT)
                     for p in (front, rear):
                         assert p.wait(timeout=1800) == 0
                 finally:
                     server.terminate()
                     server.wait(timeout=10)
-                cached = Path(cache.name) / f"truth_{a.route}_{kphi:g}_{off:g}_{g}{'_fast' if a.truth_fast else ''}.npz"
+                hold = []
+                if case.startswith("join"):                    # 정답은 뒤 차가 실제로 출발한 앞 차 시각까지 세워 둔다 (실행마다 다르다)
+                    hold = ["--hold", f"{float(np.load(dirn / f'rear_{g}.npz')['hold']):.3f}"]
+                cached = Path(cache.name) / f"truth_{a.route}_{kphi:g}_{off:g}_{g}{'_fast' if a.truth_fast else ''}{'_hold' + hold[1] if hold else ''}.npz"
                 if not cached.exists():
-                    subprocess.run(me + ["--role", "truth", "--out", str(cached), *common], env=env, cwd=ROOT, check=True, timeout=1800)
+                    subprocess.run(me + ["--role", "truth", "--out", str(cached), *common, *hold], env=env, cwd=ROOT, check=True, timeout=1800)
                 shutil.copy(cached, dirn / f"truth_{g}.npz")
                 print(f"[kphi {kphi:g} 옆 {off:g} 지연 {delay:g} 간격 {g} 끝]", flush=True)
             subprocess.run(me + ["--role", "spread_compare", "--dir", str(dirn), "--route", a.route, "--kphi", str(kphi), "--rear-x", str(off), "--delay", str(delay), "--spread", *map(str, a.spread), "--case", case if case != "wait" else ""] + (["--outage", str(a.outage_at), case[3:]] if case.startswith("out") else ["--outage", str(a.outage_at), case[5:]] if case.startswith("stall") else []), env=env, cwd=ROOT, check=True, timeout=900)
@@ -844,6 +862,9 @@ def main():
     ap.add_argument("--pace", type=float, help="두 프로세스의 배속 (실제 시간 대비). 있으면 뒤 차가 기다리지 않는다")
     ap.add_argument("--drop-traj", type=float, default=0.0)
     ap.add_argument("--outage", type=float, nargs=2)
+    ap.add_argument("--no-wait", action="store_true", help="앞 차가 뒤 차를 기다리지 않는다")
+    ap.add_argument("--late", action="store_true", help="뒤 차: 늦게 붙는다 (지난 궤적을 받아 차를 세워 둔 채 먼저 누르고 출발)")
+    ap.add_argument("--hold", type=float, default=0.0, help="정답: 뒤 차를 세워 두는 시간 (s)")
     ap.add_argument("--stall", type=float, nargs=2, help="이 구간의 궤적을 보내지 않고 모았다가 끝나면 몰아서 보낸다 (시작, 길이 s)")
     ap.add_argument("--route", default="straight", choices=["straight", "curve"], help="길 (curve: S자, 진폭 1 m, 파장 16 m)")
     ap.add_argument("--fast", action="store_true", help="앞 차와 뒤 차의 SCM 활성 영역을 줄인다 (정답은 그대로)")
