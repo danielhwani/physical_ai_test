@@ -509,6 +509,15 @@ class Simulation:
 def run(args):
     scenario = args.scenario if isinstance(args.scenario, dict) else load_yaml(args.scenario)
     scenario = apply_overrides(scenario, getattr(args, "set", None))
+    if scenario.get("vehicles"):              # 차마다 별도 Chrono 프로세스 (sim/vehicle_fleet.py): 맵 서버로 자국을 주고받고 실시간으로 달린다
+        if "chrono" in scenario:
+            raise SystemExit("vehicles와 chrono (시뮬레이터 안 Chrono)는 함께 쓰지 않는다")
+        if not getattr(args, "map_server", False):
+            args.map_server = True
+            print("vehicles: 차가 맵 서버로 자국을 주고받으므로 맵 서버를 별도 프로세스로 띄운다 (--map-server)")
+        if not args.realtime:
+            args.realtime = True
+            print("vehicles: 차 프로세스가 실시간으로 달리므로 실시간으로 실행한다 (--realtime)")
     sensor_node = getattr(args, "sensor_node", False)
     # --sensor-node: 센서를 별도 프로세스(ROS2 스트림 구독)에서 계산하므로 러너 안에서는 센서를 켜지 않는다
     map_proc = None
@@ -544,6 +553,15 @@ def run(args):
         "host": platform.node(), "started": stamp,
     }
     rec = Recorder(out, meta)
+    fleet = None
+    if scn.get("vehicles"):                   # 차 프로세스를 띄워 준비 (맵 서버에 붙고 Chrono 만들기)를 기다린다. 출발은 실행 직전
+        import atexit
+        from .vehicle_fleet import VehicleFleet
+        fleet = VehicleFleet(scn["vehicles"], sim.terrain, out, scn["duration"])
+        atexit.register(fleet.kill)
+        print(f"vehicles: 차 {len(fleet.procs)}대 준비를 기다린다")
+        fleet.wait_ready()                    # 렌더 스트림 매니페스트에 차 바디와 외형이 들어가야 해서 여기서 기다린다
+        meta["vehicles"] = [dict(c) for c in scn["vehicles"].get("cars", [])]
     dis_port = getattr(args, "dis_port", None)
     if dis_port is not None:                 # DIS 시나리오 콘솔 (문서 §10): 콘솔 요청을 시나리오 이벤트로 받는다 (이 PC 안에서만)
         from dis_console.auth import load_key
@@ -583,7 +601,7 @@ def run(args):
     if args.ros2:
         from .ros2_bridge import (Ros2StreamPublisher, launch_controller_node, launch_mujoco_viewer, launch_rviz_stack,
                                   launch_sensor_node)
-        bridge = Ros2StreamPublisher(m, sim.terrain, sim.cosim,
+        bridge = Ros2StreamPublisher(m, sim.terrain, sim.cosim if sim.cosim is not None else fleet,   # 별도 프로세스 차도 같은 방식으로 그린다
                                      soil_regions=sim.foot_soil.display_regions() if sim.foot_soil is not None else None)
         if sim.foot_soil is not None:           # 무른 흙 발자국: 화면 전용 표시 깊이 (물리·센서에는 안 들어감)
             from .stream import TerrainOverlayStream
@@ -641,6 +659,8 @@ def run(args):
     truth_hist = {round(d.time, 6): (d.xmat[sim.base_id].reshape(3, 3).T @ d.qvel[:3], quat_to_yaw(d.qpos[3:7]))}
     scan_log = {}
     wall0 = run_start = time.perf_counter()
+    if fleet is not None:                     # 모든 차가 준비됐다: 같은 벽시계 시각을 시뮬레이션 0초로
+        wall0 = run_start = fleet.go()
     paused_total, pause_start = 0.0, None
     late, max_lag = 0, 0.0
     next_view = 0.0
@@ -812,6 +832,8 @@ def run(args):
         "late_control_steps": late if (args.realtime or viewer) else None,
         "max_lag_s": round(max_lag, 4) if (args.realtime or viewer) else None,
     }
+    if fleet is not None:                     # 차 프로세스를 끝내고 (마지막 자국과 궤적 끝을 보낸다) 결과를 MOP에
+        mop["vehicles"] = fleet.close()
     audit = None
     if map_proc is not None:                       # 별도 프로세스 맵 서버: 서버와 사본 대조, 동기화 지연 (MOP에도)
         from .map_client import audit_mop

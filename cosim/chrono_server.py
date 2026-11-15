@@ -51,6 +51,52 @@ def quat_xyzw(q):
     return [q.e1, q.e2, q.e3, q.e0]
 
 
+def export_visual_bodies(system, root, prefix="hmmwv_"):
+    """외형 메쉬가 있는 바디: 메쉬를 OBJ(외형 좌표계)로 내보내고 바디별 외형 오프셋을 알려준다.
+    포즈는 각 바디의 외형 기준 프레임(GetVisualModelFrame)으로 보낸다 (body_poses).
+    반환: (바디 목록, [{"name": prefix + 바디 이름, "visuals": [...]}]). 차 프로세스 여럿이 같은 메쉬 파일을 쓰므로 임시 파일에 쓰고 옮긴다."""
+    root = Path(root)
+    out_dir = root / "build/scene_meshes/chrono"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    bodies, described = [], []
+    for b in system.GetBodies():
+        vm = b.GetVisualModel()
+        if vm is None:
+            continue
+        visuals = []
+        for inst in vm.GetShapeInstances():
+            tm = chrono.CastToChVisualShapeTriangleMesh(inst.shape)
+            if tm is None:
+                continue
+            name = tm.GetName()
+            path = out_dir / f"{name}.obj"
+            if not path.exists():
+                m = tm.GetMesh()
+                lines = [f"v {p.x:.5f} {p.y:.5f} {p.z:.5f}" for p in m.GetCoordsVertices()]
+                lines += [f"f {f.x + 1} {f.y + 1} {f.z + 1}" for f in m.GetIndicesVertices()]
+                tmp = path.with_suffix(f".{os.getpid()}.tmp")
+                tmp.write_text("\n".join(lines) + "\n")
+                os.replace(tmp, path)
+            rgba = COLORS.get(name, TIRE_COLOR if "tire" in name else [0.5, 0.5, 0.5, 1.0])
+            visuals.append({"mesh": path.relative_to(root).as_posix(), "pos": vec(inst.frame.GetPos()),
+                            "quat": quat_xyzw(inst.frame.GetRot()), "rgba": rgba})
+        if visuals:
+            bodies.append(b)
+            described.append({"name": prefix + b.GetName().replace(" ", "_"), "visuals": visuals})
+    return bodies, described
+
+
+def body_poses(bodies):
+    """바디마다 외형 기준 프레임의 [x, y, z], [qx, qy, qz, qw]."""
+    out = []
+    for b in bodies:
+        # 프레임을 변수에 잡아 둔다: b.GetVisualModelFrame().GetPos()처럼 한 식에서 이어 부르면
+        # SWIG 임시 객체가 먼저 해제되어 값이 깨진다 (x가 0으로 읽힘, 확인함)
+        fr = b.GetVisualModelFrame()
+        out.append((vec(fr.GetPos()), quat_xyzw(fr.GetRot())))
+    return out
+
+
 class ChronoServer:
     def __init__(self, root):
         self.root = Path(root)
@@ -201,33 +247,7 @@ class ChronoServer:
                 f["lifted"] = True
 
     def export_bodies(self):
-        """외형 메쉬가 있는 바디: 메쉬를 OBJ(외형 좌표계)로 내보내고 바디별 외형 오프셋을 알려준다.
-        포즈는 각 바디의 외형 기준 프레임(GetVisualModelFrame)으로 보낸다."""
-        out_dir = self.root / "build/scene_meshes/chrono"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        self.bodies, described = [], []
-        for b in self.sys.GetBodies():
-            vm = b.GetVisualModel()
-            if vm is None:
-                continue
-            visuals = []
-            for inst in vm.GetShapeInstances():
-                tm = chrono.CastToChVisualShapeTriangleMesh(inst.shape)
-                if tm is None:
-                    continue
-                name = tm.GetName()
-                path = out_dir / f"{name}.obj"
-                if not path.exists():
-                    m = tm.GetMesh()
-                    lines = [f"v {p.x:.5f} {p.y:.5f} {p.z:.5f}" for p in m.GetCoordsVertices()]
-                    lines += [f"f {f.x + 1} {f.y + 1} {f.z + 1}" for f in m.GetIndicesVertices()]
-                    path.write_text("\n".join(lines) + "\n")
-                rgba = COLORS.get(name, TIRE_COLOR if "tire" in name else [0.5, 0.5, 0.5, 1.0])
-                visuals.append({"mesh": path.relative_to(self.root).as_posix(), "pos": vec(inst.frame.GetPos()),
-                                "quat": quat_xyzw(inst.frame.GetRot()), "rgba": rgba})
-            if visuals:
-                self.bodies.append(b)
-                described.append({"name": "hmmwv_" + b.GetName().replace(" ", "_"), "visuals": visuals})
+        self.bodies, described = export_visual_bodies(self.sys, self.root)
         return described
 
     # ---------------- 진행 ----------------
@@ -302,12 +322,7 @@ class ChronoServer:
                 self.terrain.Synchronize(t)
                 self.terrain.Advance(self.step)
                 self.sys.DoStepDynamics(self.step)
-        poses = []
-        for b in getattr(self, "bodies", []):
-            # 프레임을 변수에 잡아 둔다: b.GetVisualModelFrame().GetPos()처럼 한 식에서 이어 부르면
-            # SWIG 임시 객체가 먼저 해제되어 값이 깨진다 (x가 0으로 읽힘, 확인함)
-            fr = b.GetVisualModelFrame()
-            poses.append({"pos": vec(fr.GetPos()), "quat": quat_xyzw(fr.GetRot())})
+        poses = [{"pos": p, "quat": q} for p, q in body_poses(getattr(self, "bodies", []))]
         vehicle = None
         if self.car is not None:
             v = self.car.GetVehicle()
