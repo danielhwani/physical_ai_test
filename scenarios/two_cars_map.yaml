@@ -1,7 +1,8 @@
 # 차 두 대를 시나리오에서 바로 (맵 서버 4단계 운용, sim/vehicle_fleet.py). 차마다 별도 Chrono 프로세스가 맵 서버로 자국과 바퀴 궤적을 주고받는다:
 #   python -m sim.runner scenarios/two_cars_map.yaml        (mj_ros. --map-server, --realtime은 러너가 켠다)
-# 앞 차 car_a가 x = 3 m를 +y로 지나고, 뒤 차 car_b가 12 m 뒤에서 그 자국을 따라간다 (뒤 차는 앞 차 궤적을 고스트로 재생해 다짐까지 만든다).
-# 로봇은 차 두 대가 다 지나간 뒤 +x로 걸어 자국 (x 약 2.2, 3.8 m)을 넘는다. 차와 로봇 사이에 물리 작용은 없다 (로봇은 지도 높이만 받는다).
+# 앞 차 car_a가 x = 3 m를 +y로 지나고, 뒤 차 car_b가 12 m 뒤에서 10° 기울어져 달려 (3, -8)에서 앞 차 자국을 X자로 가로지른다
+# (뒤 차는 앞 차 궤적을 고스트로 재생해 다짐까지 만든다). 로봇은 차 두 대가 다 지나간 뒤 +x로 걸어 y = 0에서 자국을 넘는다
+# (car_a x 약 2.2, 3.8 m, car_b 약 3.6, 5.2 m. 교차점을 y = -3에 두면 자국 네 줄이 0.6 m 간격이 되어 로봇이 네 번째 줄에서 막혔다). 차와 로봇 사이에 물리 작용은 없다 (로봇은 지도 높이만 받는다).
 # 같은 길을 시험 스크립트로: python conformance/probe_two_chrono.py --robot scenarios/two_cars_crossing.yaml
 name: two_cars_map
 duration: 42.0
@@ -11,8 +12,8 @@ terrain:
   resolution: 0.05
   z_range: [-0.3, 0.4]
   patches:
-    # 차 SCM이 덮는 영역 (x -3 ~ 9 m: 길 x = 3 m에서 margin 6 m)은 평평해야 하므로 요철은 그 밖 (로봇 뒤)에만 둔다
-    - {kind: rough, amplitude: 0.012, region: [-9.0, -3.0, -4.0, 3.0]}
+    # 차 SCM이 덮는 영역 (car_a x -3 ~ 9 m, car_b x -3.7 ~ 10 m: 길에서 margin)은 평평해야 하므로 요철은 그 밖 (로봇 뒤)에만 둔다
+    - {kind: rough, amplitude: 0.012, region: [-9.5, -4.0, -5.0, 3.0]}
 controller:
   type: trot
   period: 0.36
@@ -28,4 +29,5 @@ vehicles:
   delay: 0.2
   cars:
     - {name: car_a, start: [3.0, -14.0], end: [3.0, 26.0], speed: 3.0, t_start: 0.0}
-    - {name: car_b, start: [3.0, -26.0], end: [3.0, 14.0], speed: 3.0, t_start: 0.0}
+    # 10° 기울어진 길 (x = 3 + (y + 8) tan 10°). 길이 x로 7 m 퍼져 SCM이 넓어지므로 margin을 줄여 요철 패치를 피한다
+    - {name: car_b, start: [-0.174, -26.0], end: [6.879, 14.0], speed: 3.0, t_start: 0.0, margin: 3.5}
