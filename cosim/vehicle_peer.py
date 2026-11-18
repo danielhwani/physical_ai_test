@@ -370,7 +370,7 @@ def main():
         if (k + 1) % WRITE_EVERY == 0:
             write(t)
             x, y, z = car.pos()
-            track.append((t, x, y, z, car.car.GetVehicle().GetSpeed()))
+            track.append((t, x, y, z, car.car.GetVehicle().GetSpeed(), time.perf_counter() - wall0 - t))   # 마지막 칸: 그 순간 늦음 (s)
             if select.select([sys.stdin], [], [], 0)[0] and not sys.stdin.readline():
                 closed = True                              # 러너가 끝났다
         k += 1
@@ -384,7 +384,7 @@ def main():
     au = m.audit(wait_s=20.0)
     out = {"name": name, "sim_s": round(t, 3), "max_lag_s": round(lag, 4), "state": car.state, "along_m": round(car.along(), 3),
            "history_msgs": n_hist, "audit": au, "ghosts": {p: pb.stats for p, pb in plays.items()},
-           "track": [[round(v, 4) for v in row] for row in track]}
+           "track_columns": ["t", "x", "y", "z", "speed", "lag"], "track": [[round(v, 4) for v in row] for row in track]}
     Path(cfg["out"]).write_text(json.dumps(out))
     log(f"{name}: 끝 t {t:.1f} s, 늦음 최대 {1000 * lag:.0f} ms, 상태 {car.state}, 지도 대조 {au.get('hash_mismatch')}")
     m.close()
