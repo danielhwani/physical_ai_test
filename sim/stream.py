@@ -178,7 +178,8 @@ class StreamTap:
 
     def __init__(self, sim):
         self.sim = sim
-        self.manifest = build_manifest(sim.model, sim.terrain, sim.cosim,
+        self.source = getattr(sim, "render_source", sim.cosim)     # MuJoCo 밖 바디 (같은 프로세스 Chrono 또는 별도 프로세스 차)
+        self.manifest = build_manifest(sim.model, sim.terrain, self.source,
                                        soil_regions=sim.foot_soil.display_regions() if getattr(sim, "foot_soil", None) else None)
         self.bodies = [(b["id"], b["name"]) for b in self.manifest["bodies"] if b["physics_source"] == "MuJoCo"]
         self.terrain = TerrainPatchStream(sim.terrain)
@@ -195,6 +196,6 @@ class StreamTap:
     def poses(self):
         d = self.sim.data
         out = {n: (d.xpos[i].tolist(), mj_quat_to_ros(d.xquat[i]).tolist()) for i, n in self.bodies}
-        if self.sim.cosim is not None:
-            out.update({n: (p.tolist(), q.tolist()) for n, p, q in self.sim.cosim.stream_poses()})
+        if self.source is not None:
+            out.update({n: (p.tolist(), q.tolist()) for n, p, q in self.source.stream_poses()})
         return out

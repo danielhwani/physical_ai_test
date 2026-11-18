@@ -184,17 +184,34 @@ class Simulation:
         names = list(dict.fromkeys(list(self.scn.get("sensors", [])) + list(sensors or [])))
         if self.controller.sensor and self.controller.sensor not in names:   # 지형 인지 보행기가 쓰는 센서는 자동으로 켠다
             names.append(self.controller.sensor)
+        self.fleet = None                        # 별도 프로세스 차 (sim/vehicle_fleet.py, 러너가 attach_fleet으로 붙인다)
+        self.sensor_names = names
         self.scans, self.sensor_renderer, self.lidars = {}, None, []
         if names:
-            from viz.sensor_renderer import SensorRenderer
-            from .stream import StreamTap
-            defs = self.sensor_defs["lidars"]
-            unknown = [n for n in names if n not in defs]
-            assert not unknown, f"알 수 없는 센서: {unknown} (specs/go2_sensors.yaml: {list(defs)})"
-            self.tap = StreamTap(self)
-            self.sensor_renderer = SensorRenderer(self.tap.manifest, {n: defs[n] for n in names},
-                                                  terrain_half=min(8.0, max(defs[n]["range_max"] for n in names)))
-            self.lidars = self.sensor_renderer.lidars
+            self._build_sensors()
+
+    @property
+    def render_source(self):
+        """MuJoCo 밖 물리엔진 바디의 출처 (렌더 스트림과 센서 장면에 넣는다): 같은 프로세스 Chrono 또는 별도 프로세스 차."""
+        return self.cosim if self.cosim is not None else self.fleet
+
+    def _build_sensors(self):
+        from viz.sensor_renderer import SensorRenderer
+        from .stream import StreamTap
+        names, defs = self.sensor_names, self.sensor_defs["lidars"]
+        unknown = [n for n in names if n not in defs]
+        assert not unknown, f"알 수 없는 센서: {unknown} (specs/go2_sensors.yaml: {list(defs)})"
+        self.tap = StreamTap(self)
+        self.sensor_renderer = SensorRenderer(self.tap.manifest, {n: defs[n] for n in names},
+                                              terrain_half=min(8.0, max(defs[n]["range_max"] for n in names)))
+        self.lidars = self.sensor_renderer.lidars
+
+    def attach_fleet(self, fleet):
+        """별도 프로세스 차를 붙인다 (모두 준비된 뒤, 시각 0 전). 센서 장면은 시작할 때 차 없이 만들었으므로 차 바디를 넣어 다시 만든다."""
+        self.fleet = fleet
+        if self.sensor_renderer is not None:
+            assert self.data.time == 0.0, "차는 시작 전에 붙인다"
+            self._build_sensors()
 
     def sense(self):
         """센서 주기가 됐으면 스트림 메시지(지형 패치, 바디 포즈)를 센서 렌더러에 건네고 스캔을 받는다.
@@ -561,6 +578,7 @@ def run(args):
         atexit.register(fleet.kill)
         print(f"vehicles: 차 {len(fleet.procs)}대 준비를 기다린다")
         fleet.wait_ready()                    # 렌더 스트림 매니페스트에 차 바디와 외형이 들어가야 해서 여기서 기다린다
+        sim.attach_fleet(fleet)               # 로봇 LiDAR 장면에도 차를 넣는다
         meta["vehicles"] = [dict(c) for c in scn["vehicles"].get("cars", [])]
     dis_port = getattr(args, "dis_port", None)
     if dis_port is not None:                 # DIS 시나리오 콘솔 (문서 §10): 콘솔 요청을 시나리오 이벤트로 받는다 (이 PC 안에서만)
@@ -601,7 +619,7 @@ def run(args):
     if args.ros2:
         from .ros2_bridge import (Ros2StreamPublisher, launch_controller_node, launch_mujoco_viewer, launch_rviz_stack,
                                   launch_sensor_node)
-        bridge = Ros2StreamPublisher(m, sim.terrain, sim.cosim if sim.cosim is not None else fleet,   # 별도 프로세스 차도 같은 방식으로 그린다
+        bridge = Ros2StreamPublisher(m, sim.terrain, sim.render_source,   # 별도 프로세스 차도 같은 방식으로 그린다
                                      soil_regions=sim.foot_soil.display_regions() if sim.foot_soil is not None else None)
         if sim.foot_soil is not None:           # 무른 흙 발자국: 화면 전용 표시 깊이 (물리·센서에는 안 들어감)
             from .stream import TerrainOverlayStream
