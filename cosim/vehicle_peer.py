@@ -13,17 +13,21 @@
   준비되면 (맵 서버에 붙고 SCM과 차를 만든 뒤) 표준 출력에 "READY <바디 JSON>" 한 줄. 바디 JSON은 렌더러 매니페스트에 넣을
   [{"name": "<차 이름>_<바디>", "visuals": [{mesh, pos, quat, rgba}]}]. 러너가 "GO <epoch>" 한 줄을 주면 epoch (time.time)를 시각 0으로 달린다.
   달리는 동안 "POSE <JSON>" 줄을 50 Hz로: [t, [[x, y, z, qx, qy, qz, qw], ...]] (READY의 바디 순서, 외형 기준 프레임). 러너가 렌더러 TF로 보낸다.
+  러너는 달리는 동안 로봇 몸통 위치를 "ROBOT <x> <y>" 줄로 20 Hz로 준다 (양보 판단용, 시뮬레이터 참값). 차는 50 ms마다 표준 입력을 비운다.
   표준 입력이 닫히면 (러너가 끝남) 마지막 자국과 궤적 끝을 보내고 결과를 out에 쓰고 끝낸다. 진행 기록은 표준 오류로.
 
 config (JSON):
   name, peers (다른 차 이름들), tcp ("127.0.0.1:포트"), grid {"half": [hx, hy], "res"}, out (결과 JSON 경로),
   start [x, y], end [x, y], speed (m/s), t_start (s, 그때까지 제동), duration (s, 러너가 안 닫아도 이 시각 + 5 s에 끝낸다),
-  soil {bekker_kphi, bekker_kc, bekker_n, cohesion, friction_deg, janosi_shear, elastic_k, damping_r}, hz, delay, catchup, threads, margin
+  soil {bekker_kphi, bekker_kc, bekker_n, cohesion, friction_deg, janosi_shear, elastic_k, damping_r}, hz, delay, catchup, threads, margin,
+  yield_to_robot (차 앞 진로, 차체 중심 기준 앞 0 ~ yield_ahead m, 옆 ±yield_half_width m에 로봇이 있으면 제동하고 기다린다.
+  같은 프로세스 Chrono (cosim/chrono_server.py)와 같은 규칙과 기본값 9 m, 1.8 m)
 """
 import argparse
 import bisect
 import json
 import math
+import os
 import select
 import sys
 import time
@@ -46,6 +50,7 @@ THRESH = 0.001                                     # 지도보다 이만큼 더 
 WRITE_EVERY = 100                                  # 지도에 쓰는 주기 (스텝, 0.2 s)
 MAX_FILL = 1.0                                     # 받은 궤적 프레임 사이를 메우는 최대 시간 (s)
 GUARD = 1.0                                        # 자기 앞바퀴 앞 이 거리 안의 고스트는 숨긴다 (m)
+INPUT_EVERY = 25                                   # 표준 입력 (로봇 위치, 끝) 확인 주기 (스텝, 50 ms)
 POSE_EVERY = 10                                    # 렌더러용 바디 포즈 주기 (스텝, 50 Hz)
 NEAR = 15.0                                        # 이보다 먼 고스트는 쉬게 한다 (m)
 SOIL = {"bekker_kphi": 5e6, "bekker_kc": 0.0, "bekker_n": 1.1, "cohesion": 0.0, "friction_deg": 30.0, "janosi_shear": 0.01,
@@ -54,6 +59,24 @@ SOIL = {"bekker_kphi": 5e6, "bekker_kc": 0.0, "bekker_n": 1.1, "cohesion": 0.0, 
 
 def log(*a):
     print(*a, file=sys.stderr, flush=True)
+
+
+class StdinLines:
+    """표준 입력을 직접 읽어 줄로 나눈다. sys.stdin.readline은 줄을 버퍼에 미리 읽어 두어 select가 남은 줄을 알려 주지 않는다."""
+
+    def __init__(self):
+        self.fd, self.buf, self.eof = sys.stdin.fileno(), b"", False
+
+    def poll(self, timeout=0.0):
+        """지금 읽을 수 있는 줄들 (timeout 초까지 기다린다). 입력이 닫히면 eof."""
+        while not self.eof and select.select([self.fd], [], [], timeout)[0]:
+            data = os.read(self.fd, 65536)
+            if not data:
+                self.eof = True
+            self.buf += data
+            timeout = 0.0
+        *lines, self.buf = self.buf.split(b"\n")
+        return [ln.decode().strip() for ln in lines if ln.strip()]
 
 
 class Grid:
@@ -104,6 +127,9 @@ class Car:
             for side in (veh.LEFT, veh.RIGHT):
                 ter.AddActiveDomain(car.GetVehicle().GetWheel(axle, side).GetSpindle(), chrono.ChVector3d(0, 0, 0), chrono.ChVector3d(*WHEEL_DOMAIN))
         self.state = "wait"                        # wait (출발 전) -> drive -> stop (끝에 닿음)
+        # 양보 (cosim/chrono_server.py와 같은 규칙): 차 앞 진로에 로봇이 있으면 제동하고 기다린다 (로봇과 물리 작용이 없어 뚫고 지나가는 것을 막음)
+        self.yield_cfg = (float(cfg.get("yield_ahead", 9.0)), float(cfg.get("yield_half_width", 1.8))) if cfg.get("yield_to_robot") else None
+        self.robot_xy, self.yielding, self.yields, self.yield_s = None, False, 0, 0.0
 
     def pos(self):
         p = self.car.GetVehicle().GetPos()
@@ -113,12 +139,25 @@ class Car:
         x, y, _ = self.pos()
         return (x - self.start[0]) * self.dir[0] + (y - self.start[1]) * self.dir[1]
 
+    def check_yield(self):
+        was = self.yielding
+        self.yielding = False
+        if self.yield_cfg and self.robot_xy is not None and self.state == "drive":
+            x, y, _ = self.pos()
+            rx, ry = self.robot_xy[0] - x, self.robot_xy[1] - y
+            along = rx * self.dir[0] + ry * self.dir[1]
+            lateral = abs(rx * self.dir[1] - ry * self.dir[0])
+            self.yielding = 0.0 < along < self.yield_cfg[0] and lateral < self.yield_cfg[1]
+        self.yields += int(self.yielding and not was)
+
     def step(self, t, ter):
         if self.state == "wait" and t >= self.t_start:
             self.state = "drive"
         if self.state == "drive" and self.along() > self.length:
             self.state = "stop"
-        if self.state != "drive":
+        if self.yielding:
+            self.yield_s += STEP
+        if self.state != "drive" or self.yielding:
             di = veh.DriverInputs()
             di.m_throttle, di.m_steering, di.m_braking, di.m_clutch = 0.0, 0.0, 1.0, 0.0
             self.car.Synchronize(t, di, ter)
@@ -342,7 +381,11 @@ def main():
 
     print("READY " + json.dumps(described), flush=True)      # 렌더러 매니페스트에 넣을 바디와 외형
     print(poses_line(0.0), flush=True)
-    line = sys.stdin.readline().split()
+    inp = StdinLines()
+    lines = []
+    while not lines and not inp.eof:
+        lines = inp.poll(timeout=1.0)
+    line = lines[0].split() if lines else []
     if not line or line[0] != "GO":
         log(f"{name}: 시작 신호 없이 끝남")
         m.close()
@@ -370,9 +413,14 @@ def main():
         if (k + 1) % WRITE_EVERY == 0:
             write(t)
             x, y, z = car.pos()
-            track.append((t, x, y, z, car.car.GetVehicle().GetSpeed(), time.perf_counter() - wall0 - t))   # 마지막 칸: 그 순간 늦음 (s)
-            if select.select([sys.stdin], [], [], 0)[0] and not sys.stdin.readline():
-                closed = True                              # 러너가 끝났다
+            track.append((t, x, y, z, car.car.GetVehicle().GetSpeed(), time.perf_counter() - wall0 - t, float(car.yielding)))   # 늦음 (s), 양보 중
+        if k % INPUT_EVERY == 0:
+            for ln in inp.poll():
+                f = ln.split()
+                if f[0] == "ROBOT":
+                    car.robot_xy = (float(f[1]), float(f[2]))
+            closed = inp.eof                               # 러너가 끝났다
+            car.check_yield()
         k += 1
         now = time.perf_counter() - wall0
         if now < t:
@@ -384,9 +432,10 @@ def main():
     au = m.audit(wait_s=20.0)
     out = {"name": name, "sim_s": round(t, 3), "max_lag_s": round(lag, 4), "state": car.state, "along_m": round(car.along(), 3),
            "history_msgs": n_hist, "audit": au, "ghosts": {p: pb.stats for p, pb in plays.items()},
-           "track_columns": ["t", "x", "y", "z", "speed", "lag"], "track": [[round(v, 4) for v in row] for row in track]}
+           "yields": car.yields, "yield_s": round(car.yield_s, 2),
+           "track_columns": ["t", "x", "y", "z", "speed", "lag", "yielding"], "track": [[round(v, 4) for v in row] for row in track]}
     Path(cfg["out"]).write_text(json.dumps(out))
-    log(f"{name}: 끝 t {t:.1f} s, 늦음 최대 {1000 * lag:.0f} ms, 상태 {car.state}, 지도 대조 {au.get('hash_mismatch')}")
+    log(f"{name}: 끝 t {t:.1f} s, 늦음 최대 {1000 * lag:.0f} ms, 상태 {car.state}, 양보 {car.yields}번 {car.yield_s:.1f} s, 지도 대조 {au.get('hash_mismatch')}")
     m.close()
 
 

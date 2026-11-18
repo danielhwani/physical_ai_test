@@ -686,6 +686,7 @@ def run(args):
     was_paused = False
 
     interrupted = False
+    next_robot_send = 0.0
     frozen_since, next_frozen_status = None, 0.0
     try:
         while d.time < scn["duration"]:
@@ -730,6 +731,9 @@ def run(args):
 
             terrain_changed, energy, roll, pitch = sim.step_control()
             energy_total += energy
+            if fleet is not None and d.time >= next_robot_send:   # 차 양보 판단용 로봇 위치 (참값, 20 Hz)
+                fleet.send_robot(*d.qpos[:2])
+                next_robot_send = d.time + 0.05
 
             if "t" in sim.low_cmd:                   # 실행한 명령이 몇 초 전 상태로 계산됐는가 (두 실행 방식 공통)
                 cmd_latency.append(sim.low_state["t"] - sim.low_cmd["t"])

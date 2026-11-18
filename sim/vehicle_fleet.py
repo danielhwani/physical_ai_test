@@ -7,6 +7,7 @@
       catchup: 4                          # 밀린 궤적 재생 배속
       threads: 2                          # 차마다 Chrono 스레드
       margin: 6.0                         # 차 SCM이 길 양옆, 앞뒤로 덮는 거리 (m)
+      yield_to_robot: true                # 차 앞 진로 (앞 9 m, 옆 ±1.8 m)에 로봇이 있으면 제동하고 기다린다 (yield_ahead, yield_half_width)
       cars:
         - {name: car_a, start: [3.0, -14.0], end: [3.0, 26.0], speed: 3.0, t_start: 0.0}
 
@@ -30,7 +31,7 @@ import numpy as np
 from .chrono_link import find_chrono_python
 
 ROOT = Path(__file__).resolve().parent.parent
-KEYS = ("soil", "hz", "delay", "catchup", "threads", "margin")
+KEYS = ("soil", "hz", "delay", "catchup", "threads", "margin", "yield_to_robot", "yield_ahead", "yield_half_width")   # 모든 차에 (차마다 덮어쓸 수 있다)
 
 
 class VehicleFleet:
@@ -91,6 +92,16 @@ class VehicleFleet:
                     out.append((b["name"], np.array(v[:3]), np.array(v[3:])))
         return out
 
+    def send_robot(self, x, y):
+        """로봇 몸통 위치 (양보 판단용). 러너가 20 Hz로 부른다. 이미 끝난 차는 건너뛴다."""
+        for p in self.procs.values():
+            if p.poll() is None:
+                try:
+                    p.stdin.write(f"ROBOT {x:.3f} {y:.3f}\n")
+                    p.stdin.flush()
+                except (BrokenPipeError, OSError, ValueError):
+                    pass
+
     def go(self, lead=1.0):
         """lead 초 뒤를 시뮬레이션 시각 0으로 알린다. 반환: 그 순간의 time.perf_counter (러너의 실시간 기준점)."""
         epoch = time.time() + lead
@@ -119,7 +130,7 @@ class VehicleFleet:
             if f.exists():
                 r = json.loads(f.read_text())
                 out[n] = {"sim_s": r["sim_s"], "max_lag_s": r["max_lag_s"], "state": r["state"], "along_m": r["along_m"],
-                          "hash_mismatch": r["audit"].get("hash_mismatch")}
+                          "yields": r.get("yields", 0), "yield_s": r.get("yield_s", 0.0), "hash_mismatch": r["audit"].get("hash_mismatch")}
             else:
                 out[n] = {"error": f"결과 없음 (종료 코드 {p.returncode}, {self.dir / f'{n}.log'})"}
         return out
