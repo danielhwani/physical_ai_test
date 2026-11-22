@@ -183,6 +183,31 @@ def test_height_scan_input_matches_true_terrain():
     assert spread < 0.04, f"height_scan 오차 폭(10~90%) {spread * 100:.1f} cm, 일정한 차이 {np.median(err) * 100:.1f} cm"
 
 
+def test_vehicle_guard_holds_and_clears():
+    """차 감시 (control/vehicle_guard.py): 앞쪽 길 양옆 범위 안에 키 큰 점이 있으면 서고, clear_s 동안 안 보이면 다시 걷는다.
+    범위 밖 점, 낮은 점 (자국·요철), 자기 몸 점은 무시한다. 로봇 방향 (yaw)을 따른다."""
+    from control.vehicle_guard import VehicleGuard
+    g = VehicleGuard({"ahead": 8.0, "side": 15.0, "clear_s": 2.0}, np.eye(3), np.zeros(3), np.array([0.36, 0.2]))
+    R, p = np.eye(3), np.array([0.0, 0.0, 0.3])               # 센서 = 몸통 원점 (높이 0.3 m)
+    car = np.array([[6.0, y, 0.5 + z] for y in np.linspace(-9, -7, 6) for z in (0.0, 0.5)])   # 앞 6 m, 왼쪽 아래 8 m (센서 좌표 = 몸통 좌표)
+    low = np.array([[3.0, y, -0.25] for y in np.linspace(-1, 1, 30)])                         # 자국·요철 (몸통보다 낮다)
+    far = car + [0.0, -10.0, 0.0]                                                             # 옆 18 m: 범위 밖
+    own = np.array([[0.1, 0.0, 0.2]] * 20)                                                    # 자기 몸
+    dt = 0.02
+    for k in range(50):                                        # 1초: 낮은 점, 범위 밖, 자기 몸뿐 -> 걷는다
+        g.add_scan(k * dt, np.vstack([low, far, own]), R, p)
+        assert not g.update(k * dt, dt)
+    g.add_scan(1.0, np.vstack([car, low]), R, p)              # 차가 보인다 -> 선다
+    assert g.update(1.0, dt) and g.holds == 1
+    assert g.update(2.9, dt)                                   # 1.9초 안 보임: 아직 선다
+    assert not g.update(3.1, dt)                               # 2.1초 안 보임: 다시 걷는다
+    assert [e[1] for e in g.events] == ["hold", "go"]
+    yaw = np.radians(90.0)                                     # 로봇이 +y를 볼 때: 몸통 좌표 점은 그대로, 월드로는 돌아간다
+    Rz = np.array([[np.cos(yaw), -np.sin(yaw), 0], [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]])
+    g.add_scan(4.0, car, Rz, p)
+    assert g.update(4.0, dt) and g.holds == 2
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

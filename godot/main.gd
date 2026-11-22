@@ -31,9 +31,9 @@ var retry_at := 0.0
 var world: Node3D                    # ROS 좌표계 (X축 -90°)
 var bodies := {}                     # 바디 이름 -> Node3D (월드 포즈)
 var mesh_cache := {}                 # OBJ 경로 -> ArrayMesh
-var terrain_mi: MeshInstance3D
-var terrain_idx_key := Vector2i(-1, -1)
-var terrain_idx := PackedInt32Array()
+var terrain_mi: MeshInstance3D       # 가까운 땅 (로봇 둘레, 고운 칸)
+var terrain_far_mi: MeshInstance3D   # 먼 땅 (세계 지도 전체, 굵은 칸. 가까운 땅 자리는 중계기가 내려 숨긴다)
+var terrain_idx := {}                # 층 -> [격자 크기, 삼각형 목록] (크기가 같으면 다시 쓴다)
 var feet := []                       # 발 접촉 구
 var path_mi: MeshInstance3D
 var path_pts := PackedVector3Array()
@@ -247,7 +247,13 @@ func _handle(msg: Dictionary) -> void:
 					b.position = Vector3(v[0], v[1], v[2])
 					b.quaternion = Quaternion(v[3], v[4], v[5], v[6]).normalized()
 		"terrain":
-			_build_terrain(msg)
+			if msg.get("layer", "near") == "far":
+				if terrain_far_mi == null:
+					terrain_far_mi = MeshInstance3D.new()
+					world.add_child(terrain_far_mi)
+				_build_terrain(msg, terrain_far_mi, "far")
+			else:
+				_build_terrain(msg, terrain_mi, "near")
 		"status":
 			_update_status(msg)
 		"points":
@@ -421,7 +427,7 @@ func _load_obj(path: String) -> ArrayMesh:
 	return mesh
 
 
-func _build_terrain(msg: Dictionary) -> void:
+func _build_terrain(msg: Dictionary, mi: MeshInstance3D, layer: String) -> void:
 	# 표시 높이 격자 -> 메시 (ROS 좌표: x = x0 + j*dx, y = y0 + i*dy, z = 높이). 꼭짓점 색은 중계기가 계산
 	var nr: int = msg["nrow"]
 	var nc: int = msg["ncol"]
@@ -445,36 +451,42 @@ func _build_terrain(msg: Dictionary) -> void:
 			var hy: float = h[mini(i + 1, nr - 1) * nc + j] - h[maxi(i - 1, 0) * nc + j]
 			normals[k] = Vector3(-hx / (2.0 * dx), -hy / (2.0 * dy), 1.0).normalized()
 			colors[k] = Color(rgb[3 * k], rgb[3 * k + 1], rgb[3 * k + 2])
-	if terrain_idx_key != Vector2i(nr, nc):              # 격자 크기가 같으면 삼각형 목록을 다시 쓴다
-		terrain_idx_key = Vector2i(nr, nc)
-		terrain_idx = PackedInt32Array()
-		terrain_idx.resize((nr - 1) * (nc - 1) * 6)
+	# 구멍 (먼 땅: 가까운 땅이 그리는 칸, [i0, i1, j0, j1]): 그 칸의 삼각형은 만들지 않는다
+	var hole: Array = msg.get("hole", [0, 0, 0, 0])
+	var key := [Vector2i(nr, nc), hole]
+	if not terrain_idx.has(layer) or terrain_idx[layer][0] != key:   # 격자 크기와 구멍이 같으면 삼각형 목록을 다시 쓴다
+		var idx := PackedInt32Array()
+		idx.resize((nr - 1) * (nc - 1) * 6)
 		var p := 0
 		for i in nr - 1:
 			for j in nc - 1:
+				if i >= hole[0] and i < hole[1] and j >= hole[2] and j < hole[3]:
+					continue
 				var a := i * nc + j
 				# 위에서 볼 때 반시계 (a, a+1, a+nc+1), (a, a+nc+1, a+nc)를 Godot 앞면(시계)으로 뒤집는다
-				terrain_idx[p] = a
-				terrain_idx[p + 1] = a + nc + 1
-				terrain_idx[p + 2] = a + 1
-				terrain_idx[p + 3] = a
-				terrain_idx[p + 4] = a + nc
-				terrain_idx[p + 5] = a + nc + 1
+				idx[p] = a
+				idx[p + 1] = a + nc + 1
+				idx[p + 2] = a + 1
+				idx[p + 3] = a
+				idx[p + 4] = a + nc
+				idx[p + 5] = a + nc + 1
 				p += 6
+		idx.resize(p)
+		terrain_idx[layer] = [key, idx]
 	var arrays := []
 	arrays.resize(Mesh.ARRAY_MAX)
 	arrays[Mesh.ARRAY_VERTEX] = verts
 	arrays[Mesh.ARRAY_NORMAL] = normals
 	arrays[Mesh.ARRAY_COLOR] = colors
-	arrays[Mesh.ARRAY_INDEX] = terrain_idx
+	arrays[Mesh.ARRAY_INDEX] = terrain_idx[layer][1]
 	var mesh := ArrayMesh.new()
 	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
-	terrain_mi.mesh = mesh
-	if terrain_mi.material_override == null:
+	mi.mesh = mesh
+	if mi.material_override == null:
 		var m := StandardMaterial3D.new()
 		m.vertex_color_use_as_albedo = true
 		m.roughness = 1.0
-		terrain_mi.material_override = m
+		mi.material_override = m
 
 
 func _update_status(msg: Dictionary) -> void:

@@ -2,16 +2,20 @@
 #   python -m sim.runner scenarios/two_cars_yield.yaml        (mj_ros. --godot로 화면)
 # 로봇은 3초에 출발해 약 10.8 ~ 23.5초에 car_b의 진로 (옆 ±1.8 m)에 있다. car_b는 로봇이 앞 9 m 안에 들어오면 (약 12초) 제동하고 기다렸다가,
 # 로봇이 진로를 벗어나면 다시 출발한다. car_a는 로봇이 진로에 들어오기 전에 지나가 양보하지 않는다. 차와 로봇 사이에 물리 작용은 없다.
+# 로봇은 자국을 넘은 뒤 계속 걸어 x 10.6 ~ 14.5 m의 울퉁불퉁한 노면 (요철 ±1.5 cm + 6 cm 오르막)을 지나 43초에 x 약 14 m에서 선다.
 name: two_cars_yield
-duration: 34.0
+duration: 46.0
 seed: 2
 terrain:
-  size: [10.0, 10.0]
+  size: [16.0, 34.0]          # 반폭 (m): x ±16, y ±34. 차 길과 차 SCM (x -3.7 ~ 10.4, y -32 ~ 32)을 다 덮는다
+  window: [4.0, 4.0]          # 로봇 물리 (MuJoCo)에는 로봇 둘레 창만 올린다 (README "넓은 지형")
   resolution: 0.05
   z_range: [-0.3, 0.4]
   patches:
-    # 차 SCM이 덮는 영역 (car_a x -3 ~ 9 m, car_b x -3.7 ~ 10 m: 길에서 margin)은 평평해야 하므로 요철은 그 밖 (로봇 뒤)에만 둔다
-    - {kind: rough, amplitude: 0.012, region: [-9.5, -4.0, -5.0, 3.0]}
+    # 울퉁불퉁한 노면은 차 SCM 영역 (car_a x -3 ~ 9, car_b x -3.7 ~ 10.4: 지도 높이가 정확히 0이어야 한다) 밖, 로봇 진로 위에 둔다.
+    # 둔덕 (bump)은 가우스라 영역 밖에도 아주 작은 값이 남아 차가 시작하지 않으므로 쓰지 않는다
+    - {kind: rough, amplitude: 0.015, region: [10.6, -3.0, 14.5, 3.0]}
+    - {kind: ramp, region: [12.5, -3.0, 14.5, 3.0], rise: 0.06}
 controller:
   type: trot
   period: 0.36
@@ -21,7 +25,7 @@ controller:
     sensor: front_lidar
 events:
   - {t: 3.0, action: set_command, vx: 0.35, yaw_rate: 0.0}    # 차가 지나가는 동안 출발
-  - {t: 24.0, action: set_command, vx: 0.0, yaw_rate: 0.0}    # x 약 7 m에서 선다 (계속 걸으면 32초쯤 지도 끝 x 10 m에서 떨어진다)
+  - {t: 43.0, action: set_command, vx: 0.0, yaw_rate: 0.0}    # 울퉁불퉁한 노면을 지나 x 약 14 m에서 선다 (지도 끝은 x 16 m)
 vehicles:
   soil: {bekker_kphi: 5.0e6}       # 단단한 흙 (무른 흙: 1.0e6)
   hz: 100

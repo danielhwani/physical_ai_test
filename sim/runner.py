@@ -854,6 +854,10 @@ def run(args):
         "late_control_steps": late if (args.realtime or viewer) else None,
         "max_lag_s": round(max_lag, 4) if (args.realtime or viewer) else None,
     }
+    guard = getattr(sim.controller, "guard", None) if sim.remote is None else None
+    if guard is not None:                     # 차 감시 (로봇 쪽): 선 횟수, 기다린 시간, 서고 다시 걸은 시각 (점 수)
+        mop["guard_holds"], mop["guard_hold_s"] = guard.holds, round(guard.hold_s, 2)
+        mop["guard_events"] = guard.events
     if fleet is not None:                     # 차 프로세스를 끝내고 (마지막 자국과 궤적 끝을 보낸다) 결과를 MOP에
         mop["vehicles"] = fleet.close()
     audit = None

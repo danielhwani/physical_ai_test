@@ -46,6 +46,8 @@ PORT = 4243
 TERRAIN_HALF = 6.0          # 표시 창 반폭 (m). RViz 어댑터와 같다
 WINDOW_TRIGGER = 2.0
 MAX_CELLS = 100_000         # 표시 셀 수 상한 (넘으면 성기게)
+FAR_MAX_CELLS = 40_000      # 먼 땅 (세계 지도 전체를 굵게, 가까운 창 아래에 깐다) 셀 수 상한
+FAR_HZ = 1.0                # 먼 땅은 1초에 한 번까지만 다시 보낸다
 TERRAIN_RGB = np.array([0.55, 0.50, 0.42])
 SHADE_M = 0.08
 POSE_HZ, TERRAIN_HZ, POINTS_HZ = 30.0, 4.0, 10.0
@@ -167,6 +169,7 @@ class GodotBridge(Node):
         self.pending, self.pending_overlay = [], []
         self.poses, self.status = {}, None
         self.terrain_dirty = self.poses_dirty = self.status_dirty = False
+        self.far_dirty = False
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server.bind(("127.0.0.1", port))     # 같은 PC의 Godot만
@@ -326,20 +329,44 @@ class GodotBridge(Node):
 
     def terrain_msg(self):
         """표시 창 높이 격자와 꼭짓점 색 (RViz 어댑터와 같은 규칙: 흙 지역 색, 높이에 따른 명암)."""
-        w, g = self.window, self.grid
+        w = self.window
         k = 1
         while (w.wncol // k) * (w.wnrow // k) > MAX_CELLS:
             k += 1
-        rows = np.arange(w.r0, w.r0 + w.wnrow, k)
-        cols = np.arange(w.c0, w.c0 + w.wncol, k)
+        return self._layer_msg("near", np.arange(w.r0, w.r0 + w.wnrow, k), np.arange(w.c0, w.c0 + w.wncol, k))
+
+    def has_far(self):
+        """세계 지도가 가까운 창보다 크면 먼 땅을 따로 그린다."""
+        w, g = self.window, self.grid
+        return w is not None and (w.wnrow < g.nrow or w.wncol < g.ncol)
+
+    def terrain_far_msg(self):
+        """먼 땅: 세계 지도 전체를 굵은 칸으로. 칸 묶음 k는 가까운 창 이동 단위 (snap)를 나누어떨어지게 골라, 먼 땅 꼭짓점이
+        가까운 창 경계에 정확히 놓이게 한다. 가까운 창 안의 칸은 구멍 (hole: 먼 땅 꼭짓점 행 [i0, i1], 열 [j0, j1] 사이 칸)으로 알려
+        Godot가 삼각형을 만들지 않는다. 높이는 실제 값 그대로라 경계 꼭짓점의 법선 (밝기)이 가까운 땅과 이어진다.
+        (처음에는 창 안쪽 꼭짓점을 1 m 내려 숨겼는데, 경계 꼭짓점 법선이 그 1 m를 보고 기울어 경계 밖에 밝기가 다른 띠가 생겼다.)"""
+        w, g = self.window, self.grid
+        unit = max(1, int(round(w.snap / w.res)))                  # 창이 움직이는 칸 수 (1 m = 20칸)
+        ks = [d for d in range(1, unit + 1) if unit % d == 0] + [unit * m for m in range(2, 50)]
+        k = next((d for d in ks if ((g.nrow - 1) // d + 1) * ((g.ncol - 1) // d + 1) <= FAR_MAX_CELLS), ks[-1])
+        rows, cols = np.arange(0, g.nrow, k), np.arange(0, g.ncol, k)
+        msg = self._layer_msg("far", rows, cols)
+        i0, i1 = np.searchsorted(rows, w.r0), np.searchsorted(rows, w.r0 + w.wnrow - 1)
+        j0, j1 = np.searchsorted(cols, w.c0), np.searchsorted(cols, w.c0 + w.wncol - 1)
+        msg["hole"] = [int(i0), int(i1), int(j0), int(j1)]        # 칸 (i, j)는 i0 <= i < i1, j0 <= j < j1이면 그리지 않는다
+        return msg
+
+    def _layer_msg(self, layer, rows, cols):
+        g, res = self.grid, self.window.res
         H = (g.heights - self.overlay.heights)[np.ix_(rows, cols)].astype(np.float32)
-        X, Y = np.meshgrid(-g.half_x + cols * w.res, -g.half_y + rows * w.res)
+        X, Y = np.meshgrid(-g.half_x + cols * res, -g.half_y + rows * res)
         base = np.broadcast_to(TERRAIN_RGB, X.shape + (3,)).copy()
         for rg in self.manifest.get("soil_regions", []):
             x0, y0, x1, y1 = rg["region"]
             base[(X >= x0) & (X <= x1) & (Y >= y0) & (Y <= y1)] = rg["rgba"][:3]
         rgb = np.clip(base * np.clip(1.0 + H[..., None] / SHADE_M, 0.3, 1.5), 0.0, 1.0)
-        return {"type": "terrain", "x0": float(X[0, 0]), "y0": float(Y[0, 0]), "dx": float(k * w.res), "dy": float(k * w.res),
+        k = (rows[1] - rows[0]) if len(rows) > 1 else 1
+        return {"type": "terrain", "layer": layer, "x0": float(X[0, 0]), "y0": float(Y[0, 0]), "dx": float(k * res), "dy": float(k * res),
                 "nrow": int(len(rows)), "ncol": int(len(cols)), "h": b64(H), "rgb": b64(rgb)}
 
     def accept(self):
@@ -354,6 +381,7 @@ class GodotBridge(Node):
         self.get_logger().info("Godot 접속")
         self.send_scene()                                  # 늦게 붙어도 지금 장면 전체
         self.terrain_dirty = self.poses_dirty = self.status_dirty = True
+        self.far_dirty = True
 
     def waiting_lines(self):
         """장면 매니페스트가 안 올 때 Godot 정보판 문구 (ASCII만: 한글은 Godot을 멈춘다). 시뮬레이터가 ROS2 스트림을 내지 않으면 빈 화면이다."""
@@ -362,7 +390,7 @@ class GodotBridge(Node):
                 "start the simulator with --ros2 (or --rviz / --godot)", f"same ROS_DOMAIN_ID on both sides: here {dom}"]
 
     def run(self):
-        next_pose = next_terrain = next_points = next_find = next_markers = 0.0
+        next_pose = next_terrain = next_far = next_points = next_find = next_markers = 0.0
         t_start, next_wait, warned = time.monotonic(), 0.0, False
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.005)
@@ -394,6 +422,11 @@ class GodotBridge(Node):
             if self.terrain_dirty and self.window is not None and self.source is not None and now >= next_terrain:
                 self.send(self.terrain_msg())
                 self.terrain_dirty, next_terrain = False, now + 1.0 / TERRAIN_HZ
+                self.far_dirty = True
+            if self.far_dirty and self.window is not None and self.source is not None and now >= next_far:
+                if self.has_far():
+                    self.send(self.terrain_far_msg())
+                self.far_dirty, next_far = False, now + 1.0 / FAR_HZ
             if self.clouds and now >= next_points:
                 self.send_clouds()
                 next_points = now + 1.0 / POINTS_HZ

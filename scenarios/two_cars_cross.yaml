@@ -1,0 +1,45 @@
+# 로봇이 요철을 걷고, 차 두 대가 지나가기를 LiDAR로 스스로 보고 기다렸다가 그 길 (두 차의 자국)을 가로질러 건넌다:
+#   python -m sim.runner scenarios/two_cars_cross.yaml        (mj_ros. --godot로 화면)
+# 로봇은 1초에 출발해 요철 (x 0.4 ~ 2.2 m)을 걷는다. 차 감시 (controller.perception.vehicle_guard, control/vehicle_guard.py)는
+# 앞 0.3 ~ 8.5 m, 좌우 ±15 m 안에 땅에서 약 0.4 m 넘는 점이 보이면 서고, 2초 안 보이면 다시 걷는다 (로봇이 아는 LiDAR와 추정 자세만 쓴다).
+# car_a (x 9 m 직선)와 12 m 뒤의 car_b (10° 기울어져 (9, -18)에서 교차)가 16초에 로봇의 감시 범위 밖 (y -20, -32 m)에서 출발한다.
+# 로봇은 요철을 지나 길 가까이 (x 약 6 m, car_a 길에서 3 m) 왔을 때 car_a가 감시 범위에 들어와 (약 18초) 서고,
+# car_b까지 감시 범위를 벗어나면 다시 걸어 자국 네 줄 (y = 0에서 x 약 8.2, 9.8, 11.4, 13.0 m,
+# 1.6 m 간격)을 건넌다. 교차점을 y = -8에 두면 y = 0에서 두 차의 자국이 붙어 폭 50 cm 자국이 되고, 로봇이 거기서 넘어진 적이 있다.
+# 로봇은 차가 처음 보이는 자리에 선다 (길을 모른다). 차가 일찍 오면 멀리서 선다 (8초 출발이면 x 2.9 m, 길에서 6 m).
+# car_a 길에서 3 m는 차의 양보 영역 (±1.8 m) 밖이다 (차와 로봇이 서로 기다리지 않는다). 차와 로봇 사이에 물리 작용은 없다.
+name: two_cars_cross
+duration: 80.0
+seed: 2
+terrain:
+  size: [20.0, 38.0]          # 반폭 (m): x ±20, y ±38. 차 길과 차 SCM (car_a x 3 ~ 15, y -26 ~ 32. car_b x 3.0 ~ 19.2, y -35.5 ~ 23.5)을 다 덮는다
+  window: [4.0, 4.0]          # 로봇 물리 (MuJoCo)에는 로봇 둘레 창만 올린다
+  resolution: 0.05
+  z_range: [-0.3, 0.4]
+  patches:
+    # 요철은 차 SCM 영역 (지도 높이가 정확히 0이어야 한다) 밖, 로봇이 처음 걷는 곳에 둔다
+    - {kind: rough, amplitude: 0.015, region: [0.4, -2.0, 2.2, 2.0]}
+controller:
+  type: trot
+  period: 0.36
+  swing_height: 0.08
+  stand_height: 0.27
+  perception:
+    sensor: front_lidar
+    vehicle_guard: {ahead: 8.5, side: 15.0, clear_s: 2.0}   # 차 감시 (높이 0.15 m, 점 10개는 control/vehicle_guard.py 기본값). 2초 안 보이면 다시 걷는다
+events:
+  - {t: 1.0, action: set_command, vx: 0.35, yaw_rate: 0.0}    # 요철부터 걷는다. 차가 보이면 차 감시가 세운다
+  # 서서 기다리는 동안 (약 18 ~ 35초) 운용자 명령을 느린 걸음으로 바꾼다: 차 감시가 끝나면 0.25 m/s로 자국을 건넌다.
+  # 5.0e6 흙 (자국 5 ~ 6 cm)에서 0.35 m/s는 7번 중 3번, 0.25 m/s는 5번 중 1번 넘어졌다. 1.0e7 흙 (약 3 cm) + 0.25 m/s는 5번 모두 건넜다 (README)
+  - {t: 30.0, action: set_command, vx: 0.25, yaw_rate: 0.0}
+  - {t: 77.0, action: set_command, vx: 0.0, yaw_rate: 0.0}    # 자국을 건너 선다
+vehicles:
+  soil: {bekker_kphi: 1.0e7}       # 다른 차 시나리오 (5.0e6)보다 2배 단단한 흙: 자국 약 3 cm (5.0e6은 5 ~ 6 cm라 로봇이 가끔 넘어졌다)
+  hz: 100
+  delay: 0.2
+  yield_to_robot: true            # 안전장치 (로봇이 차 길 가까이 서지 않으므로 이 시나리오에서는 걸리지 않아야 한다)
+  cars:
+    # 출발과 끝은 로봇의 좌우 ±15 m 감시 범위 밖 (서 있는 차가 보이면 로봇이 계속 기다린다)
+    - {name: car_a, start: [9.0, -20.0], end: [9.0, 26.0], speed: 3.0, t_start: 16.0}
+    # 10° 기울어진 길 (x = 9 + (y + 18) tan 10°): y = 0에서 car_a보다 3.2 m 오른쪽 (트랙 폭 1.6 m의 두 배라 자국이 1.6 m 간격으로 고르게 놓인다)
+    - {name: car_b, start: [6.531, -32.0], end: [15.700, 20.0], speed: 3.0, t_start: 16.0, margin: 3.5}

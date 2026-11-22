@@ -6,7 +6,8 @@ name: two_cars_walk
 duration: 24.0
 seed: 2
 terrain:
-  size: [10.0, 10.0]
+  size: [16.0, 34.0]          # 반폭 (m): x ±16, y ±34. 차 길과 차 SCM (x -3.7 ~ 10.4, y -32 ~ 32)을 다 덮는다
+  window: [4.0, 4.0]          # 로봇 물리 (MuJoCo)에는 로봇 둘레 창만 올린다 (README "넓은 지형")
   resolution: 0.05
   z_range: [-0.3, 0.4]
   patches:

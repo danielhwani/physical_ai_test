@@ -222,6 +222,50 @@ def test_godot_bridge_messages():
         rclpy.shutdown()
 
 
+def test_godot_bridge_far_terrain():
+    """Godot 중계기 먼 땅 (세계 지도가 가까운 창보다 클 때): 세계 지도 전체를 굵은 칸 (가까운 창 이동 단위를 나누는 묶음)으로,
+    꼭짓점이 가까운 창 경계에 정확히 놓이고 그 높이가 가까운 땅과 같으며, 창 안의 칸은 구멍 (hole)으로 알려 그리지 않는다
+    (높이는 실제 값 그대로: 경계 꼭짓점 법선이 가까운 땅과 이어진다)."""
+    import base64
+    import rclpy
+    from sim.stream import TerrainPatchStream
+    from std_msgs.msg import String
+    from viz.godot_bridge import FAR_MAX_CELLS, GodotBridge
+    scn = yaml.safe_load((ROOT / "scenarios/two_cars_map.yaml").read_text())
+    scn.pop("vehicles")
+    sim = Simulation(scn)
+    sim.terrain.applied[700, 330] -= 0.05                          # 가까운 창 경계 위 꼭짓점 하나 (자국 흉내)
+    rclpy.init()
+    try:
+        br = GodotBridge(0)
+        br.on_manifest(String(data=json.dumps(build_manifest(sim.model, sim.terrain))))
+        br.on_patch(String(data=json.dumps(TerrainPatchStream(sim.terrain).full())))
+        assert br.has_far()
+        dec = lambda m, k: np.frombuffer(base64.b64decode(m[k]), "<f4")          # noqa: E731
+        near, far = br.terrain_msg(), br.terrain_far_msg()
+        assert near["layer"] == "near" and far["layer"] == "far" and far["nrow"] * far["ncol"] <= FAR_MAX_CELLS
+        k = int(round(far["dx"] / near["dx"]))
+        assert 20 % k == 0, k                                       # 창 이동 단위 (1 m = 20칸)를 나눈다
+        Hn = dec(near, "h").reshape(near["nrow"], near["ncol"])
+        Hf = dec(far, "h").reshape(far["nrow"], far["ncol"])
+        xf, yf = far["x0"] + np.arange(far["ncol"]) * far["dx"], far["y0"] + np.arange(far["nrow"]) * far["dy"]
+        xn, yn = near["x0"] + np.arange(near["ncol"]) * near["dx"], near["y0"] + np.arange(near["nrow"]) * near["dy"]
+        on_x = [int(np.argmin(np.abs(xf - x))) for x in (xn[0], xn[-1])]
+        on_y = [int(np.argmin(np.abs(yf - y))) for y in (yn[0], yn[-1])]
+        assert max(abs(xf[on_x[0]] - xn[0]), abs(xf[on_x[1]] - xn[-1]), abs(yf[on_y[0]] - yn[0]), abs(yf[on_y[1]] - yn[-1])) < 1e-6
+        G = sim.terrain.applied
+        rows = np.rint((yf + sim.terrain.half_y) / sim.terrain.res).astype(int)
+        cols = np.rint((xf + sim.terrain.half_x) / sim.terrain.res).astype(int)
+        truth = G[np.ix_(rows, cols)]
+        assert np.allclose(Hf, truth, atol=1e-6)                     # 높이는 어디서나 지형 그대로
+        assert far["hole"] == [on_y[0], on_y[1], on_x[0], on_x[1]], far["hole"]   # 가까운 창 경계 꼭짓점 사이 칸만 비운다
+        edge = Hf[on_y[0], on_x[0]:on_x[1] + 1]                     # 경계 꼭짓점 = 가까운 땅의 같은 자리
+        assert np.allclose(edge, Hn[0, ::k], atol=1e-6)
+        br.destroy_node()
+    finally:
+        rclpy.shutdown()
+
+
 def test_godot_bridge_points():
     """Godot 중계기 점군: 센서 좌표계 PointCloud2 + world -> 센서 TF를 월드 좌표로 바꾸고, 높이 색은 낮을수록 파랑."""
     import mujoco

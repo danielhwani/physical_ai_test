@@ -110,6 +110,9 @@ class Car:
         car.SetDriveType(veh.DrivelineTypeWV_AWD)
         car.SetTireType(veh.TireModelType_RIGID)
         car.SetTireStepSize(STEP)
+        # 브레이크 잠금: 기본 브레이크 (SIMPLE)는 선 바퀴를 붙잡지 못해, 1단 기어의 엔진 브레이크 토크 (약 -5 Nm)에 밀려 평지에서 30초에 6 m 뒤로 굴렀다.
+        # 흙 위에서는 떨며 수 cm 밀리고 자국을 1 cm 더 팠다 (README "제동한 차가 밀리는 원인"). 잠그면 바퀴가 거의 설 때 고정한다
+        car.EnableBrakeLocking(bool(cfg.get("brake_lock", True)))   # 시험 (conformance/probe_brake_creep.py)만 끈다
         car.Initialize()
         for part, vt in (("Chassis", chrono.VisualizationType_MESH), ("Suspension", chrono.VisualizationType_NONE),
                          ("Steering", chrono.VisualizationType_NONE), ("Wheel", chrono.VisualizationType_MESH),
@@ -368,7 +371,8 @@ def main():
         ok = (r >= 0) & (r < grid.nrow) & (c >= 0) & (c < grid.ncol)
         r, c, h = r[ok], c[ok], np.clip(h[ok], m.local.z_min, m.local.z_max)
         if r.size:
-            cur = m.local.compose(0, grid.nrow, 0, grid.ncol)[r, c]
+            r0, c0 = int(r.min()), int(c.min())                  # 쓰는 칸을 감싸는 범위만 합성한다 (지도 전체는 87만 칸일 수 있다)
+            cur = m.local.compose(r0, int(r.max()) + 1, c0, int(c.max()) + 1)[r - r0, c - c0]
             low = h < cur - THRESH
             if low.any():
                 m.write_cells("dig", name, r[low], c[low], h[low], t=t)
@@ -440,4 +444,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    prof = os.environ.get("VEHICLE_PEER_PROFILE")        # 진단용: 이 폴더에 차마다 cProfile 결과 (<이름>.prof)
+    if prof:
+        import cProfile
+        name = json.loads(sys.argv[sys.argv.index("--config") + 1])["name"]
+        cProfile.run("main()", str(Path(prof) / f"{name}.prof"))
+    else:
+        main()

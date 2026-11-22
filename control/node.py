@@ -20,6 +20,7 @@ from .observation import height_scan_grid
 from .onnx_policy import OnnxPolicyController
 from .terrain_map import TerrainPerception
 from .trot import TrotController
+from .vehicle_guard import VehicleGuard
 
 # 일어서기: 보행을 멈추고 지금 관절 각도에서 서 있는 자세(기본 자세)까지 천천히 옮긴 뒤(관절 최대 RECOVER_RATE rad/s,
 # 최소 RECOVER_MIN_S) RECOVER_HOLD_S 동안 서 있다가 보행을 처음 위상부터 다시 시작한다. 관절이 따라오는 만큼만 진행한다
@@ -38,7 +39,7 @@ class ControllerNode:
     def __init__(self, spec, controller_cfg=None, policy=None, lidar_defs=None):
         """controller_cfg: 시나리오의 controller 절 (트롯). policy: 정책 카드 경로 (ONNX).
         lidar_defs: specs/go2_sensors.yaml의 lidars (장착 보정값). 트롯의 perception.sensor가 있을 때 필요."""
-        self.terrain, self.sensor = None, None
+        self.terrain, self.sensor, self.guard = None, None, None
         if policy:
             card = load_card(policy)
             self.iface = ControlInterface(spec, card)
@@ -54,6 +55,9 @@ class ControllerNode:
             pcfg = controller_cfg.get("perception")
             if pcfg:
                 self._make_terrain(spec, lidar_defs, pcfg["sensor"], pcfg.get("map"))
+                if pcfg.get("vehicle_guard"):    # 차 감시: 앞쪽 길 양옆에 키 큰 물체가 보이면 서서 기다린다 (control/vehicle_guard.py)
+                    tp = self.terrain
+                    self.guard = VehicleGuard(pcfg["vehicle_guard"], tp.R_mount, tp.p_mount, tp.body_box)
         self.clock = GaitClock(period or 1.0)
         self.estimator = LegOdometryEstimator(spec)
         self.delay_steps = spec["action"].get("delay_steps", 0)
@@ -90,6 +94,9 @@ class ControllerNode:
         self.last_q_des = None        # 지난 주기에 보낸 목표 관절 각도 (처짐 판단용)
         if self.terrain is not None:
             self.terrain.reset()
+        if self.guard is not None:
+            self.guard.reset()
+        self.op_cmd = (0.0, 0.0)      # 운용자 명령 (차 감시가 막으면 걸음 시계에는 속도 0을 넣는다)
         self.scan_buf, self.pose_hist = [], {}
 
     def perception_snapshot(self):
@@ -125,6 +132,8 @@ class ControllerNode:
             key = min(self.pose_hist, key=lambda k: abs(k - ts)) if self.pose_hist else None
             if key is not None and abs(key - ts) < 0.5 * dt:
                 self.terrain.add_scan(pts, *self.pose_hist[key])
+                if self.guard is not None:
+                    self.guard.add_scan(ts, pts, *self.pose_hist[key])
         for k in [k for k in self.pose_hist if k < t - 1.0]:          # 1초 넘은 자세 기록은 버린다
             del self.pose_hist[k]
 
@@ -159,6 +168,7 @@ class ControllerNode:
         return self.iface.action_from_targets(r["q0"] + u * (stand - r["q0"]))
 
     def set_command(self, vx, yaw_rate):
+        self.op_cmd = (vx, yaw_rate)
         self.clock.set_command(vx, yaw_rate)
 
     def step(self, ls):
@@ -171,6 +181,9 @@ class ControllerNode:
             # 지형 인지 보행의 지도·디딜 곳이 그만큼 어긋나 잘 걷지 못했다). 제자리에 있었다고 보고 속도 0에서 다시 시작
             self.estimator.restart_after_gap()
         self.last_t = t
+        if self.guard is not None:                 # 차가 보이면 서서 기다린다 (지난 주기까지 들어온 스캔으로 판단)
+            hold = self.guard.update(t, dt)
+            self.clock.set_command(0.0 if hold else self.op_cmd[0], self.op_cmd[1])
         if self.recovery is None:
             self.clock.update(dt)
         est = self.est = self.estimator.update(ls)
