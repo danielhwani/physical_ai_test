@@ -185,6 +185,25 @@ class Ros2StreamPublisher:
         self.pub_tf.publish(self._TF(transforms=[tf]))
         self.pub_scans[name].publish(msg)
 
+    # ---- 운용자 이동 명령 /cmd_vel (같은 프로세스 보행 알고리즘일 때, --cmd-vel) ----
+    def enable_cmd_vel(self):
+        """/cmd_vel (geometry_msgs/Twist: linear.x, angular.z)을 받아 쌓는다. 러너가 제어 주기마다 take_cmd_vel로 가져간다
+        (teleop_twist_keyboard 같은 원격 조종 도구). 보행 알고리즘을 별도 노드로 돌리면 그 노드가 /cmd_vel을 직접 받는다."""
+        from geometry_msgs.msg import Twist
+        self._rx = getattr(self, "_rx", 0)
+        self.cmd_vel_in = []
+
+        def on_cmd_vel(msg):
+            self.cmd_vel_in.append((float(msg.linear.x), float(msg.angular.z)))
+            self._rx += 1
+        self.node.create_subscription(Twist, "/cmd_vel", on_cmd_vel, 10)
+
+    def take_cmd_vel(self):
+        """쌓인 /cmd_vel 명령 [(vx, yaw_rate), ...] (받은 순서)."""
+        self.spin_some()
+        out, self.cmd_vel_in = self.cmd_vel_in, []
+        return out
+
     # ---- 로봇 경계 (보행 알고리즘을 별도 노드로 돌릴 때) ----
     def enable_robot_io(self):
         """로봇 경계 토픽. 형식은 control/robot_msgs.py (go2_rt_msgs 커스텀 메시지, 없으면 JSON. GO2_ROS_MSG / --ros-msg)."""

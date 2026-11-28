@@ -699,6 +699,10 @@ def run(args):
 
     interrupted = False
     next_robot_send = 0.0
+    cmd_vel_on = bool(getattr(args, "cmd_vel", False)) and bridge is not None
+    if cmd_vel_on:
+        bridge.enable_cmd_vel()
+        print("cmd_vel: ROS2 /cmd_vel (geometry_msgs/Twist)로 로봇을 조종한다. 예: ros2 run teleop_twist_keyboard teleop_twist_keyboard")
     frozen_since, next_frozen_status = None, 0.0
     try:
         while d.time < scn["duration"]:
@@ -741,11 +745,20 @@ def run(args):
                 if pause.step_requests:
                     pause.step_requests -= 1
 
+            if cmd_vel_on:                        # 원격 조종: 받은 /cmd_vel 중 마지막을 이번 주기부터 (바뀔 때만 이벤트로 기록 -> 재현 시나리오)
+                got = bridge.take_cmd_vel()
+                if got and tuple(got[-1]) != tuple(sim.command):
+                    sim.command = got[-1]
+                    sim.controller.set_command(*sim.command)
+                    sim.event_log.append({"t": round(d.time, 6), "action": "set_command", "vx": sim.command[0],
+                                          "yaw_rate": sim.command[1], "applied_t": d.time, "source": "cmd_vel"})
             terrain_changed, energy, roll, pitch = sim.step_control()
             energy_total += energy
             if fleet is not None and d.time >= next_robot_send:   # 차 양보 판단용 로봇 위치 (참값, 20 Hz)
                 fleet.send_robot(*d.qpos[:2])
                 next_robot_send = d.time + 0.05
+                for n in fleet.check_triggers(d.time, d.qpos[:2]):   # 조건 출발 (start_when): 로봇이 사각형에 들어왔다
+                    print(f"[t={d.time:6.2f}] vehicle start: {n} (로봇 {d.qpos[0]:.2f}, {d.qpos[1]:.2f})")
 
             if "t" in sim.low_cmd:                   # 실행한 명령이 몇 초 전 상태로 계산됐는가 (두 실행 방식 공통)
                 cmd_latency.append(sim.low_state["t"] - sim.low_cmd["t"])
@@ -957,6 +970,8 @@ def main():
                     help="RViz로 가시화 (--ros2, --realtime 자동 적용. conda 환경에서 바로 실행 가능)")
     ap.add_argument("--mjviz", action="store_true",
                     help="MuJoCo 렌더러 어댑터로 가시화 (중립 스트림만 사용. HMMWV 등 다른 물리엔진 바디도 표시)")
+    ap.add_argument("--cmd-vel", action="store_true",
+                    help="ROS2 /cmd_vel (geometry_msgs/Twist)로 로봇을 조종한다 (--ros2, --realtime 자동. 예: teleop_twist_keyboard). 받은 명령은 이벤트로 기록")
     ap.add_argument("--no-vehicles", action="store_true", help="시나리오의 차 (vehicles, 별도 Chrono 프로세스)를 빼고 돌린다 (CPU 여유가 없을 때)")
     ap.add_argument("--godot", action="store_true",
                     help="Godot 4 렌더러로 가시화 (viz/godot_bridge.py + godot/. --ros2, --realtime 자동)")
@@ -991,7 +1006,9 @@ def main():
         args.godot = True
         if not args.sensor:
             args.sensor = ["front_lidar"]       # 시나리오에 센서가 이미 있으면 이름만 겹친다 (중복은 Simulation이 없앤다)
-    if args.rviz or args.mjviz or args.godot or args.sensor_node or args.controller_node:
+    if args.cmd_vel and args.controller_node:
+        raise SystemExit("--cmd-vel은 같은 프로세스 보행 알고리즘용이다. --controller-node면 보행 알고리즘 노드가 /cmd_vel을 직접 받는다")
+    if args.rviz or args.mjviz or args.godot or args.sensor_node or args.controller_node or args.cmd_vel:
         args.ros2 = args.realtime = True
     run(args)
 

@@ -3079,6 +3079,88 @@ python -m sim.rt_link scenarios/flat_trot.yaml --brain ros --remote-brain --ros-
       `two_cars_cross`는 로봇이 기다리지 않고 계속 걸어 77초 전에 지도 끝 (x 20 m)에서 떨어진다.
     - 확인: `python -m sim.runner scenarios/two_cars_cross.yaml` (약 90초, `--godot`로 화면). MOP의 `guard_events`가 `[(18.04, 'hold', 13), (34.6, 'go', 0)]`처럼 한 번 서고 한 번 걸으면 된다.
       흙 1e7 + 느린 걸음으로 5번 모두 건넜다 (위 6).
+  - **사람이 로봇을 몰고, 로봇이 닿으면 차가 지나가기** (2026-11-28, `--cmd-vel`, `start_when`, `scenarios/two_cars_teleop.yaml`):
+    ```
+    # 터미널 1 (mj_ros, ROS_DOMAIN_ID 같게)
+    python -m sim.runner scenarios/two_cars_teleop.yaml --cmd-vel --godot
+    # 터미널 2: 키보드 원격 조종 (i 앞, , 뒤, j/l 돌기, k 멈춤, q/z 빠르게/느리게). 자국을 건널 때는 0.25 m/s 정도로
+    ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -p speed:=0.25 -p turn:=0.5
+    ```
+    - **`--cmd-vel`**: 러너가 ROS2 `/cmd_vel` (`geometry_msgs/Twist`, linear.x, angular.z)을 받아 같은 프로세스 보행 알고리즘에 넣는다 (`--ros2`, `--realtime` 자동).
+      제어 주기마다 받은 것 중 마지막을 쓰고, 값이 바뀔 때만 `set_command` 이벤트 (`source: cmd_vel`)로 기록해 실행 폴더의 `scenario_replay.yaml`로 다시 돌릴 수 있다 (차는 실시간이라 같지 않다).
+      보행 알고리즘을 별도 노드로 돌리면 (`--controller-node`) 그 노드가 `/cmd_vel`을 직접 받으므로 함께 쓰지 않는다. 보행기 속도 상한은 앞뒤 1.0 m/s, 회전 1.5 rad/s.
+      `teleop_twist_keyboard` 기본 속도는 0.5 m/s라 `speed:=0.25`로 시작하길 권한다 (아래 결과).
+    - **`/cmd_vel` 처리 구조** (`--cmd-vel`, 같은 프로세스 보행 알고리즘):
+      ```
+      [터미널 2] teleop_twist_keyboard
+         │ 키를 누를 때마다 /cmd_vel (geometry_msgs/Twist) 발행. ROS_DOMAIN_ID 같게, DDS
+         ▼
+      [러너 sim.runner, 50 Hz 제어 반복 (20 ms)]
+       ① ROS2 노드 "mujoco_sim"의 /cmd_vel 구독 (sim/ros2_bridge.py enable_cmd_vel)
+            콜백이 받은 메시지를 목록에 쌓는다 (linear.x, angular.z만. linear.y 등은 버림)
+       ② 제어 주기마다 take_cmd_vel(): spin_some으로 쌓인 메시지를 처리하고 가져온다
+            그중 마지막 것만 쓴다. 이전 명령과 다르면 sim.command = (vx, wz), 보행 알고리즘에 set_command,
+            이벤트 기록 {t, set_command, vx, yaw_rate, source: cmd_vel} -> scenario_replay.yaml
+       ③ step_control() -> 보행 알고리즘 ControllerNode.step (control/node.py)
+            a. 운용자 명령은 op_cmd로 기억
+            b. 차 감시 (vehicle_guard): 차가 보이면 걸음 시계에 속도 0, 아니면 op_cmd
+            c. 걸음 시계 (control/clock.py): 가속 제한 0.5 /s² -> 명령이 서서히 바뀐다 (cmd_f)
+            d. 트롯 보행기 (control/trot.py): cmd_f + 방향 유지 + 속도 되먹임, 상한 1.0 m/s, 1.5 rad/s
+               -> 보폭, 디딜 곳 (LiDAR 지형 지도), 다리 궤적 -> 관절 목표
+       ④ 연결 지연 (시나리오 설정만큼 주기를 늦춰 실행, ROS 배치와 같게) -> 모터 (PD, 토크 한계)
+       ⑤ MuJoCo 물리 (2 ms x 10) -> 같은 주기에 드론 갱신 (참값), 차에 로봇 위치 (20 Hz), 렌더 스트림 /tf
+      ```
+      - 받기는 별도 스레드 없이 ②에서 노드를 돌릴 때만 처리한다: 명령은 늘 제어 주기 경계에서 들어가고 물리 계산 도중에 끼어들지 않는다.
+      - 한 주기에 여럿 오면 마지막 것만 쓴다. 키보드 도구는 키를 누를 때만 보내므로 키를 떼도 마지막 명령이 유지된다 (멈추려면 k로 0을 보낸다).
+      - 명령이 바뀔 때만 기록한다 (같은 값이 계속 와도 하나). 차 감시는 운용자 명령보다 먼저다 (차가 보이면 i를 눌러도 선다).
+      - 가속 제한 때문에 0에서 0.2 m/s까지 약 0.4초에 걸쳐 오른다. 키를 누른 뒤 움직이기까지 DDS 전달 (수 ms) + 다음 주기까지 최대 20 ms + 연결 지연 + 가속 제한으로,
+        체감 약 0.1 ~ 0.5초.
+    - **`--cmd-vel`과 `--controller-node`의 차이**: 둘 다 `/cmd_vel`로 몰 수 있다. 차이는 보행 알고리즘이 어디서 도느냐와 그에 따라 명령을 누가 받느냐다.
+      ```
+      --cmd-vel (같은 프로세스)
+        teleop ─/cmd_vel→ [러너: 받기 -> 보행 알고리즘 -> 물리]            한 프로세스
+
+      --controller-node (별도 노드)
+        teleop ─/cmd_vel──────────────→ [보행 알고리즘 노드 control/ros_node.py]
+                                             ↑ /robot/low_state   │ /robot/low_cmd
+        [러너: 물리, 로봇 센서] ──────────────┘                      ↓
+                ↑──────────────────────────────────────────────────┘
+                (LiDAR 점군은 ROS 토픽으로, 시나리오 명령은 /cmd_vel_stamped로)
+      ```
+
+      | | `--cmd-vel` | `--controller-node` |
+      |---|---|---|
+      | 보행 알고리즘 위치 | 러너 안 (같은 프로세스) | 별도 ROS2 노드 (다른 프로세스, 다른 PC도 가능) |
+      | `/cmd_vel`을 받는 쪽 | 러너가 받아 넘김 | 보행 알고리즘 노드가 직접 |
+      | 명령이 들어가는 때 | 다음 제어 주기 경계 (최대 20 ms 뒤) | 노드가 받는 즉시 (다음 로봇 상태 처리 때) |
+      | 로봇 상태와 관절 명령 | 함수 호출 (메시지 없음) | ROS2 토픽 `/robot/low_state`, `/robot/low_cmd` (실제 로봇과 같은 경계) |
+      | 통신 늦음 | 시나리오에 정한 연결 지연을 흉내 | 실제 ROS2 전달 늦음 (실행마다 조금씩 다름) |
+      | LiDAR | 같은 프로세스로 점을 건넴 | ROS2 점군 토픽 |
+      | 시나리오 명령 이벤트 | 함수 호출로 바로 | 러너가 시각을 붙인 `/cmd_vel_stamped` (그 시각부터 적용) |
+      | `/cmd_vel` 기록 (재현) | 됨 (`scenario_replay.yaml`) | 안 됨 (러너는 노드가 받은 `/cmd_vel`을 모른다) |
+      | 차 감시 결과 (MOP `guard_*`) | 나옴 | 감시는 노드 안에서 동작하지만 MOP에 안 나옴 |
+      | 결정성 | 같은 입력이면 같은 결과 (차가 없을 때) | 메시지 도착 시각에 따라 조금씩 다름 |
+      | CPU | 프로세스 하나 | 프로세스 하나 더 + 메시지 변환 |
+      | 쓰임 | 시험, 조종, 재현 | 실제 로봇 배치 흉내, 알고리즘을 다른 PC나 다른 구현으로 바꿔 끼우기 |
+
+      로봇을 몰아 보며 시나리오를 시험할 때는 `--cmd-vel` (가볍고 조종 기록이 남는다), 보행 알고리즘을 실제 로봇과 같은 경계로 떼어 시험할 때는 `--controller-node`.
+      `--controller-node`는 차 프로세스 (`vehicles`)와 함께 돌려 본 적이 없고 CPU를 더 써서 이 PC에서는 `--no-vehicles`가 필요할 수 있다. 둘을 함께 켜면 러너가 시작할 때 막는다.
+    - **넘어짐** (사람이 몬 두 번, 2026-11-28): 둘 다 0.25 m/s였고 car_a 바퀴 자국 (깊이 약 3 cm)에서 뒷다리가 걸려 앞으로 못 가고 버티다 뒤로 넘어졌다
+      (x 8.3 m, y +0.5 m / x 9.9 m, y −2.4 m). 자동 시험 (y = 0 직진 0.25 m/s)은 건넜다. 사람이 몰면 자국에 닿는 자리, 각도, 순간이 매번 달라 약점이 드러난다.
+      속도를 줄이는 것 (`speed:=0.2 turn:=0.3`)은 조금 나을 수 있지만 보장하지 않는다. 요령: 자국과 직각으로 곧게 들어가고, 자국 위에서 멈췄다 출발하지 않는다.
+      남은 것: 보행기가 자국을 넘게 고치기 ("깊은 자국 넘기"와 같은 일), 또는 조종 시나리오의 자국을 더 얕게 / 조종 속도 상한.
+    - **조건 출발** (`vehicles.cars[].start_when: {robot_in: [x0, y0, x1, y1], delay: 초}`): 차는 제동하고 기다리다가, 로봇 몸통 (참값)이 사각형 안에 들어오면 delay초 뒤 출발한다.
+      러너가 20 Hz로 조건을 보고 차 프로세스 표준 입력에 `START`를 준다 (`t_start`는 쓰지 않는다). 차 결과에 `started_s` (출발 시각, 조건이 안 맞았으면 None).
+    - **시나리오** `two_cars_teleop`: `two_cars_cross`와 같은 지형, 차 길, 드론, 차 감시. 로봇 명령 이벤트는 없고 (사람이 몬다), 차 두 대는 로봇이 x 4 ~ 7 m, y −3 ~ 3 m
+      (car_a 길에서 2 ~ 5 m 앞)에 들어오면 출발한다. 차 감시는 차가 지나가는 동안 운용자 명령과 상관없이 로봇을 세운다. 사람이 로봇을 차 길 가까이 몰면 차가 양보한다. 20분.
+    - **확인** (`ros2 topic pub -r 5 /cmd_vel ...`로 사람 대신 계속 앞으로):
+
+      | 명령 | 차 출발 | 차 감시 | 결과 |
+      |---|---|---|---|
+      | 0.35 m/s | 12.0초 (로봇 x 4.01 m) | 13.9 ~ 30.1초 섬 | 첫 자국 근처 (x 8.4 m)에서 넘어짐 |
+      | **0.25 m/s** | 16.9초 (로봇 x 4.00 m) | 18.9 ~ 34.6초 섬 | 자국 네 줄을 건너 17.0 m, 넘어지지 않음 |
+
+      `/cmd_vel` 명령은 0.02초에 들어가 재현 시나리오에 기록됐다. 차 늦음 0.29 ~ 0.44초, 지도 대조 0. 로봇을 계속 앞으로 몰면 지도 끝 (x 20 m)에서 떨어진다 (사람이 세운다).
   - **넓은 지면과 화면 LOD** (2026-11-22): 처음 지면은 20 m × 20 m (x, y ±10 m)라 차가 지도 밖 (y −26 ~ 26 m)에서 출발하고 끝났고, Godot는 로봇 둘레 12 m × 12 m만 그렸다.
     - `two_cars_*` 세 시나리오의 세계 지도를 x ±16 m, y ±34 m (5 cm 칸 641 × 1361 = 약 87만 칸)로 넓혀 차 길과 차 SCM을 다 덮었다.
       로봇 물리 (MuJoCo)에는 로봇 둘레 창 (`terrain.window: [4, 4]`)만 올린다. 로봇 결과는 그대로다 (`two_cars_map` 5.60 m, `two_cars_walk` 7.14 m, `two_cars_yield` 7.28 m, 양보 9.05초).

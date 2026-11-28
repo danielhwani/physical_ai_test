@@ -14,6 +14,7 @@
   [{"name": "<차 이름>_<바디>", "visuals": [{mesh, pos, quat, rgba}]}]. 러너가 "GO <epoch>" 한 줄을 주면 epoch (time.time)를 시각 0으로 달린다.
   달리는 동안 "POSE <JSON>" 줄을 50 Hz로: [t, [[x, y, z, qx, qy, qz, qw], ...]] (READY의 바디 순서, 외형 기준 프레임). 러너가 렌더러 TF로 보낸다.
   러너는 달리는 동안 로봇 몸통 위치를 "ROBOT <x> <y>" 줄로 20 Hz로 준다 (양보 판단용, 시뮬레이터 참값). 차는 50 ms마다 표준 입력을 비운다.
+  t_start가 null이면 "START" 줄을 받을 때까지 제동하고 기다리다 출발한다 (러너가 시나리오의 start_when 조건을 보고 준다).
   표준 입력이 닫히면 (러너가 끝남) 마지막 자국과 궤적 끝을 보내고 결과를 out에 쓰고 끝낸다. 진행 기록은 표준 오류로.
 
 config (JSON):
@@ -100,7 +101,9 @@ class Car:
         (x0, y0), (x1, y1) = cfg["start"], cfg["end"]
         self.start, self.length = (x0, y0), math.hypot(x1 - x0, y1 - y0)
         self.dir = ((x1 - x0) / self.length, (y1 - y0) / self.length)
-        self.speed, self.t_start = float(cfg["speed"]), float(cfg.get("t_start", 0.0))
+        self.speed = float(cfg["speed"])
+        t0 = cfg.get("t_start", 0.0)
+        self.t_start = float("inf") if t0 is None else float(t0)   # None: 러너가 "START"를 줄 때까지 제동하고 기다린다 (start_when)
         car = veh.HMMWV_Full(s)
         car.SetContactMethod(chrono.ChContactMethod_SMC)
         car.SetChassisFixed(False)
@@ -423,6 +426,9 @@ def main():
                 f = ln.split()
                 if f[0] == "ROBOT":
                     car.robot_xy = (float(f[1]), float(f[2]))
+                elif f[0] == "START":                      # 출발 조건 (start_when)이 맞았다: 지금 출발
+                    car.t_start = min(car.t_start, t)
+                    log(f"{name}: 출발 신호 t {t:.2f} s")
             closed = inp.eof                               # 러너가 끝났다
             car.check_yield()
         k += 1

@@ -10,6 +10,8 @@
       yield_to_robot: true                # 차 앞 진로 (앞 9 m, 옆 ±1.8 m)에 로봇이 있으면 제동하고 기다린다 (yield_ahead, yield_half_width)
       cars:
         - {name: car_a, start: [3.0, -14.0], end: [3.0, 26.0], speed: 3.0, t_start: 0.0}
+        # 시각 대신 조건으로 출발: 로봇 몸통이 사각형 [x0, y0, x1, y1] 안에 들어오면 delay초 뒤 (t_start는 쓰지 않는다)
+        - {name: car_b, start: [3.0, -26.0], end: [3.0, 14.0], speed: 3.0, start_when: {robot_in: [4.0, -3.0, 7.0, 3.0], delay: 0.0}}
 
 로봇 시뮬레이터는 지도 높이만 받는다 (차와 물리 작용 없음). 맵 서버 (--map-server)와 실시간 (--realtime)이 필요해 러너가 켠다.
 차 프로세스는 시뮬레이션 시각 0을 러너와 같은 벽시계로 맞추고 실시간 1배로 달린다. 결과는 결정적이지 않다 (실시간).
@@ -47,11 +49,17 @@ class VehicleFleet:
         env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "AMENT_PREFIX_PATH", "LD_LIBRARY_PATH")}   # ROS2 환경의 경로가 chrono 파이썬에 섞이지 않게
         common = {k: cfg[k] for k in KEYS if k in cfg}
         self.procs, self.ready, self.bodies, self.poses = {}, {}, {}, {}
+        self.triggers, self.started = {}, {}     # 조건 출발: {이름: (사각형, 지연)}, 출발 신호를 준 시뮬레이션 시각
         self.lock = threading.Lock()
         for c in cars:
             n = c["name"]
-            conf = dict(common, **c, peers=[x for x in names if x != n], tcp=f"127.0.0.1:{port}", duration=duration,
+            if c.get("start_when"):
+                sw = c["start_when"]
+                self.triggers[n] = [list(map(float, sw["robot_in"])), float(sw.get("delay", 0.0)), None]
+            conf = dict(common, **{k: v for k, v in c.items() if k != "start_when"}, peers=[x for x in names if x != n], tcp=f"127.0.0.1:{port}", duration=duration,
                         grid={"half": [terrain.half_x, terrain.half_y], "res": terrain.res}, out=str(self.dir / f"{n}.json"))
+            if n in self.triggers:
+                conf["t_start"] = None
             self.procs[n] = subprocess.Popen([py, str(ROOT / "cosim/vehicle_peer.py"), "--config", json.dumps(conf)], cwd=ROOT, env=env,
                                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(self.dir / f"{n}.log", "w"),
                                              text=True, bufsize=1)
@@ -102,6 +110,26 @@ class VehicleFleet:
                 except (BrokenPipeError, OSError, ValueError):
                     pass
 
+    def check_triggers(self, t, robot_xy):
+        """조건 출발 (start_when): 로봇 몸통이 사각형 안에 들어오면 delay초 뒤 그 차에 START를 준다. 반환: 이번에 출발시킨 차 이름들."""
+        out = []
+        x, y = float(robot_xy[0]), float(robot_xy[1])
+        for n, tr in self.triggers.items():
+            if n in self.started:
+                continue
+            (x0, y0, x1, y1), delay, due = tr
+            if due is None and x0 <= x <= x1 and y0 <= y <= y1:
+                tr[2] = due = t + delay
+            if due is not None and t >= due and self.procs[n].poll() is None:
+                try:
+                    self.procs[n].stdin.write("START\n")
+                    self.procs[n].stdin.flush()
+                except (BrokenPipeError, OSError, ValueError):
+                    continue
+                self.started[n] = round(t, 2)
+                out.append(n)
+        return out
+
     def go(self, lead=1.0):
         """lead 초 뒤를 시뮬레이션 시각 0으로 알린다. 반환: 그 순간의 time.perf_counter (러너의 실시간 기준점)."""
         epoch = time.time() + lead
@@ -131,6 +159,8 @@ class VehicleFleet:
                 r = json.loads(f.read_text())
                 out[n] = {"sim_s": r["sim_s"], "max_lag_s": r["max_lag_s"], "state": r["state"], "along_m": r["along_m"],
                           "yields": r.get("yields", 0), "yield_s": r.get("yield_s", 0.0), "hash_mismatch": r["audit"].get("hash_mismatch")}
+                if n in self.triggers:
+                    out[n]["started_s"] = self.started.get(n)     # 조건 출발 시각 (None이면 조건이 맞지 않아 출발하지 않았다)
             else:
                 out[n] = {"error": f"결과 없음 (종료 코드 {p.returncode}, {self.dir / f'{n}.log'})"}
         return out
