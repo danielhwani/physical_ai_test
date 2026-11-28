@@ -18,6 +18,8 @@ const ORBIT_DEG_PER_PX := 0.3
 const ZOOM_STEP := 1.12              # 휠 한 칸에 거리 ×/÷
 const HINT := "drag: rotate   wheel: zoom   right/middle drag: pan   F: follow on/off   R: reset view"
 const L_HINT := "   L: points/footholds on/off"
+const V_HINT := "   V: drone view"
+const DRONE_BODY := "drone_body"     # 촬영 드론 (sim/drone.py). V로 드론 자리에서 로봇을 보는 시점
 
 var host := "127.0.0.1"
 var port := 4243
@@ -45,6 +47,8 @@ var cam_pitch := CAM_PITCH0
 var cam_dist := CAM_DIST0
 var cam_pan := Vector3.ZERO          # 오른쪽 끌기로 옮긴 만큼 (따라가는 점에서 떨어진 양)
 var cam_follow := true               # F: 몸통 따라가기 켜고 끄기
+var drone_view := false              # V: 드론 시점 (드론 자리에서 로봇 몸통을 본다)
+var has_points := false              # 점군이나 디딜 곳이 온 적 있음 (안내 문구)
 var follow_name := "base"            # 따라갈 바디: base(로봇 몸통), 없으면 장면의 첫 바디
 var label: Label
 var hint: Label
@@ -181,11 +185,22 @@ func _process(delta: float) -> void:
 	if cam_follow and bodies.has(follow_name):
 		var target: Vector3 = bodies[follow_name].global_position
 		cam_target = cam_target.lerp(target, clamp(delta * 4.0, 0.0, 1.0))
-	_place_camera()
+	if drone_view and bodies.has(DRONE_BODY):        # 드론 시점: 드론 자리에서 따라가는 바디를 본다 (마우스 조작은 쓰지 않는다)
+		cam.global_position = bodies[DRONE_BODY].global_position
+		var look: Vector3 = bodies[follow_name].global_position if bodies.has(follow_name) else Vector3.ZERO
+		if cam.global_position.distance_to(look) > 0.01:
+			cam.look_at(look)
+	else:
+		_place_camera()
 	if shot_path != "" and frames >= shot_frames:
 		get_viewport().get_texture().get_image().save_png(shot_path)
 		print("shot saved ", shot_path, " stats ", stats, " cam yaw %.1f pitch %.1f dist %.2f follow %s" % [cam_yaw, cam_pitch, cam_dist, cam_follow])
 		get_tree().quit()
+
+
+func _update_hint() -> void:
+	# 화면 문구는 ASCII만 (기본 글꼴)
+	hint.text = HINT + (L_HINT if has_points else "") + (V_HINT if bodies.has(DRONE_BODY) else "")
 
 
 func _place_camera() -> void:
@@ -223,6 +238,8 @@ func _unhandled_input(event: InputEvent) -> void:
 			cam_follow = true
 		elif key == KEY_F:
 			cam_follow = not cam_follow
+		elif key == KEY_V and bodies.has(DRONE_BODY):
+			drone_view = not drone_view
 		elif key == KEY_L:
 			clouds_visible = not clouds_visible
 			for mi in clouds.values():
@@ -275,8 +292,8 @@ func _update_footholds(msg: Dictionary) -> void:
 		lm.no_depth_test = true                  # 다리에 가려도 보이게
 		foothold_lines.material_override = lm
 		foothold_root.add_child(foothold_lines)
-		if not hint.text.ends_with(L_HINT):
-			hint.text = HINT + L_HINT
+		has_points = true
+		_update_hint()
 	var spheres: Array = msg["spheres"]
 	while foothold_spheres.size() < spheres.size():
 		var s := MeshInstance3D.new()
@@ -326,7 +343,8 @@ func _build_points(msg: Dictionary) -> void:
 		mi.visible = clouds_visible
 		world.add_child(mi)
 		clouds[name] = mi
-		hint.text = HINT + L_HINT
+		has_points = true
+		_update_hint()
 	var xyz := Marshalls.base64_to_raw(msg["xyz"]).to_float32_array()
 	var rgb := Marshalls.base64_to_raw(msg["rgb"]).to_float32_array()
 	var n: int = msg["n"]
@@ -358,6 +376,7 @@ func _build_scene(msg: Dictionary) -> void:
 		n.name = name
 		world.add_child(n)
 		bodies[name] = n
+	_update_hint()
 	for v in msg["visuals"]:
 		if not bodies.has(v["body"]):
 			continue

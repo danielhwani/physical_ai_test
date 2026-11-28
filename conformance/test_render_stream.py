@@ -276,6 +276,38 @@ def test_godot_bridge_far_terrain():
         rclpy.shutdown()
 
 
+def test_drone_follows_and_streams():
+    """촬영 드론 (sim/drone.py, 경로 계산형): 로봇 뒤 위쪽 목표로 수렴하고, 가속도 제한을 지키고, 가속 방향으로 기울며 (앞으로 가속하면
+    앞이 숙여진다), 렌더 스트림 장면 목록과 위치에 나온다 (다른 엔진 바디와 같은 모양)."""
+    from sim.drone import BODY, FollowDrone, RenderSources
+    from viz.stream_decode import quat_to_matrix
+    dr = FollowDrone({"offset": [-2.5, 0.0, 2.0], "max_speed": 3.0, "max_accel": 2.0, "start": [-2.5, 0.0, 2.3]})
+    dt = 0.02
+    robot = np.array([0.0, 0.0, 0.3])
+    tilt_fwd = None
+    prev_v = np.zeros(3)
+    for k in range(1000):                                     # 20초: 로봇이 +x로 0.5 m/s (2초 뒤 출발)
+        if k * dt > 2.0:
+            robot = robot + [0.5 * dt, 0.0, 0.0]
+        dr.update(dt, robot, 0.0)
+        assert np.linalg.norm(dr.vel - prev_v) <= 2.0 * dt + 1e-9   # 가속도 제한
+        prev_v = dr.vel.copy()
+        if tilt_fwd is None and dr.acc[0] > 0.5:               # 앞으로 가속하는 순간: 몸체 x축 (앞)이 아래를 본다
+            tilt_fwd = quat_to_matrix(dr.quat)[:, 0][2]
+    assert tilt_fwd is not None and tilt_fwd < -0.03, tilt_fwd
+    assert np.linalg.norm(dr.pos - dr.target(robot, 0.0)) < 0.4   # 0.5 m/s로 가는 로봇을 따라간다 (gain 1.5: 약 0.33 m 뒤처짐)
+    R = quat_to_matrix(dr.quat)
+    assert R[:, 0] @ [1.0, 0.0, 0.0] > 0.99                     # 머리는 로봇 쪽 (+x)
+    m = dr.mop()
+    assert m["drone_speed_max_mps"] <= 3.0 and m["drone_tilt_max_deg"] <= np.degrees(np.arctan(2.0 / 9.81)) + 1e-6
+    src = RenderSources([None, dr])
+    bodies = src.manifest_bodies()
+    assert [b["name"] for b in bodies] == [BODY] and bodies[0]["entity"] == "drone" and len(bodies[0]["visuals"]) == 7
+    assert all((ROOT / v["mesh"]).exists() for v in bodies[0]["visuals"])
+    (name, pos, quat), = src.stream_poses()
+    assert name == BODY and np.allclose(pos, dr.pos) and np.isclose(np.linalg.norm(quat), 1.0)
+
+
 def test_godot_bridge_points():
     """Godot 중계기 점군: 센서 좌표계 PointCloud2 + world -> 센서 TF를 월드 좌표로 바꾸고, 높이 색은 낮을수록 파랑."""
     import mujoco

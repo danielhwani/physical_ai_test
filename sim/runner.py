@@ -185,6 +185,10 @@ class Simulation:
         if self.controller.sensor and self.controller.sensor not in names:   # 지형 인지 보행기가 쓰는 센서는 자동으로 켠다
             names.append(self.controller.sensor)
         self.fleet = None                        # 별도 프로세스 차 (sim/vehicle_fleet.py, 러너가 attach_fleet으로 붙인다)
+        self.drone = None                        # 촬영 드론 (sim/drone.py, 경로 계산형): 센서 장면에도 들어가도록 센서보다 먼저 만든다
+        if self.scn.get("drone"):
+            from .drone import FollowDrone
+            self.drone = FollowDrone(self.scn["drone"])
         self.sensor_names = names
         self.scans, self.sensor_renderer, self.lidars = {}, None, []
         if names:
@@ -193,7 +197,11 @@ class Simulation:
     @property
     def render_source(self):
         """MuJoCo 밖 물리엔진 바디의 출처 (렌더 스트림과 센서 장면에 넣는다): 같은 프로세스 Chrono 또는 별도 프로세스 차."""
-        return self.cosim if self.cosim is not None else self.fleet
+        outside = self.cosim if self.cosim is not None else self.fleet
+        if self.drone is None:
+            return outside
+        from .drone import RenderSources
+        return RenderSources([outside, self.drone])
 
     def _build_sensors(self):
         from viz.sensor_renderer import SensorRenderer
@@ -505,6 +513,8 @@ class Simulation:
             # 직전 주기까지의 상태로 계산된 명령만 실행 (연결 지연 한 주기 고정). 노드가 늦으면 더 오래된 명령 -> 지연 MOP에 드러난다
             self.low_cmd = (self.remote.cmd_until(prev) if prev is not None else None) or self.fallback_cmd()
         energy = self.robot.apply(self.low_cmd)
+        if self.drone is not None:               # 촬영 드론: 로봇 몸통 참값을 따라간다 (물리 없음)
+            self.drone.update(dt, d.qpos[:3], quat_to_yaw(d.qpos[3:7]))
         if self.cosim is not None and self.cosim.feet_enabled:
             # 발자국: 물리 스텝마다 평균한 발 수직력 참값 (흙에 걸리는 실제 하중)
             self.cosim.observe_feet(d.geom_xpos[self.foot_ids], self.robot.foot_force)
@@ -526,6 +536,8 @@ class Simulation:
 def run(args):
     scenario = args.scenario if isinstance(args.scenario, dict) else load_yaml(args.scenario)
     scenario = apply_overrides(scenario, getattr(args, "set", None))
+    if getattr(args, "no_vehicles", False) and scenario.pop("vehicles", None):
+        print("--no-vehicles: 시나리오의 차 (vehicles)를 빼고 돌린다 (CPU 여유가 없을 때)")
     if scenario.get("vehicles"):              # 차마다 별도 Chrono 프로세스 (sim/vehicle_fleet.py): 맵 서버로 자국을 주고받고 실시간으로 달린다
         if "chrono" in scenario:
             raise SystemExit("vehicles와 chrono (시뮬레이터 안 Chrono)는 함께 쓰지 않는다")
@@ -765,6 +777,8 @@ def run(args):
                     contact=sim.foot_contacts().astype(float), cmd=sim.command_display,
                     q_des=np.asarray(sim.low_cmd["q_des"]),
                     terrain_version=sim.terrain.version)
+            if sim.drone is not None:
+                rec.log(drone_pos=sim.drone.pos, drone_quat_xyzw=sim.drone.quat)
             if sim.cosim is not None and sim.cosim.has_vehicle:
                 rec.log(vehicle_pos=sim.cosim.vehicle["pos"], vehicle_speed=sim.cosim.vehicle["speed"])
 
@@ -858,6 +872,8 @@ def run(args):
     if guard is not None:                     # 차 감시 (로봇 쪽): 선 횟수, 기다린 시간, 서고 다시 걸은 시각 (점 수)
         mop["guard_holds"], mop["guard_hold_s"] = guard.holds, round(guard.hold_s, 2)
         mop["guard_events"] = guard.events
+    if sim.drone is not None:
+        mop.update(sim.drone.mop())
     if fleet is not None:                     # 차 프로세스를 끝내고 (마지막 자국과 궤적 끝을 보낸다) 결과를 MOP에
         mop["vehicles"] = fleet.close()
     audit = None
@@ -941,6 +957,7 @@ def main():
                     help="RViz로 가시화 (--ros2, --realtime 자동 적용. conda 환경에서 바로 실행 가능)")
     ap.add_argument("--mjviz", action="store_true",
                     help="MuJoCo 렌더러 어댑터로 가시화 (중립 스트림만 사용. HMMWV 등 다른 물리엔진 바디도 표시)")
+    ap.add_argument("--no-vehicles", action="store_true", help="시나리오의 차 (vehicles, 별도 Chrono 프로세스)를 빼고 돌린다 (CPU 여유가 없을 때)")
     ap.add_argument("--godot", action="store_true",
                     help="Godot 4 렌더러로 가시화 (viz/godot_bridge.py + godot/. --ros2, --realtime 자동)")
     ap.add_argument("--godot-lidar", action="store_true",

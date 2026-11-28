@@ -27,6 +27,10 @@ controller:
   perception:
     sensor: front_lidar
     vehicle_guard: {ahead: 8.5, side: 15.0, clear_s: 2.0}   # 차 감시 (높이 0.15 m, 점 10개는 control/vehicle_guard.py 기본값). 2초 안 보이면 다시 걷는다
+drone:                         # 촬영 드론 (sim/drone.py, 경로 계산형, 물리 없음): 로봇 뒤 2.5 m, 위 2 m를 따라가며 로봇을 본다. Godot에서 V로 드론 시점
+  offset: [-2.5, 0.0, 2.0]
+  max_speed: 3.0
+  max_accel: 2.0
 events:
   - {t: 1.0, action: set_command, vx: 0.35, yaw_rate: 0.0}    # 요철부터 걷는다. 차가 보이면 차 감시가 세운다
   # 서서 기다리는 동안 (약 18 ~ 35초) 운용자 명령을 느린 걸음으로 바꾼다: 차 감시가 끝나면 0.25 m/s로 자국을 건넌다.
