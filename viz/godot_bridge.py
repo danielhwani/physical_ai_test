@@ -46,13 +46,23 @@ PORT = 4243
 TERRAIN_HALF = 6.0          # 표시 창 반폭 (m). RViz 어댑터와 같다
 WINDOW_TRIGGER = 2.0
 MAX_CELLS = 100_000         # 표시 셀 수 상한 (넘으면 성기게)
-FAR_MAX_CELLS = 40_000      # 먼 땅 (세계 지도 전체를 굵게, 가까운 창 아래에 깐다) 셀 수 상한
+FAR_MAX_CELLS = 60_000      # 먼 땅 (세계 지도 전체를 굵게, 가까운 땅 바깥) 셀 수 상한. 4만이면 x ±20, y ±38 m 지도가 50 cm 칸이 되어 자국이 끊겨 보였다
 FAR_HZ = 1.0                # 먼 땅은 1초에 한 번까지만 다시 보낸다
 TERRAIN_RGB = np.array([0.55, 0.50, 0.42])
 SHADE_M = 0.08
 POSE_HZ, TERRAIN_HZ, POINTS_HZ = 30.0, 4.0, 10.0
 MARKER_TOPIC = "/control/footholds"
 CLOUD_TOPIC = re.compile(r"^/sensors/[^/]+/points$|^/control/terrain_map$")   # RViz 설정(config/go2.rviz)과 같은 점군
+
+
+def box_mean(a, rows, cols, half):
+    """격자 a에서 (rows[i], cols[j]) 둘레 (2 half + 1)^2 칸 (가장자리에서는 안쪽만)의 평균 (누적합, numpy만)."""
+    S = np.zeros((a.shape[0] + 1, a.shape[1] + 1))
+    S[1:, 1:] = np.cumsum(np.cumsum(a, 0, dtype=float), 1)
+    r0, r1 = np.maximum(rows - half, 0), np.minimum(rows + half + 1, a.shape[0])
+    c0, c1 = np.maximum(cols - half, 0), np.minimum(cols + half + 1, a.shape[1])
+    tot = S[np.ix_(r1, c1)] - S[np.ix_(r0, c1)] - S[np.ix_(r1, c0)] + S[np.ix_(r0, c0)]
+    return tot / np.outer(r1 - r0, c1 - c0)
 
 
 def b64(a):
@@ -242,11 +252,16 @@ class GodotBridge(Node):
         self.terrain_dirty = True
 
     def poll_map(self):
+        """맵 서버 변경을 받는다. 지도 전체 합성은 지형을 보내는 빈도까지만 (차 두 대가 0.2초마다 쓰면 1초에 약 10번 합성했다.
+        x ±20, y ±38 m 지도는 약 120만 칸이라 CPU를 꽤 쓴다)."""
         if self.map is not None and self.map.poll() > 0:
+            self.map_changed = True
+        now = time.monotonic()
+        if getattr(self, "map_changed", False) and now >= getattr(self, "next_compose", 0.0):
             g = self.grid
             g.heights = self.map.local.compose(0, g.nrow, 0, g.ncol).astype(np.float32)
             g.version = self.map.local.version
-            self.terrain_dirty = True
+            self.terrain_dirty, self.map_changed, self.next_compose = True, False, now + 1.0 / TERRAIN_HZ
 
     def on_patch(self, msg):
         if self.source == "map":
@@ -350,15 +365,27 @@ class GodotBridge(Node):
         ks = [d for d in range(1, unit + 1) if unit % d == 0] + [unit * m for m in range(2, 50)]
         k = next((d for d in ks if ((g.nrow - 1) // d + 1) * ((g.ncol - 1) // d + 1) <= FAR_MAX_CELLS), ks[-1])
         rows, cols = np.arange(0, g.nrow, k), np.arange(0, g.ncol, k)
-        msg = self._layer_msg("far", rows, cols)
         i0, i1 = np.searchsorted(rows, w.r0), np.searchsorted(rows, w.r0 + w.wnrow - 1)
         j0, j1 = np.searchsorted(cols, w.c0), np.searchsorted(cols, w.c0 + w.wncol - 1)
+        # 높이는 꼭짓점 둘레 k x k 칸의 평균: 한 점만 뽑으면 폭 25 cm 자국이 뽑은 점에 걸리는 곳만 보여 끊겨 보였다.
+        # 평균은 자국이 두 묶음에 걸쳐도 반씩 남아 이어진다 (최소값은 요철을 실제보다 낮게 그려 가까운 땅 경계에 단차가 생긴다).
+        # 가까운 땅과 맞닿는 경계 꼭짓점만은 점 높이 그대로 (가까운 땅의 같은 꼭짓점과 높이가 같아 틈이 없다)
+        base = self.grid.heights - self.overlay.heights
+        H = box_mean(base, rows, cols, k // 2)
+        exact = base[np.ix_(rows, cols)]
+        for i in (i0, i1):
+            H[i, j0:j1 + 1] = exact[i, j0:j1 + 1]
+        for j in (j0, j1):
+            H[i0:i1 + 1, j] = exact[i0:i1 + 1, j]
+        msg = self._layer_msg("far", rows, cols, H=H)
         msg["hole"] = [int(i0), int(i1), int(j0), int(j1)]        # 칸 (i, j)는 i0 <= i < i1, j0 <= j < j1이면 그리지 않는다
         return msg
 
-    def _layer_msg(self, layer, rows, cols):
+    def _layer_msg(self, layer, rows, cols, H=None):
         g, res = self.grid, self.window.res
-        H = (g.heights - self.overlay.heights)[np.ix_(rows, cols)].astype(np.float32)
+        if H is None:
+            H = (g.heights - self.overlay.heights)[np.ix_(rows, cols)]
+        H = H.astype(np.float32)
         X, Y = np.meshgrid(-g.half_x + cols * res, -g.half_y + rows * res)
         base = np.broadcast_to(TERRAIN_RGB, X.shape + (3,)).copy()
         for rg in self.manifest.get("soil_regions", []):

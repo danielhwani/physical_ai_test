@@ -225,16 +225,19 @@ def test_godot_bridge_messages():
 def test_godot_bridge_far_terrain():
     """Godot 중계기 먼 땅 (세계 지도가 가까운 창보다 클 때): 세계 지도 전체를 굵은 칸 (가까운 창 이동 단위를 나누는 묶음)으로,
     꼭짓점이 가까운 창 경계에 정확히 놓이고 그 높이가 가까운 땅과 같으며, 창 안의 칸은 구멍 (hole)으로 알려 그리지 않는다
-    (높이는 실제 값 그대로: 경계 꼭짓점 법선이 가까운 땅과 이어진다)."""
+    (높이를 내려 숨기지 않는다: 경계 꼭짓점 법선이 가까운 땅과 이어진다). 다른 꼭짓점은 둘레 k x k 칸 평균이라
+    좁은 자국이 굵은 칸 사이에 놓여도 끊기지 않는다."""
     import base64
     import rclpy
     from sim.stream import TerrainPatchStream
     from std_msgs.msg import String
-    from viz.godot_bridge import FAR_MAX_CELLS, GodotBridge
+    from viz.godot_bridge import FAR_MAX_CELLS, GodotBridge, box_mean
     scn = yaml.safe_load((ROOT / "scenarios/two_cars_map.yaml").read_text())
     scn.pop("vehicles")
     sim = Simulation(scn)
     sim.terrain.applied[700, 330] -= 0.05                          # 가까운 창 경계 위 꼭짓점 하나 (자국 흉내)
+    rut = np.abs(sim.terrain.xs - 8.6) < 0.06                    # 폭 15 cm 자국 (x 8.55 ~ 8.65 m: 가까운 창 밖)
+    sim.terrain.applied[:, rut] -= 0.03
     rclpy.init()
     try:
         br = GodotBridge(0)
@@ -257,8 +260,15 @@ def test_godot_bridge_far_terrain():
         rows = np.rint((yf + sim.terrain.half_y) / sim.terrain.res).astype(int)
         cols = np.rint((xf + sim.terrain.half_x) / sim.terrain.res).astype(int)
         truth = G[np.ix_(rows, cols)]
-        assert np.allclose(Hf, truth, atol=1e-6)                     # 높이는 어디서나 지형 그대로
         assert far["hole"] == [on_y[0], on_y[1], on_x[0], on_x[1]], far["hole"]   # 가까운 창 경계 꼭짓점 사이 칸만 비운다
+        border = np.zeros_like(Hf, bool)
+        border[on_y, on_x[0]:on_x[1] + 1] = True
+        border[on_y[0]:on_y[1] + 1, on_x] = True
+        assert np.allclose(Hf[border], truth[border], atol=1e-6)    # 경계는 점 높이 (가까운 땅과 같다)
+        mean = box_mean(G, rows, cols, k // 2)
+        assert np.allclose(Hf[~border], mean[~border], atol=1e-6)    # 나머지는 둘레 평균
+        cm = (xf > 8.3) & (xf < 8.9)                                 # 좁은 자국이 굵은 칸에서도 모든 줄에 보인다 (점 높이만 쓰면 사라진다)
+        assert (Hf[:, cm].min(1) < -0.005).all()
         edge = Hf[on_y[0], on_x[0]:on_x[1] + 1]                     # 경계 꼭짓점 = 가까운 땅의 같은 자리
         assert np.allclose(edge, Hn[0, ::k], atol=1e-6)
         br.destroy_node()
